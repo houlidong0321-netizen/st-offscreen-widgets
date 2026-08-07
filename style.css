@@ -165,6 +165,25 @@
     font-size: 0.85em;
 }
 
+.ow-fullscreen-corner-btn {
+    position: absolute;
+    top: 40px;
+    right: 8px;
+    z-index: 5;
+    padding: 4px 8px;
+    background: rgba(0,0,0,0.55);
+    border-color: rgba(255,255,255,0.3);
+    color: #fff;
+}
+.ow-fullscreen-corner-btn:hover { background: rgba(0,0,0,0.75); }
+
+.ow-result-frame:fullscreen,
+.ow-result-frame:-webkit-full-screen {
+    width: 100vw;
+    height: 100vh;
+    background: #fff;
+}
+
 .ow-table {
     width: 100%;
     border-collapse: collapse;

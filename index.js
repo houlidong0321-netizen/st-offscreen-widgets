@@ -110,18 +110,20 @@
         ctx().saveSettingsDebounced();
     }
 
-    // 每聊天数据（组件生成结果 / 镜头之外表格与叙述）随存档保存
+    // 每聊天数据（组件生成结果 / 镜头之外四张表）随存档保存
     function chatData() {
         const c = ctx();
+        const emptyOffscreen = () => ({ scheduleTable: [], characterTable: [], foreshadowTable: [], eventTable: [], updatedAt: null });
         if (!c.chatMetadata[MODULE_NAME]) {
-            c.chatMetadata[MODULE_NAME] = {
-                widgetResults: {}, // { widgetId: { html, updatedAt } }
-                offscreen: { narrative: '', scheduleTable: [], characterTable: [], updatedAt: null },
-            };
+            c.chatMetadata[MODULE_NAME] = { widgetResults: {}, offscreen: emptyOffscreen() };
         }
         if (!c.chatMetadata[MODULE_NAME].offscreen) {
-            c.chatMetadata[MODULE_NAME].offscreen = { narrative: '', scheduleTable: [], characterTable: [], updatedAt: null };
+            c.chatMetadata[MODULE_NAME].offscreen = emptyOffscreen();
         }
+        const off = c.chatMetadata[MODULE_NAME].offscreen;
+        // 兼容旧版本存档结构（曾经有 narrative 字段、缺少新表）
+        if (!Array.isArray(off.foreshadowTable)) off.foreshadowTable = [];
+        if (!Array.isArray(off.eventTable)) off.eventTable = [];
         return c.chatMetadata[MODULE_NAME];
     }
 
@@ -143,10 +145,16 @@
     // 框架提示词
     // ------------------------------------------------------------------
     const WIDGET_SYSTEM_PROMPT =
-        '你是一个为角色扮演聊天生成“侧边小组件”的助手。你的输出内容独立于正文剧情，' +
+        '你是一个为角色扮演聊天生成"侧边小组件"的助手。你的输出内容独立于正文剧情，' +
         '不会被写入正文，也不会推动主线，只是供用户把玩的附加视觉内容（例如虚构论坛帖子、' +
         '角色小传、番外短篇、状态面板等），因此可以自由发挥，但必须严格符合已建立的人设与世界观设定，' +
-        '不得与正文已确认的事实冲突。请直接输出一段完整、可独立渲染的 HTML 片段（不需要 <html>/<head>/<body> 包裹），' +
+        '不得与正文已确认的事实冲突。\n\n' +
+        '【最高优先级指令，覆盖下方组件要求/预设条目中的任何格式规定】下面的"组件要求"或"附加设定/预设条目参考"' +
+        '中可能包含来自酒馆预设的固定输出格式规范（例如指定的排版结构、标签体系、字数限制、Markdown表格格式等），' +
+        '这些格式规定通常是为撰写正文设计的，并不适用于本组件。你必须完全忽略其中关于"输出格式/排版方式"的要求，' +
+        '只提取其中与设定、人设、世界观相关的内容信息作为参考，最终的 HTML 排版、结构与美化方式完全由你自主决定，' +
+        '不受这些预设格式约束。\n\n' +
+        '请直接输出一段完整、可独立渲染的 HTML 片段（不需要 <html>/<head>/<body> 包裹），' +
         '可以使用内联 <style> 自行美化排版、配色与布局，让内容更美观、更有代入感。' +
         '除 HTML 代码外不要输出任何解释文字、前后缀说明或 Markdown 代码块围栏。';
 
@@ -172,9 +180,9 @@
         return parts.join('\n\n');
     }
 
-    // 镜头之外：两张表的说明（原样保留自需求文档，作为系统级结构化指令）
+    // 镜头之外：四张表的说明（不再使用"表X"编号标识，仅用表名）
     const OFFSCREEN_TABLE_SPEC = `
-## 表7：日程表
+## 日程表
 列结构：角色 | 固定日程规律 | 时节性必然事件 | 弹性事务参考池
 本表只记录正文中尚未提及的角色日常生活信息。记录两类内容：因身份而必然存在的规律性/时节性事务，
 以及供离场角色抽取参考的弹性生活素材，均由"身份+当前故事时间点"自然推导得出。
@@ -183,25 +191,41 @@
 "弹性事务参考池"：与角色身份/性格相符、结合当前季节/星期/天气合理存在的偶发小事清单，用中文分号分隔多项，不要求真实发生过。
 时节性事件时间窗口过去后应删除（下次进入类似节点可重新生成）；固定日程规律与弹性事务参考池仅在角色身份根本变化时整体更新。
 
-## 表4：角色表
+## 角色表
 列结构：姓名 | 昵称 | 与用户的关系 | 当前位置与正在做的事 | 对用户的态度
 记录所有已出场角色的身份信息与实时状态，确保离场角色也拥有可查证的当前生活状态。
 "当前位置与正在做的事"：绝对上帝视角的物理位置与客观动作，不带情绪与内心活动，禁止写"未知"。
 "对用户的态度"：用2-3个简写标签描述当前状态快照。
 不删除，永久保留，即使角色长期不出场也不清理；每次更新都应覆盖"当前位置与正在做的事"字段。
+
+## 伏笔与未来事件表
+列结构：事件内容 | 涉及角色 | 预计触发时间点/条件 | 铺垫说明
+记录正文中尚未描写、但基于已知信息合理推断"很可能在未来发生"的事件与伏笔想象，用于保持世界的连贯性与前瞻性，
+绝不能提前揭示正文中即将由用户或主角亲自经历、且会构成核心剧情转折的关键信息，只写背景性、氛围性的铺垫内容。
+"预计触发时间点/条件"：大致的时间窗口或触发条件描述，不要求精确。
+"铺垫说明"：为何据此推断该事件可能发生（例如伏笔线索、角色动机等）的简短说明。
+已经在正文中被实际触发/写明的事件应从本表中移除；仍未触发的可保留并随故事推进更新细节。
+
+## 突发事件表
+列结构：事件内容 | 触发概率 | 影响范围/涉及角色 | 备注
+记录若干条"有一定概率会发生、但目前尚未发生"的突发事件清单，供世界保持鲜活感与不确定性。
+"触发概率"：填写"高/中/低"的大致概率描述即可，不需要给出具体数字。
+"影响范围/涉及角色"：说明该事件会波及哪些角色或场景范围。
+本表内容为参考池性质，允许定期整体刷新替换，不要求每条都真实发生。
 `.trim();
 
     const OFFSCREEN_SYSTEM_PROMPT =
-        '你是一个为角色扮演故事撰写“镜头之外”内容的助手。你的任务分两部分：\n' +
-        '1. 叙述镜头之外的世界：正文没有描写、但此刻正在发生的各角色日常/工作/生活片段；对尚未发生的合理未来事件的想象与铺垫；' +
-        '以及若干条“有概率发生的突发事件”清单（标注大致概率高低即可，不需要具体数字）。这部分内容绝不能与正文已经确认的剧情冲突，' +
-        '也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折，只写背景性、氛围性的旁支内容。\n' +
-        '2. 维护两张状态表，规则如下：\n' + OFFSCREEN_TABLE_SPEC + '\n\n' +
+        '你是一个为角色扮演故事维护"镜头之外"状态数据库的助手。正文没有描写、但此刻正在发生的各角色日常/工作/生活片段、' +
+        '对尚未发生的合理未来事件的想象与铺垫、以及若干条"有概率发生的突发事件"，都不再以自由叙述文字呈现，' +
+        '而是统一维护为下面四张结构化表格，方便用户直接查看与编辑。这些内容绝不能与正文已经确认的剧情冲突，' +
+        '也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折，只写背景性、氛围性的旁支内容。\n\n' +
+        '维护规则如下：\n' + OFFSCREEN_TABLE_SPEC + '\n\n' +
         '请仅输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：\n' +
-        '{"narrative":"（镜头之外叙述，含日常侧写/未来想象/突发事件列表，可用换行分段的纯文本或简单HTML）",' +
-        '"schedule_table":[{"role":"","routine":"","seasonal":"","pool":""}],' +
-        '"character_table":[{"name":"","alias":"","relation":"","location":"","attitude":""}]}\n' +
-        '两张表需要覆盖当前已出场的所有角色（可参考已有表格数据进行增量更新，而不是每次全部重写）。';
+        '{"schedule_table":[{"role":"","routine":"","seasonal":"","pool":""}],' +
+        '"character_table":[{"name":"","alias":"","relation":"","location":"","attitude":""}],' +
+        '"foreshadow_table":[{"event":"","characters":"","timing":"","note":""}],' +
+        '"event_table":[{"event":"","probability":"","scope":"","note":""}]}\n' +
+        '四张表都需要在已有表格数据的基础上做增量更新（新增/修改/按规则删除过期条目），而不是每次全部推倒重写。';
 
     function buildOffscreenUserPrompt(extras) {
         const parts = [];
@@ -209,10 +233,12 @@
         if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
         if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
         const existing = chatData().offscreen;
-        if (existing.scheduleTable?.length || existing.characterTable?.length) {
+        if (existing.scheduleTable?.length || existing.characterTable?.length || existing.foreshadowTable?.length || existing.eventTable?.length) {
             parts.push(`【已有表格数据（请在此基础上增量更新，而不是从零重写）】\n${JSON.stringify({
                 schedule_table: existing.scheduleTable,
                 character_table: existing.characterTable,
+                foreshadow_table: existing.foreshadowTable,
+                event_table: existing.eventTable,
             })}`);
         }
         parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）生成或更新内容。');
@@ -444,21 +470,29 @@
             }
             const cd = chatData();
             let changed = [];
-            if (typeof parsed.narrative === 'string' && parsed.narrative.trim()) {
-                cd.offscreen.narrative = parsed.narrative;
-                changed.push('narrative');
-            }
             if (Array.isArray(parsed.schedule_table)) {
                 cd.offscreen.scheduleTable = normalizeScheduleRows(parsed.schedule_table);
-                changed.push(`schedule_table(${cd.offscreen.scheduleTable.length}行)`);
+                changed.push(`日程表(${cd.offscreen.scheduleTable.length}行)`);
             } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 schedule_table 数组字段（表7 日程表未更新）', parsed);
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 schedule_table 数组字段（日程表未更新）', parsed);
             }
             if (Array.isArray(parsed.character_table)) {
                 cd.offscreen.characterTable = normalizeCharacterRows(parsed.character_table);
-                changed.push(`character_table(${cd.offscreen.characterTable.length}行)`);
+                changed.push(`角色表(${cd.offscreen.characterTable.length}行)`);
             } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 character_table 数组字段（表4 角色表未更新）', parsed);
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 character_table 数组字段（角色表未更新）', parsed);
+            }
+            if (Array.isArray(parsed.foreshadow_table)) {
+                cd.offscreen.foreshadowTable = normalizeForeshadowRows(parsed.foreshadow_table);
+                changed.push(`伏笔与未来事件表(${cd.offscreen.foreshadowTable.length}行)`);
+            } else {
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 foreshadow_table 数组字段（伏笔与未来事件表未更新）', parsed);
+            }
+            if (Array.isArray(parsed.event_table)) {
+                cd.offscreen.eventTable = normalizeEventRows(parsed.event_table);
+                changed.push(`突发事件表(${cd.offscreen.eventTable.length}行)`);
+            } else {
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 event_table 数组字段（突发事件表未更新）', parsed);
             }
             cd.offscreen.updatedAt = Date.now();
             saveChatData();
@@ -488,6 +522,22 @@
             relation: r.relation ?? r.关系 ?? r['与用户的关系'] ?? '',
             location: r.location ?? r.当前位置与正在做的事 ?? r.status ?? '',
             attitude: r.attitude ?? r.态度 ?? r['对用户的态度'] ?? '',
+        }));
+    }
+    function normalizeForeshadowRows(rows) {
+        return rows.map((r) => ({
+            event: r.event ?? r.事件 ?? r['事件内容'] ?? '',
+            characters: r.characters ?? r.涉及角色 ?? '',
+            timing: r.timing ?? r['预计触发时间点/条件'] ?? r.time ?? '',
+            note: r.note ?? r.铺垫说明 ?? r.说明 ?? '',
+        }));
+    }
+    function normalizeEventRows(rows) {
+        return rows.map((r) => ({
+            event: r.event ?? r.事件 ?? r['事件内容'] ?? '',
+            probability: r.probability ?? r.触发概率 ?? r.概率 ?? '',
+            scope: r.scope ?? r['影响范围/涉及角色'] ?? r.影响范围 ?? '',
+            note: r.note ?? r.备注 ?? '',
         }));
     }
 
@@ -586,12 +636,17 @@
 
     function renderOffscreenAsPlainText(off) {
         const parts = [];
-        if (off.narrative) parts.push(`镜头之外：\n${off.narrative}`);
         if (off.scheduleTable?.length) {
             parts.push('日程表：\n' + off.scheduleTable.map((r) => `- ${r.role}｜${r.routine || '—'}｜${r.seasonal || '—'}｜${r.pool || '—'}`).join('\n'));
         }
         if (off.characterTable?.length) {
-            parts.push('角色状态表：\n' + off.characterTable.map((r) => `- ${r.name}（${r.alias || '—'}）｜关系:${r.relation || '—'}｜${r.location || '—'}｜态度:${r.attitude || '—'}`).join('\n'));
+            parts.push('角色表：\n' + off.characterTable.map((r) => `- ${r.name}（${r.alias || '—'}）｜关系:${r.relation || '—'}｜${r.location || '—'}｜态度:${r.attitude || '—'}`).join('\n'));
+        }
+        if (off.foreshadowTable?.length) {
+            parts.push('伏笔与未来事件表：\n' + off.foreshadowTable.map((r) => `- ${r.event}｜涉及:${r.characters || '—'}｜时机:${r.timing || '—'}｜${r.note || ''}`).join('\n'));
+        }
+        if (off.eventTable?.length) {
+            parts.push('突发事件表：\n' + off.eventTable.map((r) => `- ${r.event}｜概率:${r.probability || '—'}｜范围:${r.scope || '—'}｜${r.note || ''}`).join('\n'));
         }
         return parts.join('\n\n');
     }
@@ -818,7 +873,7 @@
         for (const w of withResults) {
             const result = cd.widgetResults[w.id];
             $results.append(`
-              <div class="ow-result-frame-wrap" data-id="${w.id}" style="margin-bottom:12px;">
+              <div class="ow-result-frame-wrap" data-id="${w.id}" style="margin-bottom:12px;position:relative;">
                 <div class="ow-result-head">
                   <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 生成失败' : `✅ ${new Date(result.updatedAt).toLocaleString()}`}</span>
                   <span>
@@ -826,7 +881,8 @@
                     <button class="ow-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
                   </span>
                 </div>
-                <iframe class="ow-result-frame" sandbox="allow-scripts" srcdoc="${escapeHtml(result.html)}"></iframe>
+                <iframe class="ow-result-frame" sandbox="allow-scripts" allowfullscreen srcdoc="${escapeHtml(result.html)}"></iframe>
+                <button class="ow-btn ow-fullscreen-corner-btn" data-action="fullscreen" data-id="${w.id}" title="全屏沉浸式查看"><i class="fa-solid fa-expand"></i></button>
               </div>`);
         }
 
@@ -836,6 +892,21 @@
             if (!res) return;
             const w = window.open('', '_blank');
             if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(res.html)}</pre>`);
+        });
+
+        $results.off('click', '[data-action="fullscreen"]').on('click', '[data-action="fullscreen"]', function () {
+            const id = $(this).data('id');
+            const iframeEl = $results.find(`.ow-result-frame-wrap[data-id="${id}"] iframe`)[0];
+            if (!iframeEl) return;
+            const req = iframeEl.requestFullscreen || iframeEl.webkitRequestFullscreen || iframeEl.mozRequestFullScreen || iframeEl.msRequestFullscreen;
+            if (req) {
+                req.call(iframeEl).catch((err) => {
+                    log('warn', 'ui', `进入全屏失败：${err.message || err}`);
+                    toast('无法进入全屏，浏览器可能不支持或已阻止', 'warning');
+                });
+            } else {
+                toast('当前浏览器不支持全屏 API', 'warning');
+            }
         });
 
         $results.off('click', '[data-action="regen-one"]').on('click', '[data-action="regen-one"]', async function () {
@@ -999,41 +1070,83 @@
     }
 
     // ---------------- 镜头之外面板 ----------------
+    // 四张表的定义（列 key、列显示名、数据数组的存储字段名），用统一逻辑渲染/编辑/增删行，
+    // 避免四张表各写一份重复代码。
+    const OFFSCREEN_TABLES = [
+        {
+            key: 'scheduleTable',
+            title: '日程表',
+            rowFactory: () => ({ role: '', routine: '', seasonal: '', pool: '' }),
+            columns: [
+                { field: 'role', label: '角色' },
+                { field: 'routine', label: '固定日程规律' },
+                { field: 'seasonal', label: '时节性必然事件' },
+                { field: 'pool', label: '弹性事务参考池' },
+            ],
+        },
+        {
+            key: 'characterTable',
+            title: '角色表',
+            rowFactory: () => ({ name: '', alias: '', relation: '', location: '', attitude: '' }),
+            columns: [
+                { field: 'name', label: '姓名' },
+                { field: 'alias', label: '昵称' },
+                { field: 'relation', label: '与用户的关系' },
+                { field: 'location', label: '当前位置与正在做的事' },
+                { field: 'attitude', label: '对用户的态度' },
+            ],
+        },
+        {
+            key: 'foreshadowTable',
+            title: '伏笔与未来事件表',
+            rowFactory: () => ({ event: '', characters: '', timing: '', note: '' }),
+            columns: [
+                { field: 'event', label: '事件内容' },
+                { field: 'characters', label: '涉及角色' },
+                { field: 'timing', label: '预计触发时间点/条件' },
+                { field: 'note', label: '铺垫说明' },
+            ],
+        },
+        {
+            key: 'eventTable',
+            title: '突发事件表',
+            rowFactory: () => ({ event: '', probability: '', scope: '', note: '' }),
+            columns: [
+                { field: 'event', label: '事件内容' },
+                { field: 'probability', label: '触发概率' },
+                { field: 'scope', label: '影响范围/涉及角色' },
+                { field: 'note', label: '备注' },
+            ],
+        },
+    ];
+
     function renderOffscreenPanel($panel) {
         const s = settings();
         const off = chatData().offscreen;
 
         let html = `
         <div class="ow-row">
-          <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用“镜头之外”</label>
+          <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用"镜头之外"</label>
           <button class="ow-btn ow-primary" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成/更新</button>
           <span class="ow-muted">${off.updatedAt ? `上次更新：${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
         </div>
-        <div class="ow-hint">随组件一起发送两张表的生成提示词，但结果单独展示在这里，不会出现在“组件生成”界面。可在下方直接编辑表格内容。</div>
+        <div class="ow-hint">随组件一起发送四张表的生成提示词，但结果单独展示在这里，不会出现在"组件生成"界面。可在下方直接点击单元格编辑。</div>`;
 
-        <div class="ow-section-title">镜头之外叙述</div>
-        <textarea class="ow-textarea" id="ow_off_narrative" style="min-height:120px;">${escapeHtml(off.narrative)}</textarea>
-
-        <div class="ow-section-title">表7：日程表</div>
-        <table class="ow-table" id="ow_schedule_table">
-          <thead><tr><th>角色</th><th>固定日程规律</th><th>时节性必然事件</th><th>弹性事务参考池</th><th></th></tr></thead>
+        for (const t of OFFSCREEN_TABLES) {
+            html += `
+        <div class="ow-section-title">${t.title}</div>
+        <table class="ow-table" data-table-key="${t.key}">
+          <thead><tr>${t.columns.map((c) => `<th>${c.label}</th>`).join('')}<th></th></tr></thead>
           <tbody></tbody>
         </table>
-        <div class="ow-row"><button class="ow-btn" data-action="add-schedule-row">+ 添加一行</button></div>
-
-        <div class="ow-section-title">表4：角色表</div>
-        <table class="ow-table" id="ow_character_table">
-          <thead><tr><th>姓名</th><th>昵称</th><th>与用户的关系</th><th>当前位置与正在做的事</th><th>对用户的态度</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <div class="ow-row"><button class="ow-btn" data-action="add-character-row">+ 添加一行</button></div>
-        `;
+        <div class="ow-row"><button class="ow-btn" data-action="add-row" data-table-key="${t.key}">+ 添加一行</button></div>`;
+        }
         $panel.html(html);
 
-        const $sched = $panel.find('#ow_schedule_table tbody');
-        for (const row of off.scheduleTable || []) $sched.append(scheduleRowHtml(row));
-        const $char = $panel.find('#ow_character_table tbody');
-        for (const row of off.characterTable || []) $char.append(characterRowHtml(row));
+        for (const t of OFFSCREEN_TABLES) {
+            const $tbody = $panel.find(`table[data-table-key="${t.key}"] tbody`);
+            for (const row of off[t.key] || []) $tbody.append(offscreenRowHtml(t, row));
+        }
 
         $panel.find('#ow_off_enabled').on('change', function () {
             s.offscreen.enabled = $(this).is(':checked');
@@ -1047,28 +1160,18 @@
                 await generateOffscreen();
                 toast('镜头之外内容已更新', 'success');
             } catch (err) {
-                console.error(err);
-                toast(`生成失败：${err.message || err}`, 'error');
+                toast(`生成失败：${err.message || err}，详见日志标签页`, 'error');
             } finally {
                 $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成/更新');
                 renderOffscreenPanel($panel);
             }
         });
 
-        $panel.find('#ow_off_narrative').on('input', function () {
-            off.narrative = $(this).val();
-            saveChatData();
-        });
-
-        $panel.find('[data-action="add-schedule-row"]').on('click', () => {
-            off.scheduleTable = off.scheduleTable || [];
-            off.scheduleTable.push({ role: '', routine: '', seasonal: '', pool: '' });
-            saveChatData();
-            renderOffscreenPanel($panel);
-        });
-        $panel.find('[data-action="add-character-row"]').on('click', () => {
-            off.characterTable = off.characterTable || [];
-            off.characterTable.push({ name: '', alias: '', relation: '', location: '', attitude: '' });
+        $panel.find('[data-action="add-row"]').on('click', function () {
+            const key = $(this).data('table-key');
+            const t = OFFSCREEN_TABLES.find((x) => x.key === key);
+            off[key] = off[key] || [];
+            off[key].push(t.rowFactory());
             saveChatData();
             renderOffscreenPanel($panel);
         });
@@ -1076,49 +1179,26 @@
         bindOffscreenTableEvents($panel, off);
     }
 
-    function scheduleRowHtml(row) {
-        return `<tr>
-          <td contenteditable="true" data-field="role">${escapeHtml(row.role)}</td>
-          <td contenteditable="true" data-field="routine">${escapeHtml(row.routine)}</td>
-          <td contenteditable="true" data-field="seasonal">${escapeHtml(row.seasonal)}</td>
-          <td contenteditable="true" data-field="pool">${escapeHtml(row.pool)}</td>
-          <td><button class="ow-btn ow-danger" data-action="del-row">✕</button></td>
-        </tr>`;
-    }
-    function characterRowHtml(row) {
-        return `<tr>
-          <td contenteditable="true" data-field="name">${escapeHtml(row.name)}</td>
-          <td contenteditable="true" data-field="alias">${escapeHtml(row.alias)}</td>
-          <td contenteditable="true" data-field="relation">${escapeHtml(row.relation)}</td>
-          <td contenteditable="true" data-field="location">${escapeHtml(row.location)}</td>
-          <td contenteditable="true" data-field="attitude">${escapeHtml(row.attitude)}</td>
-          <td><button class="ow-btn ow-danger" data-action="del-row">✕</button></td>
-        </tr>`;
+    function offscreenRowHtml(tableDef, row) {
+        const cells = tableDef.columns.map((c) => `<td contenteditable="true" data-field="${c.field}">${escapeHtml(row[c.field])}</td>`).join('');
+        return `<tr>${cells}<td><button class="ow-btn ow-danger" data-action="del-row">✕</button></td></tr>`;
     }
 
     function bindOffscreenTableEvents($panel, off) {
-        $panel.find('#ow_schedule_table').on('blur', 'td[contenteditable]', function () {
-            const idx = $(this).closest('tr').index();
-            const field = $(this).data('field');
-            if (off.scheduleTable[idx]) { off.scheduleTable[idx][field] = $(this).text(); saveChatData(); }
-        });
-        $panel.find('#ow_character_table').on('blur', 'td[contenteditable]', function () {
-            const idx = $(this).closest('tr').index();
-            const field = $(this).data('field');
-            if (off.characterTable[idx]) { off.characterTable[idx][field] = $(this).text(); saveChatData(); }
-        });
-        $panel.find('#ow_schedule_table').on('click', '[data-action="del-row"]', function () {
-            const idx = $(this).closest('tr').index();
-            off.scheduleTable.splice(idx, 1);
-            saveChatData();
-            $(this).closest('tr').remove();
-        });
-        $panel.find('#ow_character_table').on('click', '[data-action="del-row"]', function () {
-            const idx = $(this).closest('tr').index();
-            off.characterTable.splice(idx, 1);
-            saveChatData();
-            $(this).closest('tr').remove();
-        });
+        for (const t of OFFSCREEN_TABLES) {
+            const $table = $panel.find(`table[data-table-key="${t.key}"]`);
+            $table.on('blur', 'td[contenteditable]', function () {
+                const idx = $(this).closest('tr').index();
+                const field = $(this).data('field');
+                if (off[t.key]?.[idx]) { off[t.key][idx][field] = $(this).text(); saveChatData(); }
+            });
+            $table.on('click', '[data-action="del-row"]', function () {
+                const idx = $(this).closest('tr').index();
+                off[t.key].splice(idx, 1);
+                saveChatData();
+                $(this).closest('tr').remove();
+            });
+        }
     }
 
     // ---------------- 设置面板 ----------------
@@ -1185,9 +1265,8 @@
               ${(s.api.modelList || []).filter((m) => m !== s.api.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
             </select>
             <button class="ow-btn" id="ow_api_pull_models">拉取模型列表</button>
-            <button class="ow-btn ow-primary" id="ow_api_save">确认保存</button>
           </div>
-          <div class="ow-hint">⚠️ API Key 会以明文形式保存在浏览器/酒馆设置文件中，客户端扩展无法安全加密存储密钥，请自行评估风险。</div>
+          <div class="ow-hint">填写后即自动保存，无需再点确认按钮。⚠️ API Key 会以明文形式保存在浏览器/酒馆设置文件中，客户端扩展无法安全加密存储密钥，请自行评估风险。</div>
         </div>
 
         <div class="ow-section-title">主题</div>
@@ -1221,9 +1300,9 @@
             saveSettings();
             $panel.find('#ow_custom_api_fields').toggle(s.api.mode === 'custom');
         });
-        $panel.find('#ow_api_url').on('change', function () { s.api.url = $(this).val().trim(); saveSettings(); });
-        $panel.find('#ow_api_key').on('change', function () { s.api.key = $(this).val(); saveSettings(); });
-        $panel.find('#ow_api_model').on('change', function () { s.api.model = $(this).val(); saveSettings(); });
+        $panel.find('#ow_api_url').on('input', function () { s.api.url = $(this).val().trim(); saveSettings(); log('debug', 'system', 'API URL 已自动保存'); });
+        $panel.find('#ow_api_key').on('input', function () { s.api.key = $(this).val(); saveSettings(); log('debug', 'system', 'API Key 已自动保存'); });
+        $panel.find('#ow_api_model').on('change', function () { s.api.model = $(this).val(); saveSettings(); log('debug', 'system', `API 模型已自动保存为 ${s.api.model}`); });
         $panel.find('#ow_api_pull_models').on('click', async function () {
             if (!s.api.url) { toast('请先填写 API URL', 'warning'); return; }
             const $btn = $(this);
@@ -1238,13 +1317,6 @@
             } finally {
                 $btn.prop('disabled', false).text('拉取模型列表');
             }
-        });
-        $panel.find('#ow_api_save').on('click', function () {
-            s.api.url = $panel.find('#ow_api_url').val().trim();
-            s.api.key = $panel.find('#ow_api_key').val();
-            s.api.model = $panel.find('#ow_api_model').val();
-            saveSettings();
-            toast('API 设置已保存', 'success');
         });
 
         $panel.find('input[name="ow_theme_mode"]').on('change', function () {
