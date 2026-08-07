@@ -18,6 +18,52 @@
     const INJECT_KEY_OFFSCREEN = `${MODULE_NAME}_offscreen`;
 
     // ------------------------------------------------------------------
+    // 日志诊断模块：记录每一步关键动作（发送了什么/收到了什么/解析是否成功），
+    // 仅保存在内存中（刷新页面会清空），供出问题时导出/复制给开发者排查。
+    // ------------------------------------------------------------------
+    const MAX_LOGS = 300;
+    const logs = [];
+    let $logPanel = null; // 当前打开的日志面板（若存在），用于实时刷新
+
+    function log(level, tag, msg, data) {
+        const entry = {
+            time: Date.now(),
+            level, // 'info' | 'warn' | 'error' | 'debug'
+            tag,   // 'trigger' | 'request' | 'response' | 'parse' | 'inject' | 'ui' | 'system'
+            msg,
+            data: data !== undefined ? safeStringify(data) : undefined,
+        };
+        logs.push(entry);
+        if (logs.length > MAX_LOGS) logs.shift();
+        const consoleFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+        consoleFn(`[镜头之外][${tag}] ${msg}`, data !== undefined ? data : '');
+        if ($logPanel) renderLogEntries($logPanel);
+        return entry;
+    }
+
+    function safeStringify(data) {
+        try {
+            if (typeof data === 'string') return data;
+            if (data instanceof Error) return `${data.name}: ${data.message}\n${data.stack || ''}`;
+            return JSON.stringify(data, null, 2);
+        } catch (e) {
+            return String(data);
+        }
+    }
+
+    function clearLogs() {
+        logs.length = 0;
+        if ($logPanel) renderLogEntries($logPanel);
+    }
+
+    function exportLogsText() {
+        return logs.map((e) => {
+            const t = new Date(e.time).toLocaleString();
+            return `[${t}] [${e.level.toUpperCase()}] [${e.tag}] ${e.msg}${e.data ? `\n${e.data}` : ''}`;
+        }).join('\n\n');
+    }
+
+    // ------------------------------------------------------------------
     // 默认设置 & 持久化（全局设置存 extension_settings，随存档/浏览器持久化）
     // ------------------------------------------------------------------
     const defaultSettings = () => ({
@@ -233,16 +279,32 @@
     // ------------------------------------------------------------------
     // 模型调用（跟随酒馆当前 API，或使用独立 API）
     // ------------------------------------------------------------------
-    async function callModel(systemPrompt, userPrompt) {
+    async function callModel(systemPrompt, userPrompt, label = '') {
         const s = settings();
-        if (s.api.mode === 'custom' && s.api.url) {
-            return callCustomApi(systemPrompt, userPrompt);
+        log('info', 'request', `[${label}] 发起请求（模式：${s.api.mode === 'custom' ? '独立API' : '跟随酒馆'}）`, {
+            systemPrompt,
+            userPrompt,
+        });
+        let raw;
+        try {
+            if (s.api.mode === 'custom' && s.api.url) {
+                raw = await callCustomApi(systemPrompt, userPrompt);
+            } else {
+                // 跟随酒馆当前正文所用的 API/连接配置，走原生 generateRaw（不经过 WI/AN 自动扫描，
+                // 上下文素材由本扩展自行拼接到 userPrompt 中）。
+                const c = ctx();
+                const result = await c.generateRaw({ prompt: userPrompt, systemPrompt });
+                raw = typeof result === 'string' ? result : String(result ?? '');
+            }
+        } catch (err) {
+            log('error', 'request', `[${label}] 请求失败：${err.message || err}`, err);
+            throw err;
         }
-        // 跟随酒馆当前正文所用的 API/连接配置，走原生 generateRaw（不经过 WI/AN 自动扫描，
-        // 上下文素材由本扩展自行拼接到 userPrompt 中）。
-        const c = ctx();
-        const raw = await c.generateRaw({ prompt: userPrompt, systemPrompt });
-        return typeof raw === 'string' ? raw : String(raw ?? '');
+        log('info', 'response', `[${label}] 收到响应（长度 ${raw.length} 字符）`, raw);
+        if (!raw || !raw.trim()) {
+            log('warn', 'response', `[${label}] 响应为空字符串，请检查所选 API/连接配置是否可用`);
+        }
+        return raw;
     }
 
     async function callCustomApi(systemPrompt, userPrompt) {
@@ -250,22 +312,22 @@
         const base = s.api.url.replace(/\/+$/, '');
         const headers = { 'Content-Type': 'application/json' };
         if (s.api.key) headers['Authorization'] = `Bearer ${s.api.key}`;
-        const res = await fetch(`${base}/chat/completions`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                model: s.api.model || undefined,
-                messages: [
-                    ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
-                    { role: 'user', content: userPrompt },
-                ],
-                stream: false,
-            }),
+        const body = JSON.stringify({
+            model: s.api.model || undefined,
+            messages: [
+                ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+                { role: 'user', content: userPrompt },
+            ],
+            stream: false,
         });
+        log('debug', 'request', `独立 API 请求：POST ${base}/chat/completions`, { model: s.api.model, hasKey: !!s.api.key });
+        const res = await fetch(`${base}/chat/completions`, { method: 'POST', headers, body });
         if (!res.ok) {
-            throw new Error(`独立 API 请求失败：HTTP ${res.status} ${res.statusText}`);
+            const text = await res.text().catch(() => '');
+            throw new Error(`独立 API 请求失败：HTTP ${res.status} ${res.statusText} ${text.slice(0, 300)}`);
         }
         const data = await res.json();
+        log('debug', 'response', '独立 API 原始返回', data);
         return data?.choices?.[0]?.message?.content ?? '';
     }
 
@@ -284,24 +346,63 @@
     }
 
     function stripCodeFence(text) {
-        return String(text || '')
-            .trim()
-            .replace(/^```(?:json|html)?\s*/i, '')
-            .replace(/```\s*$/i, '')
-            .trim();
+        let t = String(text || '').trim();
+        // 去掉最外层的 Markdown 代码块围栏（不要求围栏必须在字符串的最开头/最结尾，
+        // 因为部分模型会在代码块前后附带说明文字）。
+        const fenceMatch = t.match(/```(?:json|html)?\s*([\s\S]*?)```/i);
+        if (fenceMatch) return fenceMatch[1].trim();
+        // 没有闭合围栏（比如被截断）时，至少去掉开头的围栏标记
+        t = t.replace(/^```(?:json|html)?\s*/i, '');
+        return t.trim();
+    }
+
+    /**
+     * 尽量从模型的自由格式回复中解析出 JSON 对象，每一步都写日志，方便排查
+     * “模型返回了什么、我们是怎么解析失败的”。
+     */
+    function tryParseJsonRobust(raw, label = '') {
+        const attempts = [];
+
+        // 尝试 1：直接解析原始文本
+        attempts.push({ name: '直接 JSON.parse(原始文本)', text: raw });
+        // 尝试 2：去除 Markdown 代码块围栏后解析
+        const fenced = stripCodeFence(raw);
+        if (fenced !== raw) attempts.push({ name: '去除代码块围栏后解析', text: fenced });
+        // 尝试 3：截取第一个 { 到最后一个 } 之间的内容
+        const braceMatch = raw.match(/\{[\s\S]*\}/);
+        if (braceMatch) attempts.push({ name: '截取花括号包裹的最大片段', text: braceMatch[0] });
+        // 尝试 4：在去围栏文本里再截取花括号片段
+        if (fenced !== raw) {
+            const braceMatch2 = fenced.match(/\{[\s\S]*\}/);
+            if (braceMatch2) attempts.push({ name: '去围栏 + 截取花括号片段', text: braceMatch2[0] });
+        }
+
+        for (const attempt of attempts) {
+            try {
+                const parsed = JSON.parse(attempt.text);
+                log('info', 'parse', `[${label}] JSON 解析成功，使用方式：${attempt.name}`);
+                return parsed;
+            } catch (err) {
+                log('debug', 'parse', `[${label}] 解析尝试失败（${attempt.name}）：${err.message}`);
+            }
+        }
+        log('error', 'parse', `[${label}] 所有解析方式均失败，模型可能没有按要求返回 JSON。原始响应已记录在上方 response 日志中，可对照检查模型是否输出了额外说明文字、Markdown 表格等非 JSON 内容。`);
+        return null;
     }
 
     // ------------------------------------------------------------------
     // 生成：组件
     // ------------------------------------------------------------------
     async function generateWidget(widget) {
+        log('info', 'system', `开始生成组件「${widget.name}」`, { id: widget.id, prompt: widget.prompt });
         const extras = await gatherExtras();
         const userPrompt = buildWidgetUserPrompt(widget, extras);
-        const raw = await callModel(WIDGET_SYSTEM_PROMPT, userPrompt);
+        const raw = await callModel(WIDGET_SYSTEM_PROMPT, userPrompt, `组件:${widget.name}`);
         const html = stripCodeFence(raw);
         const cd = chatData();
         cd.widgetResults[widget.id] = { html, updatedAt: Date.now() };
         saveChatData();
+        log('info', 'system', `组件「${widget.name}」生成完成，已写入 chatMetadata.${MODULE_NAME}.widgetResults["${widget.id}"]`);
         return html;
     }
 
@@ -328,42 +429,80 @@
     // 生成：镜头之外
     // ------------------------------------------------------------------
     async function generateOffscreen({ onProgress } = {}) {
-        onProgress?.('start');
+        log('info', 'system', '开始生成/更新「镜头之外」内容');
+        onProgress?.('offscreen', 'start');
         const extras = await gatherExtras();
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
-            const raw = await callModel(OFFSCREEN_SYSTEM_PROMPT, userPrompt);
-            const cleaned = stripCodeFence(raw);
-            let parsed;
-            try {
-                parsed = JSON.parse(cleaned);
-            } catch (e) {
-                // 尝试提取花括号内内容做二次解析
-                const match = cleaned.match(/\{[\s\S]*\}/);
-                if (match) parsed = JSON.parse(match[0]);
-                else throw e;
+            const raw = await callModel(OFFSCREEN_SYSTEM_PROMPT, userPrompt, '镜头之外');
+            const parsed = tryParseJsonRobust(raw, '镜头之外');
+            if (!parsed) {
+                throw new Error('未能从模型响应中解析出 JSON，两张表格因此没有更新。请在「日志」标签页查看完整响应内容，确认模型是否遵循了 JSON 格式要求。');
+            }
+            if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error(`解析出的内容不是预期的对象结构（实际类型：${Array.isArray(parsed) ? 'array' : typeof parsed}）`);
             }
             const cd = chatData();
-            cd.offscreen.narrative = parsed.narrative || cd.offscreen.narrative || '';
-            if (Array.isArray(parsed.schedule_table)) cd.offscreen.scheduleTable = parsed.schedule_table;
-            if (Array.isArray(parsed.character_table)) cd.offscreen.characterTable = parsed.character_table;
+            let changed = [];
+            if (typeof parsed.narrative === 'string' && parsed.narrative.trim()) {
+                cd.offscreen.narrative = parsed.narrative;
+                changed.push('narrative');
+            }
+            if (Array.isArray(parsed.schedule_table)) {
+                cd.offscreen.scheduleTable = normalizeScheduleRows(parsed.schedule_table);
+                changed.push(`schedule_table(${cd.offscreen.scheduleTable.length}行)`);
+            } else {
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 schedule_table 数组字段（表7 日程表未更新）', parsed);
+            }
+            if (Array.isArray(parsed.character_table)) {
+                cd.offscreen.characterTable = normalizeCharacterRows(parsed.character_table);
+                changed.push(`character_table(${cd.offscreen.characterTable.length}行)`);
+            } else {
+                log('warn', 'parse', '响应 JSON 中没有找到合法的 character_table 数组字段（表4 角色表未更新）', parsed);
+            }
             cd.offscreen.updatedAt = Date.now();
             saveChatData();
-            onProgress?.('done');
+            log('info', 'system', `「镜头之外」更新完成，已写入 chatMetadata.${MODULE_NAME}.offscreen：${changed.join('、') || '（无字段被更新，请检查上面的 parse 警告）'}`);
+            onProgress?.('offscreen', 'done');
         } catch (err) {
-            console.error('[镜头之外] 生成失败', err);
-            onProgress?.('error', err);
+            log('error', 'system', `「镜头之外」生成失败：${err.message || err}`, err);
+            onProgress?.('offscreen', 'error', err);
             throw err;
         }
         updateInjections();
     }
 
+    // 兼容模型可能使用的不同字段名（中文/拼音/英文），尽量把返回内容对齐到内部统一字段
+    function normalizeScheduleRows(rows) {
+        return rows.map((r) => ({
+            role: r.role ?? r.角色 ?? r.name ?? '',
+            routine: r.routine ?? r.固定日程规律 ?? r.fixed_schedule ?? '',
+            seasonal: r.seasonal ?? r.时节性必然事件 ?? r.seasonal_event ?? '',
+            pool: r.pool ?? r.弹性事务参考池 ?? r.flexible_pool ?? '',
+        }));
+    }
+    function normalizeCharacterRows(rows) {
+        return rows.map((r) => ({
+            name: r.name ?? r.姓名 ?? '',
+            alias: r.alias ?? r.昵称 ?? r.nickname ?? '',
+            relation: r.relation ?? r.关系 ?? r['与用户的关系'] ?? '',
+            location: r.location ?? r.当前位置与正在做的事 ?? r.status ?? '',
+            attitude: r.attitude ?? r.态度 ?? r['对用户的态度'] ?? '',
+        }));
+    }
+
     async function runGenerationPipeline(onProgress) {
+        log('info', 'system', '=== 开始批量生成流程 ===');
         await generateAllWidgets({ onProgress });
         const s = settings();
         if (s.offscreen.enabled) {
-            try { await generateOffscreen({ onProgress }); } catch (e) { /* 已在内部记录 */ }
+            try {
+                await generateOffscreen({ onProgress });
+            } catch (e) {
+                toast(`「镜头之外」生成失败：${e.message || e}，详情请看日志标签页`, 'error');
+            }
         }
+        log('info', 'system', '=== 批量生成流程结束 ===');
     }
 
     // ------------------------------------------------------------------
@@ -375,19 +514,29 @@
 
     async function onCharacterMessageRendered(messageId) {
         const s = settings();
-        if (s.triggerMode !== 'auto') return;
+        if (s.triggerMode !== 'auto') {
+            log('debug', 'trigger', `收到 CHARACTER_MESSAGE_RENDERED（消息#${messageId}），但当前为手动模式，跳过`);
+            return;
+        }
         const c = ctx();
         const mes = c.chat?.[messageId];
-        if (!mes || mes.is_user || mes.is_system) return;
-        if (!messageHasClosedContentTag(mes.mes)) return;
+        if (!mes || mes.is_user || mes.is_system) {
+            log('debug', 'trigger', `消息#${messageId} 不是角色回复（is_user/is_system），跳过`);
+            return;
+        }
+        const matched = messageHasClosedContentTag(mes.mes);
+        log(matched ? 'info' : 'debug', 'trigger',
+            `消息#${messageId} <content> 标签检测：${matched ? '匹配成功，准备自动生成' : '未匹配到闭合标签，跳过'}`,
+            { mesPreview: String(mes.mes || '').slice(0, 500) });
+        if (!matched) return;
         toast('检测到新正文，正在后台生成组件…', 'info');
         try {
             await runGenerationPipeline();
-            toast('组件生成完成', 'success');
+            toast('自动生成流程结束（详情见日志标签页）', 'success');
             refreshOpenPanels();
         } catch (err) {
-            console.error(err);
-            toast('组件生成出现错误，详见控制台', 'error');
+            log('error', 'trigger', '自动生成流程抛出未捕获异常', err);
+            toast('组件生成出现错误，详见日志标签页', 'error');
         }
     }
 
@@ -401,6 +550,7 @@
     function updateInjections() {
         const c = ctx();
         const s = settings();
+        log('debug', 'inject', `更新正文注入（组件注入:${s.injectWidgets ? '开' : '关'}，镜头之外注入:${s.offscreen.enabled && s.offscreen.injectTables ? '开' : '关'}）`);
         // 组件注入
         if (s.injectWidgets) {
             const cd = chatData();
@@ -502,10 +652,12 @@
               <div class="ow-tab active" data-tab="widgets">组件生成</div>
               <div class="ow-tab" data-tab="offscreen">镜头之外</div>
               <div class="ow-tab" data-tab="settings">设置</div>
+              <div class="ow-tab" data-tab="log">日志<span class="ow-log-badge" id="ow_log_badge" style="display:none;"></span></div>
             </div>
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
             <div class="ow-panel" data-panel="settings"></div>
+            <div class="ow-panel" data-panel="log"></div>
           </div>
         </div>`;
         $modal = $(html).appendTo(document.body);
@@ -524,17 +676,67 @@
         renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
         renderSettingsPanel($modal.find('.ow-panel[data-panel="settings"]'));
+        $logPanel = $modal.find('.ow-panel[data-panel="log"]');
+        renderLogEntries($logPanel);
+        log('info', 'ui', '主界面已打开');
     }
 
     function closeModal() {
         $modal?.remove();
         $modal = null;
+        $logPanel = null;
     }
 
     function refreshOpenPanels() {
         if (!$modal) return;
         renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+    }
+
+    // ---------------- 日志面板 ----------------
+    function renderLogPanelShell($panel) {
+        $panel.html(`
+        <div class="ow-row">
+          <button class="ow-btn" id="ow_log_copy"><i class="fa-regular fa-copy"></i> 复制全部日志</button>
+          <button class="ow-btn ow-danger" id="ow_log_clear"><i class="fa-solid fa-broom"></i> 清空日志</button>
+          <span class="ow-muted">日志仅保存在本次页面会话的内存中，刷新页面会清空；出问题时请复制后发给开发者对照排查。</span>
+        </div>
+        <div id="ow_log_entries"></div>`);
+        $panel.find('#ow_log_copy').on('click', async () => {
+            const text = exportLogsText() || '（暂无日志）';
+            try {
+                await navigator.clipboard.writeText(text);
+                toast('日志已复制到剪贴板', 'success');
+            } catch (e) {
+                // 剪贴板 API 不可用时，退化为弹窗展示可手动复制
+                const w = window.open('', '_blank');
+                if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(text)}</pre>`);
+            }
+        });
+        $panel.find('#ow_log_clear').on('click', () => {
+            if (confirm('确定清空全部日志吗？')) clearLogs();
+        });
+    }
+
+    function renderLogEntries($panel) {
+        if (!$panel || !$panel.length) return;
+        if (!$panel.find('#ow_log_entries').length) renderLogPanelShell($panel);
+        const $entries = $panel.find('#ow_log_entries');
+        const levelColor = { error: '#f66', warn: '#e6b800', info: 'inherit', debug: '#888' };
+        if (!logs.length) {
+            $entries.html('<div class="ow-empty">暂无日志，进行一次生成操作后这里会显示详细过程。</div>');
+            return;
+        }
+        const wasAtBottom = $entries.length && Math.abs($entries[0].scrollHeight - $entries.scrollTop() - $entries.outerHeight()) < 40;
+        $entries.html(logs.slice().reverse().map((e) => {
+            const t = new Date(e.time).toLocaleTimeString();
+            const color = levelColor[e.level] || 'inherit';
+            return `<div class="ow-log-entry" style="border-left:3px solid ${color};padding:4px 8px;margin-bottom:4px;font-size:0.82em;">
+                <div style="opacity:0.7;">${t} · <b style="color:${color};">${e.level.toUpperCase()}</b> · ${escapeHtml(e.tag)}</div>
+                <div>${escapeHtml(e.msg)}</div>
+                ${e.data ? `<pre style="white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto;background:rgba(255,255,255,0.04);padding:6px;border-radius:4px;margin-top:4px;">${escapeHtml(e.data)}</pre>` : ''}
+            </div>`;
+        }).join(''));
     }
 
     function applyTheme() {
@@ -546,32 +748,33 @@
         }
     }
 
-    // ---------------- 组件生成面板 ----------------
+    // ---------------- 组件生成面板：模块一「组件显示」+ 模块二「组件列表」 ----------------
     function renderWidgetsPanel($panel) {
         const s = settings();
-        const cd = chatData();
 
-        let html = `
+        $panel.html(`
+        <div class="ow-row">
+          <button class="ow-btn ow-primary" id="ow_generate_now"><i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件</button>
+          <span class="ow-muted">当前触发模式：${s.triggerMode === 'auto' ? '自动（检测到新正文自动生成）' : '手动'}，可在“设置”中修改；生成过程详情见“日志”标签页</span>
+        </div>
+
+        <div class="ow-section-title">① 组件显示（API 返回的渲染结果）</div>
+        <div id="ow_widget_results"></div>
+
+        <div class="ow-section-title" style="margin-top:20px;">② 组件列表（新建 / 编辑 / 勾选预设条目）</div>
         <div class="ow-row">
           <button class="ow-btn ow-primary" id="ow_add_widget"><i class="fa-solid fa-plus"></i> 新建组件</button>
-          <button class="ow-btn" id="ow_generate_now"><i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件</button>
-          <span class="ow-muted">当前模式：${s.triggerMode === 'auto' ? '自动（检测到新正文自动生成）' : '手动'}，可在“设置”中修改</span>
         </div>
-        <div id="ow_widget_list"></div>`;
-        $panel.html(html);
+        <div id="ow_widget_list"></div>`);
 
-        const $list = $panel.find('#ow_widget_list');
-        if (!s.widgets.length) {
-            $list.append('<div class="ow-empty">还没有组件，点击上方“新建组件”添加一个吧。</div>');
-        }
-        for (const w of s.widgets) {
-            $list.append(renderWidgetCard(w, cd.widgetResults[w.id]));
-        }
+        renderWidgetResults($panel);
+        renderWidgetList($panel);
 
         $panel.find('#ow_add_widget').on('click', () => {
             s.widgets.push({ id: uid(), name: '新组件', prompt: '', enabled: true, presetEntries: [] });
             saveSettings();
-            renderWidgetsPanel($panel);
+            log('info', 'ui', '新建了一个组件');
+            renderWidgetList($panel);
         });
 
         $panel.find('#ow_generate_now').on('click', async () => {
@@ -579,41 +782,99 @@
             $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner ow-spin"></i> 生成中…');
             try {
                 await runGenerationPipeline((w, phase) => {
-                    if (phase === 'start') toast(`正在生成：${w.name || w}`, 'info');
+                    const name = (w && w.name) ? w.name : (w === 'offscreen' ? '镜头之外' : String(w));
+                    if (phase === 'start') toast(`正在生成：${name}`, 'info');
+                    if (phase === 'error') toast(`「${name}」生成出错，详见日志标签页`, 'error');
                 });
-                toast('全部组件生成完成', 'success');
+                toast('全部生成任务已结束（若有失败项请查看日志标签页）', 'success');
             } catch (err) {
-                console.error(err);
-                toast('生成过程中出现错误，详见控制台', 'error');
+                log('error', 'system', '批量生成流程抛出未捕获异常', err);
+                toast('生成过程中出现错误，详见日志标签页', 'error');
             } finally {
                 $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件');
-                renderWidgetsPanel($panel);
+                renderWidgetResults($panel);
             }
         });
+    }
 
+    // ---- 模块一：组件显示（只读结果，带前端渲染预览）----
+    function renderWidgetResults($panel) {
+        const s = settings();
+        const cd = chatData();
+        const $results = $panel.find('#ow_widget_results');
+        $results.empty();
+
+        const withResults = s.widgets.filter((w) => cd.widgetResults[w.id]);
+        if (!withResults.length) {
+            $results.append('<div class="ow-empty">还没有任何生成结果。点「立即生成全部已开启组件」，或到下方组件列表里单独生成某一个。</div>');
+            return;
+        }
+        for (const w of withResults) {
+            const result = cd.widgetResults[w.id];
+            $results.append(`
+              <div class="ow-result-frame-wrap" data-id="${w.id}" style="margin-bottom:12px;">
+                <div class="ow-result-head">
+                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 生成失败' : `✅ ${new Date(result.updatedAt).toLocaleString()}`}</span>
+                  <span>
+                    <button class="ow-btn" data-action="view-raw" data-id="${w.id}">查看源码</button>
+                    <button class="ow-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
+                  </span>
+                </div>
+                <iframe class="ow-result-frame" sandbox="allow-scripts" srcdoc="${escapeHtml(result.html)}"></iframe>
+              </div>`);
+        }
+
+        $results.off('click', '[data-action="view-raw"]').on('click', '[data-action="view-raw"]', function () {
+            const id = $(this).data('id');
+            const res = chatData().widgetResults[id];
+            if (!res) return;
+            const w = window.open('', '_blank');
+            if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(res.html)}</pre>`);
+        });
+
+        $results.off('click', '[data-action="regen-one"]').on('click', '[data-action="regen-one"]', async function () {
+            const id = $(this).data('id');
+            const w = s.widgets.find((x) => x.id === id);
+            if (!w) return;
+            const $btn = $(this);
+            $btn.prop('disabled', true);
+            try {
+                await generateWidget(w);
+                toast(`「${w.name}」已重新生成`, 'success');
+            } catch (err) {
+                toast(`「${w.name}」生成失败：${err.message || err}`, 'error');
+            } finally {
+                updateInjections();
+                renderWidgetResults($panel);
+            }
+        });
+    }
+
+    // ---- 模块二：组件列表（管理，不包含结果预览）----
+    function renderWidgetList($panel) {
+        const s = settings();
+        const $list = $panel.find('#ow_widget_list');
+        $list.empty();
+        if (!s.widgets.length) {
+            $list.append('<div class="ow-empty">还没有组件，点上方「新建组件」添加一个吧。</div>');
+        }
+        for (const w of s.widgets) {
+            $list.append(renderWidgetCard(w));
+        }
         bindWidgetCardEvents($panel);
     }
 
-    function renderWidgetCard(widget, result) {
+    function renderWidgetCard(widget) {
         const chips = (widget.presetEntries || [])
             .map((e, idx) => `<span class="ow-chip" data-widget="${widget.id}" data-idx="${idx}">${escapeHtml(e.name)}<span class="ow-chip-x" title="移除">✕</span></span>`)
             .join('');
-        const resultBlock = result?.html
-            ? `<div class="ow-result-frame-wrap">
-                 <div class="ow-result-head">
-                   <span>${result.error ? '⚠️ 生成失败' : `✅ 上次生成：${new Date(result.updatedAt).toLocaleString()}`}</span>
-                   <button class="ow-btn" data-action="view-raw" data-id="${widget.id}">查看源码</button>
-                 </div>
-                 <iframe class="ow-result-frame" sandbox="allow-scripts" srcdoc="${escapeHtml(result.html)}"></iframe>
-               </div>`
-            : '<div class="ow-muted" style="margin-top:6px;">尚未生成</div>';
 
         return $(`
         <div class="ow-widget-card" data-id="${widget.id}">
           <div class="ow-widget-card-head">
             <input type="checkbox" class="ow-enabled-toggle" ${widget.enabled ? 'checked' : ''} title="是否随批量生成一起发送">
             <input type="text" class="ow-input ow-name-input" value="${escapeHtml(widget.name)}" placeholder="组件名称">
-            <button class="ow-btn" data-action="gen-one" title="仅生成此组件"><i class="fa-solid fa-play"></i></button>
+            <button class="ow-btn" data-action="gen-one" title="仅生成此组件（结果显示在上方模块①）"><i class="fa-solid fa-play"></i></button>
             <button class="ow-btn ow-danger" data-action="delete" title="删除组件"><i class="fa-solid fa-trash"></i></button>
           </div>
           <textarea class="ow-textarea ow-prompt-input" placeholder="描述这个组件要生成什么，例如：生成一个虚构论坛帖子，主题是……">${escapeHtml(widget.prompt)}</textarea>
@@ -623,7 +884,6 @@
           </div>
           <div class="ow-preset-list" style="display:none;"></div>
           <div class="ow-preset-chips">${chips}</div>
-          ${resultBlock}
         </div>`);
     }
 
@@ -654,7 +914,8 @@
             s.widgets = s.widgets.filter((x) => x.id !== id);
             delete chatData().widgetResults[id];
             saveSettings(); saveChatData();
-            renderWidgetsPanel($panel);
+            renderWidgetList($panel);
+            renderWidgetResults($panel);
         });
 
         $panel.off('click', '[data-action="gen-one"]').on('click', '[data-action="gen-one"]', async function () {
@@ -665,23 +926,14 @@
             $btn.prop('disabled', true);
             try {
                 await generateWidget(w);
-                toast(`「${w.name}」生成完成`, 'success');
+                toast(`「${w.name}」生成完成，结果见上方模块①`, 'success');
             } catch (err) {
-                console.error(err);
-                toast(`「${w.name}」生成失败：${err.message || err}`, 'error');
+                toast(`「${w.name}」生成失败：${err.message || err}，详见日志标签页`, 'error');
             } finally {
                 $btn.prop('disabled', false);
                 updateInjections();
-                renderWidgetsPanel($panel);
+                renderWidgetResults($panel);
             }
-        });
-
-        $panel.off('click', '[data-action="view-raw"]').on('click', '[data-action="view-raw"]', function () {
-            const id = $(this).data('id');
-            const res = chatData().widgetResults[id];
-            if (!res) return;
-            const w = window.open('', '_blank');
-            if (w) { w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(res.html)}</pre>`); }
         });
 
         // 预设下拉：填充选项
@@ -727,7 +979,7 @@
                 }
             }
             saveSettings();
-            renderWidgetsPanel($panel);
+            renderWidgetList($panel);
         });
 
         $panel.off('click', '.ow-chip-x').on('click', '.ow-chip-x', function (e) {
@@ -736,7 +988,7 @@
             const id = $chip.data('widget');
             const idx = $chip.data('idx');
             const w = s.widgets.find((x) => x.id === id);
-            if (w) { w.presetEntries.splice(idx, 1); saveSettings(); renderWidgetsPanel($panel); }
+            if (w) { w.presetEntries.splice(idx, 1); saveSettings(); renderWidgetList($panel); }
         });
     }
 
@@ -1032,9 +1284,13 @@
             waitForMenu();
             const c = ctx();
             c.eventSource.on(c.eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
-            c.eventSource.on(c.eventTypes.CHAT_CHANGED, () => { refreshOpenPanels(); });
+            c.eventSource.on(c.eventTypes.CHAT_CHANGED, () => {
+                log('debug', 'system', '检测到 CHAT_CHANGED，刷新已打开的面板');
+                refreshOpenPanels();
+            });
+            log('info', 'system', '扩展初始化完成');
         } catch (err) {
-            console.error('[镜头之外 · 组件生成器] 初始化失败', err);
+            log('error', 'system', '初始化失败', err);
         }
     });
 })();

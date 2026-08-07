@@ -196,6 +196,16 @@
 /* 输入区“魔法棒”菜单入口 */
 #ow_menu_button i { margin-right: 4px; }
 
+.ow-log-badge {
+    display: inline-block;
+    background: #c33;
+    color: #fff;
+    border-radius: 10px;
+    font-size: 0.7em;
+    padding: 0 6px;
+    margin-left: 4px;
+}
+
 .ow-spin {
     display: inline-block;
     animation: ow-spin 1s linear infinite;
