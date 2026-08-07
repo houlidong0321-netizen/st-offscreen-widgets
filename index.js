@@ -501,6 +501,8 @@
             } catch (e) {
                 toast(`「镜头之外」生成失败：${e.message || e}，详情请看日志标签页`, 'error');
             }
+        } else {
+            log('info', 'system', '"镜头之外"当前未启用（设置页 / 镜头之外标签页里的开关），本次批量生成跳过了它。若你希望它随组件一起生成，请先勾选"启用镜头之外"。');
         }
         log('info', 'system', '=== 批量生成流程结束 ===');
     }
@@ -793,6 +795,10 @@
             } finally {
                 $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件');
                 renderWidgetResults($panel);
+                if ($modal) {
+                    log('debug', 'ui', '批量生成结束，刷新"镜头之外"标签页显示（即使当前未切换到该标签页也一并更新，避免数据已写入但界面未重绘）');
+                    renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+                }
             }
         });
     }
