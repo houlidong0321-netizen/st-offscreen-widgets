@@ -615,3 +615,34 @@
     .ow-widget-name { max-width: 38%; }
     .ow-result-head { flex-wrap: wrap; }
 }
+
+/* ---------------------------------------------------------------- 收藏夹 */
+.ow-fav-item {
+    border-top: 1px solid var(--ow-border);
+    padding: 8px 0 6px;
+}
+.ow-fav-item:first-child { border-top: none; }
+
+.ow-fav-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.ow-fav-name {
+    font-weight: 500;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 32%;
+}
+
+.ow-fav-tags { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.ow-fav-tags .ow-chip { margin: 0; font-size: 11px; }
+.ow-fav-tags .ow-chip i { opacity: 0.6; font-size: 10px; }
+
+.ow-fav-meta .ow-btn { padding: 4px 9px; font-size: 11.5px; }
+
+.ow-fav-btn i.fa-solid.fa-star { color: #f0c14b; }

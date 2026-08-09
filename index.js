@@ -223,6 +223,8 @@
             offscreenPreamble: DEFAULT_OFFSCREEN_PREAMBLE,
         },
         offscreenTables: defaultOffscreenTables(),
+        // 收藏夹：跨聊天全局保存，folders 为文件夹，items 为收藏的组件快照
+        favorites: { folders: [{ id: 'default', name: '默认收藏夹', createdAt: Date.now() }], items: [] },
         // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
         // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
         worldInfoOverrides: {},
@@ -776,7 +778,7 @@
             for (const t of getOffscreenTables({ onlyEnabled: true })) {
                 const rows = parsed[t.jsonKey];
                 if (Array.isArray(rows)) {
-                    cd.offscreen.tables[t.key] = normalizeRowsGeneric(rows, t.columns);
+                    cd.offscreen.tables[t.key] = normalizeRowsGeneric(rows, t.columns, t.title);
                     changed.push(`${t.title}(${cd.offscreen.tables[t.key].length}行)`);
                 } else {
                     log('warn', 'parse', `响应中没有合法的 ${t.jsonKey} 数组（${t.title}未更新，保留旧数据）`, parsed);
@@ -1055,6 +1057,244 @@
     }
 
     // ------------------------------------------------------------------
+    // 收藏夹：把某次生成的组件结果快照存进全局设置，跨聊天可查看。
+    // 每条记录日期、角色名、用户名，便于日后回溯是哪个场景下生成的。
+    // ------------------------------------------------------------------
+    function favs() {
+        const s = settings();
+        if (!s.favorites) s.favorites = { folders: [], items: [] };
+        if (!Array.isArray(s.favorites.folders)) s.favorites.folders = [];
+        if (!Array.isArray(s.favorites.items)) s.favorites.items = [];
+        if (!s.favorites.folders.length) {
+            s.favorites.folders.push({ id: 'default', name: '默认收藏夹', createdAt: Date.now() });
+        }
+        return s.favorites;
+    }
+
+    function currentNames() {
+        const c = ctx();
+        const charName = c.characters?.[c.characterId]?.name || c.name2 || '未知角色';
+        const userName = c.name1 || '用户';
+        return { charName, userName };
+    }
+
+    function addFavorite(widget, folderId) {
+        const f = favs();
+        const cd = chatData();
+        const result = cd.widgetResults[widget.id];
+        if (!result?.html) { toast('这个组件还没有生成结果，无法收藏', 'warning'); return null; }
+        const { charName, userName } = currentNames();
+        const item = {
+            id: `fav_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+            folderId: folderId || f.folders[0].id,
+            widgetId: widget.id,
+            widgetName: widget.name || '未命名组件',
+            html: result.html,
+            savedAt: Date.now(),
+            charName,
+            userName,
+        };
+        f.items.push(item);
+        saveSettings();
+        log('info', 'system', `已收藏组件「${item.widgetName}」到「${f.folders.find((x) => x.id === item.folderId)?.name || '收藏夹'}」`);
+        return item;
+    }
+
+    function isFavorited(widgetId) {
+        const cd = chatData();
+        const html = cd.widgetResults[widgetId]?.html;
+        if (!html) return false;
+        return favs().items.some((it) => it.widgetId === widgetId && it.html === html);
+    }
+
+    // 选择收藏到哪个文件夹的小弹窗
+    function openFavoriteDialog(widget) {
+        const f = favs();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:70vh;width:min(460px,92vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">收藏「${escapeHtml(widget.name || '未命名组件')}」</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-field-label">选择收藏夹</div>
+              <select class="ow-select" id="ow_fav_folder" style="width:100%;">
+                ${f.folders.map((fo) => `<option value="${escapeHtml(fo.id)}">${escapeHtml(fo.name)}</option>`).join('')}
+              </select>
+              <div class="ow-row" style="margin-top:10px;">
+                <input type="text" class="ow-input ow-grow" id="ow_fav_new_folder" placeholder="或新建收藏夹，输入名称">
+                <button class="ow-btn" id="ow_fav_create">新建</button>
+              </div>
+              <div class="ow-row" style="margin-top:14px;justify-content:flex-end;">
+                <button class="ow-btn" id="ow_fav_cancel">取消</button>
+                <button class="ow-btn ow-primary" id="ow_fav_confirm">收藏</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.body);
+
+        const close = () => $ov.remove();
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close, #ow_fav_cancel').on('click', close);
+        $ov.find('#ow_fav_create').on('click', function () {
+            const name = String($ov.find('#ow_fav_new_folder').val() || '').trim();
+            if (!name) { toast('请输入收藏夹名称', 'warning'); return; }
+            const fo = { id: `folder_${Date.now().toString(36)}`, name, createdAt: Date.now() };
+            f.folders.push(fo);
+            saveSettings();
+            $ov.find('#ow_fav_folder').append(`<option value="${escapeHtml(fo.id)}" selected>${escapeHtml(fo.name)}</option>`);
+            $ov.find('#ow_fav_new_folder').val('');
+        });
+        $ov.find('#ow_fav_confirm').on('click', function () {
+            const folderId = $ov.find('#ow_fav_folder').val();
+            const item = addFavorite(widget, folderId);
+            if (item) toast(`已收藏到「${f.folders.find((x) => x.id === folderId)?.name}」`, 'success');
+            close();
+            if ($modal) renderFavoritesPanel($modal.find('.ow-panel[data-panel="favorites"]'));
+        });
+    }
+
+    // ---------------- 收藏夹面板 ----------------
+    function renderFavoritesPanel($panel) {
+        const f = favs();
+        bindPreviewAutoResize();
+        $panel.html(`
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <span class="ow-muted">${f.items.length} 个收藏 · ${f.folders.length} 个文件夹</span>
+          </div>
+          <button class="ow-btn" id="ow_fav_add_folder"><i class="fa-solid fa-folder-plus"></i> 新建文件夹</button>
+        </div>
+        <div id="ow_fav_folders"></div>`);
+
+        const $wrap = $panel.find('#ow_fav_folders');
+        if (!f.items.length) {
+            $wrap.html('<div class="ow-empty">还没有收藏。在「组件生成」里点组件右上角的 ☆ 收藏按钮即可保存。</div>');
+        } else {
+            let html = '';
+            for (const fo of f.folders) {
+                const items = f.items.filter((it) => it.folderId === fo.id).sort((a, b) => b.savedAt - a.savedAt);
+                html += `
+                <div class="ow-widget-card ow-collapsed" data-folder="${escapeHtml(fo.id)}">
+                  <div class="ow-widget-card-head">
+                    <span class="ow-caret" data-action="fav-toggle"><i class="fa-solid fa-chevron-right"></i></span>
+                    <i class="fa-solid fa-folder" style="opacity:.6;"></i>
+                    <span class="ow-widget-name" data-action="fav-toggle">${escapeHtml(fo.name)}</span>
+                    <span class="ow-muted ow-widget-meta">${items.length} 项</span>
+                    <span class="ow-spacer"></span>
+                    <button class="ow-btn" data-action="fav-rename" title="重命名"><i class="fa-solid fa-pen"></i></button>
+                    <button class="ow-btn ow-danger" data-action="fav-del-folder" title="删除文件夹"><i class="fa-solid fa-trash"></i></button>
+                  </div>
+                  <div class="ow-widget-card-body">
+                    ${items.length ? items.map((it) => `
+                      <div class="ow-fav-item" data-fav="${escapeHtml(it.id)}">
+                        <div class="ow-fav-meta">
+                          <span class="ow-fav-name">${escapeHtml(it.widgetName)}</span>
+                          <span class="ow-fav-tags">
+                            <span class="ow-chip">${new Date(it.savedAt).toLocaleDateString()} ${new Date(it.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                            <span class="ow-chip"><i class="fa-solid fa-masks-theater"></i> ${escapeHtml(it.charName)}</span>
+                            <span class="ow-chip"><i class="fa-solid fa-user"></i> ${escapeHtml(it.userName)}</span>
+                          </span>
+                          <span class="ow-spacer"></span>
+                          <button class="ow-btn" data-action="fav-view" title="查看"><i class="fa-solid fa-eye"></i></button>
+                          <button class="ow-btn" data-action="fav-move" title="移动到其他文件夹"><i class="fa-solid fa-folder-tree"></i></button>
+                          <button class="ow-btn ow-danger" data-action="fav-del" title="删除"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                        <div class="ow-fav-preview" style="display:none;"></div>
+                      </div>`).join('') : '<div class="ow-muted" style="padding:6px 2px;">这个文件夹还是空的</div>'}
+                  </div>
+                </div>`;
+            }
+            $wrap.html(html);
+        }
+
+        $panel.find('#ow_fav_add_folder').on('click', function () {
+            const name = prompt('新文件夹名称：', '新收藏夹');
+            if (!name) return;
+            f.folders.push({ id: `folder_${Date.now().toString(36)}`, name, createdAt: Date.now() });
+            saveSettings();
+            renderFavoritesPanel($panel);
+        });
+
+        $wrap.on('click', '[data-action="fav-toggle"]', function () {
+            const $card = $(this).closest('.ow-widget-card');
+            $card.toggleClass('ow-collapsed');
+            const expanded = !$card.hasClass('ow-collapsed');
+            $card.find('.ow-caret i').first().attr('class', expanded ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-right');
+        });
+
+        $wrap.on('click', '[data-action="fav-rename"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('folder');
+            const fo = f.folders.find((x) => x.id === id);
+            if (!fo) return;
+            const name = prompt('重命名文件夹：', fo.name);
+            if (!name) return;
+            fo.name = name;
+            saveSettings();
+            renderFavoritesPanel($panel);
+        });
+
+        $wrap.on('click', '[data-action="fav-del-folder"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('folder');
+            const fo = f.folders.find((x) => x.id === id);
+            const count = f.items.filter((it) => it.folderId === id).length;
+            if (!fo || !confirm(`删除文件夹「${fo.name}」？其中的 ${count} 个收藏也会一并删除。`)) return;
+            f.folders = f.folders.filter((x) => x.id !== id);
+            f.items = f.items.filter((it) => it.folderId !== id);
+            saveSettings();
+            renderFavoritesPanel($panel);
+        });
+
+        $wrap.on('click', '[data-action="fav-view"]', function () {
+            const $item = $(this).closest('.ow-fav-item');
+            const it = f.items.find((x) => x.id === $item.data('fav'));
+            if (!it) return;
+            const $pv = $item.find('.ow-fav-preview');
+            if ($pv.is(':visible')) { $pv.hide().empty(); return; }
+            const frameId = `fav_${it.id}`;
+            $pv.html(`
+              <div class="ow-result-frame-wrap" style="margin:8px 0 4px;">
+                <div class="ow-result-head">
+                  <span>${escapeHtml(it.widgetName)}</span>
+                  <span><button class="ow-btn" data-action="fav-fullscreen"><i class="fa-solid fa-expand"></i></button></span>
+                </div>
+                <iframe class="ow-result-frame" data-frame-id="${frameId}" sandbox="allow-scripts" allowfullscreen
+                  srcdoc="${escapeHtml(buildPreviewSrcdoc(it.html, frameId))}"></iframe>
+              </div>`).show();
+        });
+
+        $wrap.on('click', '[data-action="fav-fullscreen"]', function () {
+            const el = $(this).closest('.ow-result-frame-wrap').find('iframe')[0];
+            if (!el) return;
+            const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+            if (req) req.call(el).catch((err) => toast(`无法进入全屏：${err.message || err}`, 'warning'));
+        });
+
+        $wrap.on('click', '[data-action="fav-move"]', function () {
+            const $item = $(this).closest('.ow-fav-item');
+            const it = f.items.find((x) => x.id === $item.data('fav'));
+            if (!it) return;
+            const names = f.folders.map((fo, i) => `${i + 1}. ${fo.name}`).join('\n');
+            const pick = prompt(`移动到哪个文件夹？输入序号：\n${names}`, '1');
+            const idx = Number(pick) - 1;
+            if (!(idx >= 0 && idx < f.folders.length)) return;
+            it.folderId = f.folders[idx].id;
+            saveSettings();
+            renderFavoritesPanel($panel);
+        });
+
+        $wrap.on('click', '[data-action="fav-del"]', function () {
+            const $item = $(this).closest('.ow-fav-item');
+            const it = f.items.find((x) => x.id === $item.data('fav'));
+            if (!it || !confirm(`删除收藏「${it.widgetName}」？`)) return;
+            f.items = f.items.filter((x) => x.id !== it.id);
+            saveSettings();
+            renderFavoritesPanel($panel);
+        });
+    }
+
+    // ------------------------------------------------------------------
     // UI：主弹窗
     // ------------------------------------------------------------------
     let $modal = null;
@@ -1073,6 +1313,7 @@
             <div class="ow-tabs">
               <div class="ow-tab active" data-tab="widgets">组件生成</div>
               <div class="ow-tab" data-tab="offscreen">镜头之外</div>
+              <div class="ow-tab" data-tab="favorites">收藏夹</div>
               <div class="ow-tab" data-tab="worldinfo">世界书</div>
               <div class="ow-tab" data-tab="prompts">提示词</div>
               <div class="ow-tab" data-tab="settings">设置</div>
@@ -1080,6 +1321,7 @@
             </div>
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
+            <div class="ow-panel" data-panel="favorites"></div>
             <div class="ow-panel" data-panel="worldinfo"></div>
             <div class="ow-panel" data-panel="prompts"></div>
             <div class="ow-panel" data-panel="settings"></div>
@@ -1101,6 +1343,7 @@
         applyTheme();
         renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+        renderFavoritesPanel($modal.find('.ow-panel[data-panel="favorites"]'));
         renderWorldInfoPanel($modal.find('.ow-panel[data-panel="worldinfo"]'));
         renderPromptsPanel($modal.find('.ow-panel[data-panel="prompts"]'));
         renderSettingsPanel($modal.find('.ow-panel[data-panel="settings"]'));
@@ -1272,6 +1515,9 @@ ${innerHtml}
                 <div class="ow-result-head">
                   <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}</span>
                   <span>
+                    <button class="ow-btn ow-fav-btn" data-action="favorite" data-id="${w.id}" title="收藏到收藏夹">
+                      <i class="${isFavorited(w.id) ? 'fa-solid' : 'fa-regular'} fa-star"></i>
+                    </button>
                     <button class="ow-btn" data-action="fullscreen" data-id="${w.id}" title="全屏"><i class="fa-solid fa-expand"></i></button>
                     <button class="ow-btn" data-action="view-raw" data-id="${w.id}">源码</button>
                     <button class="ow-btn ow-gen-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
@@ -1286,6 +1532,11 @@ ${innerHtml}
             if (!res) return;
             const w = window.open('', '_blank');
             if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(res.html)}</pre>`);
+        });
+
+        $results.off('click', '[data-action="favorite"]').on('click', '[data-action="favorite"]', function () {
+            const w = settings().widgets.find((x) => x.id === $(this).data('id'));
+            if (w) openFavoriteDialog(w);
         });
 
         $results.off('click', '[data-action="fullscreen"]').on('click', '[data-action="fullscreen"]', function () {
@@ -1491,12 +1742,102 @@ ${innerHtml}
     }
 
     // 通用行归一化：优先取英文 field，其次取中文列名作为别名，兼容模型返回中文键名
-    function normalizeRowsGeneric(rows, columns) {
-        return rows.map((r) => {
+    // 把模型返回的任意键名尽量对齐到我们的列字段。
+    // 现实里模型经常不严格按 JSON 示例的英文键名输出，会用中文列名、近义词、
+    // 带下划线的变体等；此前只匹配 field / label 两种写法，匹配不上就整列为空
+    // （伏笔表"内容"列空白就是这么来的）。这里做多级模糊匹配，并在匹配失败时
+    // 把该行实际返回的键名写进日志，方便直接定位模型到底用了什么字段名。
+    const COLUMN_ALIASES = {
+        content: ['内容', '描述', '详情', '伏笔内容', '伏笔', 'description', 'detail', 'desc', 'text', 'summary'],
+        tag: ['标签', '编号', 'id', 'label', 'marker'],
+        name: ['名称', '姓名', '名字', 'title'],
+        chapter: ['章节', '埋设章节', '关联章节', '所在章节', 'chapters'],
+        chapters: ['章节', '关联章节', 'chapter'],
+        status: ['状态', '当前状态', 'state'],
+        time: ['时间', '日期', 'datetime', 'date'],
+        task: ['事项', '任务', '事件', 'event', 'todo'],
+        location: ['位置', '当前位置', '地点', '地理位置', 'place', 'position'],
+        role: ['角色', '人物', 'character', 'name'],
+        usage: ['用途', '作用', 'purpose', 'use'],
+        structure: ['构造', '构造细节', '环境细节', '细节', 'detail', 'details'],
+        alias: ['昵称', '别名', 'nickname'],
+        relation: ['关系', '与用户的关系', 'relationship'],
+        attitude: ['态度', '对用户的态度'],
+        routine: ['固定日程规律', '日程规律', '规律', 'schedule'],
+        seasonal: ['时节性必然事件', '时节性事件', '季节性事件'],
+        pool: ['弹性事务参考池', '弹性事务', '参考池'],
+    };
+
+    function canonKey(k) {
+        return String(k).toLowerCase().replace(/[\s_\-/|:：，,。.、()（）\[\]【】]/g, '');
+    }
+
+    function stringifyCell(v) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'string') return v;
+        if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+        if (Array.isArray(v)) return v.map(stringifyCell).filter(Boolean).join('；');
+        if (typeof v === 'object') {
+            // 模型偶尔会把一格写成对象，退化成 "键:值" 拼接，至少不丢内容
+            return Object.entries(v).map(([k, val]) => `${k}:${stringifyCell(val)}`).join('；');
+        }
+        return String(v);
+    }
+
+    function pickCellValue(row, col) {
+        if (!row || typeof row !== 'object') return { value: '', matchedKey: null };
+        // 1) 精确匹配 field / label
+        for (const k of [col.field, col.label]) {
+            if (k != null && row[k] !== undefined && row[k] !== null && row[k] !== '') {
+                return { value: stringifyCell(row[k]), matchedKey: k };
+            }
+        }
+        // 2) 归一化后匹配 field / label / 别名
+        const candidates = [col.field, col.label, ...(COLUMN_ALIASES[col.field] || [])].filter(Boolean).map(canonKey);
+        for (const rk of Object.keys(row)) {
+            if (candidates.includes(canonKey(rk)) && row[rk] !== undefined && row[rk] !== null && row[rk] !== '') {
+                return { value: stringifyCell(row[rk]), matchedKey: rk };
+            }
+        }
+        // 3) 归一化后的包含关系（如 "伏笔内容" 对 "内容"）
+        for (const rk of Object.keys(row)) {
+            const ck = canonKey(rk);
+            if (!row[rk]) continue;
+            for (const cand of candidates) {
+                if (cand.length >= 2 && (ck.includes(cand) || cand.includes(ck))) {
+                    return { value: stringifyCell(row[rk]), matchedKey: rk };
+                }
+            }
+        }
+        return { value: '', matchedKey: null };
+    }
+
+    function normalizeRowsGeneric(rows, columns, tableTitle = '') {
+        const unmatchedReport = [];
+        const result = rows.map((r, i) => {
             const out = {};
-            for (const c of columns) out[c.field] = r?.[c.field] ?? r?.[c.label] ?? '';
+            const usedKeys = new Set();
+            const emptyCols = [];
+            for (const c of columns) {
+                const { value, matchedKey } = pickCellValue(r, c);
+                out[c.field] = value;
+                if (matchedKey) usedKeys.add(matchedKey);
+                else if (!value) emptyCols.push(`${c.field}/${c.label}`);
+            }
+            if (emptyCols.length && r && typeof r === 'object') {
+                const leftover = Object.keys(r).filter((k) => !usedKeys.has(k));
+                if (leftover.length) {
+                    unmatchedReport.push({ row: i, 空列: emptyCols, 该行实际返回的未匹配键: leftover, 原始行: r });
+                }
+            }
             return out;
         });
+        if (unmatchedReport.length) {
+            log('warn', 'parse',
+                `「${tableTitle}」有列没能从模型返回里匹配到值。下面列出这些行实际用的键名——如果模型一直用某个固定的别名，可以到「表格管理」把该列的字段名改成它，或在提示词里强调键名。`,
+                unmatchedReport);
+        }
+        return result;
     }
 
     function renderOffscreenPanel($panel) {
