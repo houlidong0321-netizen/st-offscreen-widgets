@@ -1,310 +1,617 @@
-/* 镜头之外 · 组件生成器 — 样式表
-   所有选择器均以 .ow- 前缀限定作用域，默认跟随酒馆主题变量，
-   不覆盖任何酒馆原生元素，避免污染全局样式。 */
+/* ============================================================================
+   镜头之外 · 组件生成器 — 样式表
+   全部选择器以 .ow- 前缀限定作用域，默认继承酒馆主题变量，不污染酒馆全局样式。
+   ========================================================================= */
 
-.ow-modal-overlay {
+/* ---------------------------------------------------------------- 设计变量 */
+.ow-modal-overlay,
+.ow-sub-overlay {
+    --ow-radius: 12px;
+    --ow-radius-sm: 8px;
+    --ow-gap: 10px;
+    --ow-accent: var(--SmartThemeQuoteColor, #6aa9e9);
+    --ow-border: color-mix(in srgb, var(--SmartThemeBodyColor, #ddd) 16%, transparent);
+    --ow-surface: color-mix(in srgb, var(--SmartThemeBodyColor, #ddd) 5%, transparent);
+    --ow-surface-2: color-mix(in srgb, var(--SmartThemeBodyColor, #ddd) 9%, transparent);
+    --ow-text-dim: color-mix(in srgb, var(--SmartThemeBodyColor, #ddd) 62%, transparent);
+    --ow-font: var(--mainFontFamily), -apple-system, BlinkMacSystemFont, "Segoe UI",
+               "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --ow-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* 老浏览器不支持 color-mix 时的回退 */
+@supports not (color: color-mix(in srgb, red 50%, blue)) {
+    .ow-modal-overlay, .ow-sub-overlay {
+        --ow-border: rgba(255, 255, 255, 0.16);
+        --ow-surface: rgba(255, 255, 255, 0.05);
+        --ow-surface-2: rgba(255, 255, 255, 0.09);
+        --ow-text-dim: rgba(255, 255, 255, 0.62);
+    }
+}
+
+/* ------------------------------------------------------------------ 遮罩层 */
+.ow-modal-overlay,
+.ow-sub-overlay {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(2px);
     z-index: 9998;
     display: flex;
     align-items: center;
     justify-content: center;
+    animation: ow-fade 0.16s ease;
+}
+.ow-sub-overlay { z-index: 10000; }
+
+@keyframes ow-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ow-rise {
+    from { opacity: 0; transform: translateY(8px) scale(0.99); }
+    to   { opacity: 1; transform: none; }
 }
 
-.ow-modal {
-    width: min(920px, 94vw);
-    height: min(720px, 88vh);
+/* -------------------------------------------------------------------- 弹窗 */
+.ow-modal,
+.ow-sub-modal {
     background: var(--SmartThemeBlurTintColor, #1e1e1e);
     color: var(--SmartThemeBodyColor, #ddd);
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 10px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius);
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.3);
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    backdrop-filter: blur(var(--SmartThemeBlurStrength, 5px));
+    font-family: var(--ow-font);
+    font-size: 14px;
+    line-height: 1.6;
+    animation: ow-rise 0.2s cubic-bezier(0.2, 0.8, 0.3, 1);
 }
 
+.ow-modal {
+    width: min(980px, 95vw);
+    height: min(760px, 90vh);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength, 6px));
+}
+
+.ow-sub-modal {
+    width: min(780px, 93vw);
+    height: min(660px, 86vh);
+}
+
+/* ------------------------------------------------------------------ 标题栏 */
 .ow-modal-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    gap: var(--ow-gap);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--ow-border);
     flex: 0 0 auto;
+    background: var(--ow-surface);
 }
 
 .ow-modal-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-weight: 600;
-    font-size: 1.05em;
+    font-size: 15px;
+    letter-spacing: 0.01em;
 }
 
 .ow-close-btn {
     cursor: pointer;
-    opacity: 0.75;
-    padding: 4px 8px;
+    opacity: 0.6;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    transition: opacity 0.15s, background 0.15s;
 }
-.ow-close-btn:hover { opacity: 1; }
+.ow-close-btn:hover { opacity: 1; background: var(--ow-surface-2); }
 
+.ow-generating {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--ow-accent);
+    background: color-mix(in srgb, var(--ow-accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ow-accent) 32%, transparent);
+    padding: 2px 9px;
+    border-radius: 999px;
+}
+
+/* -------------------------------------------------------------------- 标签 */
 .ow-tabs {
     display: flex;
-    gap: 4px;
-    padding: 8px 10px 0 10px;
+    gap: 2px;
+    padding: 0 10px;
     flex: 0 0 auto;
-    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    border-bottom: 1px solid var(--ow-border);
+    overflow-x: auto;
+    scrollbar-width: none;
 }
+.ow-tabs::-webkit-scrollbar { display: none; }
 
 .ow-tab {
-    padding: 7px 14px;
+    position: relative;
+    padding: 11px 15px;
     cursor: pointer;
-    border-radius: 8px 8px 0 0;
-    opacity: 0.65;
-    font-size: 0.92em;
+    font-size: 13.5px;
+    color: var(--ow-text-dim);
+    white-space: nowrap;
+    transition: color 0.15s;
+}
+.ow-tab:hover { color: var(--SmartThemeBodyColor, #ddd); }
+.ow-tab.active { color: var(--SmartThemeBodyColor, #ddd); font-weight: 600; }
+.ow-tab.active::after {
+    content: '';
+    position: absolute;
+    left: 12px; right: 12px; bottom: -1px;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: var(--ow-accent);
 }
 
-.ow-tab.active {
-    opacity: 1;
-    background: var(--SmartThemeQuoteColor, rgba(255,255,255,0.08));
-    font-weight: 600;
-}
-
+/* -------------------------------------------------------------------- 面板 */
 .ow-panel {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 12px 14px;
+    overflow-x: hidden;
+    padding: 16px 18px 24px;
     display: none;
 }
 .ow-panel.active { display: block; }
 
-.ow-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
-.ow-col { display: flex; flex-direction: column; gap: 6px; }
-.ow-grow { flex: 1 1 auto; min-width: 0; }
-.ow-muted { opacity: 0.65; font-size: 0.85em; }
-.ow-hint { opacity: 0.6; font-size: 0.8em; margin: 2px 0 8px 0; line-height: 1.5; }
-
-.ow-btn {
-    cursor: pointer;
-    padding: 5px 12px;
+.ow-panel::-webkit-scrollbar,
+.ow-sub-body::-webkit-scrollbar,
+.ow-preview-box::-webkit-scrollbar { width: 9px; }
+.ow-panel::-webkit-scrollbar-thumb,
+.ow-sub-body::-webkit-scrollbar-thumb,
+.ow-preview-box::-webkit-scrollbar-thumb {
+    background: var(--ow-surface-2);
     border-radius: 6px;
-    border: 1px solid var(--SmartThemeBorderColor, #555);
-    background: var(--SmartThemeBotMesBlurTintColor, rgba(255,255,255,0.05));
-    color: inherit;
-    font-size: 0.88em;
-    white-space: nowrap;
 }
-.ow-btn:hover { filter: brightness(1.2); }
-.ow-btn.ow-primary { background: var(--SmartThemeQuoteColor, #3a6ea5); border-color: transparent; }
-.ow-btn.ow-danger { border-color: #a33; color: #f88; }
-.ow-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-.ow-input, .ow-textarea, .ow-select {
-    background: var(--SmartThemeBotMesBlurTintColor, rgba(255,255,255,0.06));
-    border: 1px solid var(--SmartThemeBorderColor, #555);
-    color: inherit;
-    border-radius: 6px;
-    padding: 5px 8px;
-    font-size: 0.88em;
-    font-family: inherit;
-}
-.ow-textarea { width: 100%; resize: vertical; min-height: 60px; }
-.ow-input { width: 100%; }
-
-.ow-widget-card {
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 8px;
-    padding: 8px 10px;
-    margin-bottom: 10px;
-}
-
-.ow-widget-card-head { display: flex; align-items: center; gap: 8px; }
-.ow-widget-card-head .ow-input { font-weight: 600; }
-
-.ow-preset-list {
-    max-height: 160px;
-    overflow-y: auto;
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 6px;
-    padding: 6px;
-    margin-top: 4px;
-}
-.ow-preset-entry { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 0.85em; }
-.ow-preset-entry label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.ow-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: rgba(255,255,255,0.08);
-    border-radius: 12px;
-    padding: 2px 8px;
-    font-size: 0.78em;
-    margin: 2px 4px 2px 0;
-}
-.ow-chip .ow-chip-x { cursor: pointer; opacity: 0.7; }
-.ow-chip .ow-chip-x:hover { opacity: 1; }
-
-.ow-result-frame-wrap {
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 8px;
-    overflow: hidden;
-    margin-top: 6px;
-}
-.ow-result-frame {
-    width: 100%;
-    height: 320px;
-    border: none;
-    background: #fff;
-}
-.ow-result-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 6px 10px;
-    background: rgba(255,255,255,0.05);
-    font-size: 0.85em;
-}
-
-.ow-fullscreen-corner-btn {
-    position: absolute;
-    top: 40px;
-    right: 8px;
-    z-index: 5;
-    padding: 4px 8px;
-    background: rgba(0,0,0,0.55);
-    border-color: rgba(255,255,255,0.3);
-    color: #fff;
-}
-.ow-fullscreen-corner-btn:hover { background: rgba(0,0,0,0.75); }
-
-.ow-result-frame:fullscreen,
-.ow-result-frame:-webkit-full-screen {
-    width: 100vw;
-    height: 100vh;
-    background: #fff;
-}
-
-.ow-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.82em;
-    margin-top: 6px;
-}
-.ow-table th, .ow-table td {
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    padding: 4px 6px;
-    vertical-align: top;
-}
-.ow-table th { background: rgba(255,255,255,0.06); text-align: left; }
-.ow-table td[contenteditable="true"] { outline: none; cursor: text; }
-.ow-table td[contenteditable="true"]:focus { background: rgba(255,255,255,0.08); }
-
-.ow-section-title {
-    font-weight: 600;
-    margin: 14px 0 4px 0;
-    font-size: 0.95em;
-}
-
-.ow-empty {
-    text-align: center;
-    opacity: 0.5;
-    padding: 20px 0;
-    font-size: 0.9em;
-}
-
-/* 输入区“魔法棒”菜单入口 */
-#ow_menu_button i { margin-right: 4px; }
-
-.ow-log-badge {
-    display: inline-block;
-    background: #c33;
-    color: #fff;
-    border-radius: 10px;
-    font-size: 0.7em;
-    padding: 0 6px;
-    margin-left: 4px;
-}
-
-.ow-update-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 8px 14px;
-    background: rgba(58, 110, 165, 0.18);
-    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
-    font-size: 0.86em;
-    flex: 0 0 auto;
-}
-
-.ow-spin {
-    display: inline-block;
-    animation: ow-spin 1s linear infinite;
-}
-@keyframes ow-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-
-/* ---- 面板顶栏：左侧主操作 + 右上角管理入口 ---- */
-.ow-panel-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding-bottom: 8px;
-    margin-bottom: 10px;
-    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
-    flex-wrap: wrap;
-}
-
-/* ---- 生成中指示 ---- */
-.ow-generating {
-    margin-left: 10px;
-    font-size: 0.75em;
-    font-weight: normal;
-    opacity: 0.85;
-    color: var(--SmartThemeQuoteColor, #6aa9e9);
-}
-
-/* ---- 子弹窗（组件列表 / 表格管理）---- */
-.ow-sub-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.ow-sub-modal {
-    width: min(760px, 92vw);
-    height: min(640px, 84vh);
-    background: var(--SmartThemeBlurTintColor, #1e1e1e);
-    color: var(--SmartThemeBodyColor, #ddd);
-    border: 1px solid var(--SmartThemeBorderColor, #444);
-    border-radius: 10px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-}
+.ow-panel::-webkit-scrollbar-thumb:hover,
+.ow-sub-body::-webkit-scrollbar-thumb:hover { background: var(--ow-border); }
 
 .ow-sub-body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 12px 14px;
+    padding: 14px 16px 20px;
 }
 
+/* 面板顶栏：左主操作 / 右管理入口 */
+.ow-panel-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ow-gap);
+    padding: 0 0 12px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--ow-border);
+    flex-wrap: wrap;
+    position: sticky;
+    top: -16px;
+    background: var(--SmartThemeBlurTintColor, #1e1e1e);
+    z-index: 3;
+    padding-top: 2px;
+}
+
+/* -------------------------------------------------------------- 通用小组件 */
+.ow-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 7px 0;
+    flex-wrap: wrap;
+}
+.ow-col { display: flex; flex-direction: column; gap: 7px; }
+.ow-grow { flex: 1 1 auto; min-width: 0; }
+.ow-spacer { flex: 1 1 auto; }
+.ow-muted { color: var(--ow-text-dim); font-size: 12.5px; }
+
+.ow-hint {
+    color: var(--ow-text-dim);
+    font-size: 12.5px;
+    line-height: 1.65;
+    margin: 4px 0 12px;
+    padding: 8px 11px;
+    background: var(--ow-surface);
+    border-left: 2px solid var(--ow-border);
+    border-radius: 0 var(--ow-radius-sm) var(--ow-radius-sm) 0;
+}
+.ow-hint code {
+    font-family: var(--ow-mono);
+    font-size: 11.5px;
+    background: var(--ow-surface-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+}
+
+.ow-section-title {
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ow-text-dim);
+    margin: 20px 0 8px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid var(--ow-border);
+}
+.ow-panel > .ow-section-title:first-of-type { margin-top: 4px; }
+
+.ow-field-label {
+    font-size: 11.5px;
+    color: var(--ow-text-dim);
+    margin: 9px 0 4px;
+    font-weight: 500;
+}
+
+.ow-empty {
+    text-align: center;
+    color: var(--ow-text-dim);
+    padding: 44px 20px;
+    font-size: 13px;
+    border: 1px dashed var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    background: var(--ow-surface);
+}
+
+/* -------------------------------------------------------------------- 按钮 */
+.ow-btn {
+    cursor: pointer;
+    padding: 6px 13px;
+    border-radius: var(--ow-radius-sm);
+    border: 1px solid var(--ow-border);
+    background: var(--ow-surface);
+    color: inherit;
+    font-family: inherit;
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s, border-color 0.15s, transform 0.08s;
+}
+.ow-btn:hover:not(:disabled) { background: var(--ow-surface-2); border-color: var(--ow-text-dim); }
+.ow-btn:active:not(:disabled) { transform: translateY(1px); }
+
+.ow-btn.ow-primary {
+    background: var(--ow-accent);
+    border-color: transparent;
+    color: #fff;
+    font-weight: 500;
+}
+.ow-btn.ow-primary:hover:not(:disabled) { filter: brightness(1.12); background: var(--ow-accent); }
+
+.ow-btn.ow-danger { border-color: transparent; color: #e5787d; background: transparent; }
+.ow-btn.ow-danger:hover:not(:disabled) { background: rgba(200, 60, 70, 0.16); color: #ff9195; }
+
+.ow-btn:disabled { opacity: 0.42; cursor: not-allowed; }
+
+/* -------------------------------------------------------------------- 表单 */
+.ow-input, .ow-textarea, .ow-select {
+    background: var(--ow-surface);
+    border: 1px solid var(--ow-border);
+    color: inherit;
+    border-radius: var(--ow-radius-sm);
+    padding: 7px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    line-height: 1.5;
+    transition: border-color 0.15s, background 0.15s;
+}
+.ow-input:focus, .ow-textarea:focus, .ow-select:focus {
+    outline: none;
+    border-color: var(--ow-accent);
+    background: var(--ow-surface-2);
+}
+.ow-input { width: 100%; }
+.ow-textarea {
+    width: 100%;
+    resize: vertical;
+    min-height: 64px;
+    font-size: 12.5px;
+    line-height: 1.65;
+}
+.ow-select { cursor: pointer; }
+
+.ow-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+.ow-col > label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 2px 0;
+}
+.ow-row input[type="checkbox"],
+.ow-row input[type="radio"],
+.ow-col input[type="checkbox"] { accent-color: var(--ow-accent); cursor: pointer; margin: 0; }
+
+/* ---------------------------------------------------------------- 开关组件 */
+.ow-switch {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    cursor: pointer;
+}
+.ow-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.ow-switch-track {
+    width: 34px;
+    height: 19px;
+    border-radius: 999px;
+    background: var(--ow-surface-2);
+    border: 1px solid var(--ow-border);
+    position: relative;
+    transition: background 0.18s, border-color 0.18s;
+}
+.ow-switch-track::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: var(--ow-text-dim);
+    transition: transform 0.18s, background 0.18s;
+}
+.ow-switch input:checked + .ow-switch-track {
+    background: var(--ow-accent);
+    border-color: transparent;
+}
+.ow-switch input:checked + .ow-switch-track::after {
+    transform: translateX(15px);
+    background: #fff;
+}
+
+/* ------------------------------------------------------------ 卡片（可折叠） */
+.ow-widget-card {
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    margin-bottom: 8px;
+    background: var(--ow-surface);
+    overflow: hidden;
+    transition: border-color 0.15s;
+}
+.ow-widget-card:hover { border-color: var(--ow-text-dim); }
+
+.ow-widget-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 11px;
+}
+
+.ow-widget-card-body {
+    padding: 2px 11px 12px;
+    border-top: 1px solid var(--ow-border);
+}
+.ow-widget-card.ow-collapsed .ow-widget-card-body { display: none; }
+
+.ow-caret {
+    cursor: pointer;
+    width: 18px;
+    text-align: center;
+    color: var(--ow-text-dim);
+    font-size: 11px;
+    flex: 0 0 auto;
+    transition: color 0.15s;
+}
+.ow-caret:hover { color: var(--SmartThemeBodyColor, #ddd); }
+
+.ow-widget-name {
+    cursor: pointer;
+    font-weight: 500;
+    font-size: 13.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 44%;
+}
+.ow-widget-meta { font-size: 11.5px; flex: 0 0 auto; }
+
+/* -------------------------------------------------------------- 预设条目区 */
+.ow-preset-list {
+    max-height: 190px;
+    overflow-y: auto;
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    padding: 7px 9px;
+    margin-top: 6px;
+    background: var(--ow-surface);
+}
+.ow-preset-entry {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 3px 0;
+    font-size: 12.5px;
+}
+.ow-preset-entry input { accent-color: var(--ow-accent); cursor: pointer; flex: 0 0 auto; }
+.ow-preset-entry label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.ow-preset-chips { margin-top: 6px; }
+.ow-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--ow-surface-2);
+    border: 1px solid var(--ow-border);
+    border-radius: 999px;
+    padding: 2px 9px;
+    font-size: 11.5px;
+    margin: 3px 5px 3px 0;
+}
+.ow-chip-x { cursor: pointer; opacity: 0.6; font-size: 10px; }
+.ow-chip-x:hover { opacity: 1; color: #e5787d; }
+
+/* ------------------------------------------------------------ 组件预览结果 */
+.ow-result-frame-wrap {
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    overflow: hidden;
+    margin-bottom: 14px;
+    background: var(--ow-surface);
+}
+
+.ow-result-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 11px;
+    background: var(--ow-surface-2);
+    font-size: 12.5px;
+    border-bottom: 1px solid var(--ow-border);
+}
+.ow-result-head > span:first-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+}
+.ow-result-head > span:last-child { display: flex; gap: 5px; flex: 0 0 auto; }
+.ow-result-head .ow-btn { padding: 4px 9px; font-size: 11.5px; }
+
+/* 高度由内部脚本回报后动态设置，这里只给初始值与下限 */
+.ow-result-frame {
+    display: block;
+    width: 100%;
+    height: 420px;
+    border: none;
+    background: #fff;
+    transition: height 0.18s ease;
+}
+.ow-result-frame:fullscreen,
+.ow-result-frame:-webkit-full-screen {
+    width: 100vw;
+    height: 100vh !important;
+}
+
+/* -------------------------------------------------------------------- 表格 */
+.ow-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12.5px;
+    margin: 6px 0 4px;
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    overflow: hidden;
+}
+.ow-table th, .ow-table td {
+    border-bottom: 1px solid var(--ow-border);
+    border-right: 1px solid var(--ow-border);
+    padding: 7px 9px;
+    vertical-align: top;
+    line-height: 1.55;
+}
+.ow-table th:last-child, .ow-table td:last-child { border-right: none; }
+.ow-table tr:last-child td { border-bottom: none; }
+.ow-table th {
+    background: var(--ow-surface-2);
+    text-align: left;
+    font-weight: 600;
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    color: var(--ow-text-dim);
+    white-space: nowrap;
+}
+.ow-table td[contenteditable="true"] { cursor: text; transition: background 0.12s; }
+.ow-table td[contenteditable="true"]:hover { background: var(--ow-surface); }
+.ow-table td[contenteditable="true"]:focus {
+    outline: none;
+    background: color-mix(in srgb, var(--ow-accent) 12%, transparent);
+    box-shadow: inset 0 0 0 1px var(--ow-accent);
+}
+.ow-table td:last-child { width: 1%; white-space: nowrap; text-align: center; }
+.ow-table td:last-child .ow-btn { padding: 2px 8px; font-size: 11px; }
+
+/* ------------------------------------------------------------ 更新提示横幅 */
+.ow-update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ow-gap);
+    padding: 9px 16px;
+    background: color-mix(in srgb, var(--ow-accent) 15%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--ow-accent) 30%, transparent);
+    font-size: 12.5px;
+    flex: 0 0 auto;
+    flex-wrap: wrap;
+}
+
+.ow-log-badge {
+    display: inline-block;
+    background: #c0454b;
+    color: #fff;
+    border-radius: 999px;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    margin-left: 5px;
+    vertical-align: middle;
+}
+
+/* -------------------------------------------------------------------- 日志 */
+.ow-log-entry {
+    border-left: 3px solid var(--ow-border);
+    padding: 6px 10px;
+    margin-bottom: 5px;
+    font-size: 12px;
+    background: var(--ow-surface);
+    border-radius: 0 6px 6px 0;
+}
+.ow-log-entry pre,
 .ow-preview-box {
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 320px;
-    overflow: auto;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid var(--SmartThemeBorderColor, #444);
+    background: var(--ow-surface-2);
     border-radius: 6px;
-    padding: 8px;
-    font-size: 0.78em;
-    margin-top: 6px;
+    padding: 7px 9px;
+    margin-top: 5px;
+    font-family: var(--ow-mono);
+    font-size: 11px;
+    line-height: 1.55;
+    max-height: 240px;
+    overflow: auto;
+}
+.ow-preview-box {
+    max-height: 340px;
+    border: 1px solid var(--ow-border);
 }
 
-.ow-result-frame-wrap { margin-bottom: 12px; }
+/* ------------------------------------------------------------ 菜单入口按钮 */
+#ow_menu_button i { margin-right: 4px; }
+
+/* -------------------------------------------------------------------- 动画 */
+.ow-spin { display: inline-block; animation: ow-spin 0.9s linear infinite; }
+@keyframes ow-spin { to { transform: rotate(360deg); } }
+
+/* ------------------------------------------------------------ 窄屏适配 */
+@media (max-width: 620px) {
+    .ow-modal, .ow-sub-modal { width: 100vw; height: 100vh; border-radius: 0; border: none; }
+    .ow-panel { padding: 12px 12px 20px; }
+    .ow-tab { padding: 10px 11px; font-size: 13px; }
+    .ow-widget-name { max-width: 38%; }
+    .ow-result-head { flex-wrap: wrap; }
+}

@@ -40,6 +40,7 @@
         currentCommitHash: '',
         currentBranchName: '',
         remoteUrl: '',
+        global: false,
     };
 
     async function checkExtensionUpdate({ quiet = false } = {}) {
@@ -48,23 +49,38 @@
         try {
             const c = ctx();
             const headers = c.getRequestHeaders ? c.getRequestHeaders() : { 'Content-Type': 'application/json' };
-            const res = await fetch('/api/extensions/version', {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: false }),
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            updateState.checked = true;
-            updateState.isUpToDate = !!data.isUpToDate;
-            updateState.currentCommitHash = data.currentCommitHash || '';
-            updateState.currentBranchName = data.currentBranchName || '';
-            updateState.remoteUrl = data.remoteUrl || '';
-            if (!quiet) {
-                log('info', 'system', `扩展更新检查完成：${updateState.isUpToDate ? '已是最新版本' : '发现新版本'}（本地提交 ${updateState.currentCommitHash.slice(0, 7) || '未知'}）`, data);
+            // 全局扩展与用户扩展在前端 URL 上是同一个 /scripts/extensions/third-party/ 路径，
+            // 无法从路径分辨，因此两种都试一遍：先当作用户扩展，再当作全局扩展。
+            let lastErr = '';
+            for (const isGlobal of [false, true]) {
+                try {
+                    const res = await fetch('/api/extensions/version', {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: isGlobal }),
+                    });
+                    if (!res.ok) {
+                        lastErr = `HTTP ${res.status}`;
+                        log('debug', 'system', `更新检查（global=${isGlobal}）返回 ${res.status}，尝试下一种安装方式`);
+                        continue;
+                    }
+                    const data = await res.json();
+                    updateState.checked = true;
+                    updateState.global = isGlobal;
+                    updateState.isUpToDate = !!data.isUpToDate;
+                    updateState.currentCommitHash = data.currentCommitHash || '';
+                    updateState.currentBranchName = data.currentBranchName || '';
+                    updateState.remoteUrl = data.remoteUrl || '';
+                    if (!quiet) {
+                        log('info', 'system', `扩展更新检查完成（${isGlobal ? '全局' : '用户'}扩展）：${updateState.isUpToDate ? '已是最新版本' : '发现新版本'}（本地提交 ${updateState.currentCommitHash.slice(0, 7) || '未知'}）`, data);
+                    }
+                    return updateState;
+                } catch (err) {
+                    lastErr = err.message || String(err);
+                    log('debug', 'system', `更新检查请求出错（global=${isGlobal}）：${lastErr}`);
+                }
             }
-        } catch (err) {
-            log('warn', 'system', `检查扩展更新失败：${err.message || err}（extensionName=${EXTENSION_ID_PARAM}，若本扩展安装目录名与仓库名不同，可能需要在代码里调整回退值）`, err);
+            log('warn', 'system', `更新检查未成功（用户扩展与全局扩展两种方式都失败，最后错误：${lastErr}）。extensionName=${EXTENSION_ID_PARAM}。若安装目录名与仓库名不同，或不是用 Git 地址安装的，就会出现这种情况。`);
         } finally {
             updateState.checking = false;
             updateMenuBadge();
@@ -74,12 +90,12 @@
 
     async function performExtensionUpdate() {
         const c = ctx();
-        log('info', 'system', `开始从仓库拉取扩展更新（extensionName=${EXTENSION_ID_PARAM}）…`);
+        log('info', 'system', `开始拉取扩展更新（extensionName=${EXTENSION_ID_PARAM}, global=${updateState.global}）…`);
         const headers = c.getRequestHeaders ? c.getRequestHeaders() : { 'Content-Type': 'application/json' };
         const res = await fetch('/api/extensions/update', {
             method: 'POST',
             headers,
-            body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: false }),
+            body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: !!updateState.global }),
         });
         if (!res.ok) {
             const text = await res.text().catch(() => '');
@@ -87,12 +103,11 @@
         }
         const data = await res.json();
         log('info', 'system', '扩展更新请求完成', data);
-        // 注意：/update 接口返回的 isUpToDate 表示"拉取前"是否已是最新（false = 刚刚真的拉取了新代码）
         updateState.checked = true;
-        updateState.isUpToDate = true; // 拉取动作本身已让本地追平远端
+        updateState.isUpToDate = true;
         if (data.shortCommitHash) updateState.currentCommitHash = data.shortCommitHash;
         updateMenuBadge();
-        return data; // { isUpToDate, shortCommitHash, extensionPath, remoteUrl }
+        return data;
     }
 
     function updateMenuBadge() {
@@ -1192,6 +1207,51 @@
         refreshGeneratingIndicator();
     }
 
+    // 组件预览用 iframe 渲染（sandbox 无 allow-same-origin，父页面读不到内部高度），
+    // 所以往 srcdoc 里注入一小段脚本，让它把自身高度 postMessage 回来，父页面据此调整高度，
+    // 避免内容被固定高度截断只显示一半。
+    function buildPreviewSrcdoc(innerHtml, frameId) {
+        return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;padding:0;background:#fff;}
+  body{padding:12px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.6;}
+  img,video,canvas,table{max-width:100%;}
+</style></head><body>
+${innerHtml}
+<script>
+(function(){
+  var id=${JSON.stringify(frameId)};
+  function send(){
+    try{
+      var h=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);
+      parent.postMessage({__owFrame:id,height:h},'*');
+    }catch(e){}
+  }
+  window.addEventListener('load',send);
+  document.addEventListener('DOMContentLoaded',send);
+  [50,200,600,1200,2000].forEach(function(t){setTimeout(send,t);});
+  try{ new ResizeObserver(send).observe(document.documentElement); }catch(e){}
+  window.addEventListener('resize',send);
+})();
+<\/script>
+</body></html>`;
+    }
+
+    // 父页面统一监听所有预览 iframe 的高度回报（只注册一次）
+    let previewResizeBound = false;
+    function bindPreviewAutoResize() {
+        if (previewResizeBound) return;
+        previewResizeBound = true;
+        window.addEventListener('message', (ev) => {
+            const d = ev.data;
+            if (!d || !d.__owFrame || typeof d.height !== 'number') return;
+            const el = document.querySelector(`iframe[data-frame-id="${d.__owFrame}"]`);
+            if (!el) return;
+            const h = Math.min(Math.max(d.height + 8, 120), 5000);
+            if (Math.abs(parseInt(el.style.height || '0', 10) - h) > 2) el.style.height = h + 'px';
+        });
+    }
+
     // ---- 组件显示（占满整个面板）----
     function renderWidgetResults($panel) {
         const s = settings();
@@ -1199,6 +1259,7 @@
         const $results = $panel.find('#ow_widget_results');
         $results.empty();
 
+        bindPreviewAutoResize();
         const withResults = s.widgets.filter((w) => cd.widgetResults[w.id]);
         if (!withResults.length) {
             $results.append('<div class="ow-empty">还没有生成结果。点「生成全部组件」，或在右上角「组件列表」里新建/单独生成。</div>');
@@ -1216,7 +1277,7 @@
                     <button class="ow-btn ow-gen-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
                   </span>
                 </div>
-                <iframe class="ow-result-frame" sandbox="allow-scripts" allowfullscreen srcdoc="${escapeHtml(result.html)}"></iframe>
+                <iframe class="ow-result-frame" data-frame-id="${w.id}" sandbox="allow-scripts" allowfullscreen srcdoc="${escapeHtml(buildPreviewSrcdoc(result.html, w.id))}"></iframe>
               </div>`);
         }
 
@@ -1277,10 +1338,6 @@
                 return;
             }
             for (const w of s.widgets) $list.append(renderWidgetCard(w));
-            $ov.find('.ow-preset-select').each(function () {
-                const $sel = $(this);
-                for (const n of getPresetNames()) $sel.append(`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`);
-            });
         };
         renderList();
 
@@ -1297,30 +1354,59 @@
         const chips = (widget.presetEntries || [])
             .map((e, idx) => `<span class="ow-chip" data-widget="${widget.id}" data-idx="${idx}">${escapeHtml(e.name)}<span class="ow-chip-x" title="移除">✕</span></span>`)
             .join('');
+        const presetCount = (widget.presetEntries || []).length;
         return $(`
-        <div class="ow-widget-card" data-id="${widget.id}">
+        <div class="ow-widget-card ow-collapsed" data-id="${widget.id}">
           <div class="ow-widget-card-head">
+            <span class="ow-caret" data-action="toggle-card" title="展开/收起"><i class="fa-solid fa-chevron-right"></i></span>
             <input type="checkbox" class="ow-enabled-toggle" ${widget.enabled ? 'checked' : ''} title="是否随批量生成">
-            <input type="text" class="ow-input ow-name-input" value="${escapeHtml(widget.name)}" placeholder="组件名称">
+            <span class="ow-widget-name" data-action="toggle-card">${escapeHtml(widget.name) || '<span class="ow-muted">未命名</span>'}</span>
+            <span class="ow-muted ow-widget-meta">${presetCount ? `${presetCount} 条预设` : ''}</span>
+            <span class="ow-spacer"></span>
             <button class="ow-btn ow-gen-btn" data-action="gen-one" title="单独生成"><i class="fa-solid fa-play"></i></button>
             <button class="ow-btn ow-danger" data-action="delete" title="删除"><i class="fa-solid fa-trash"></i></button>
           </div>
-          <textarea class="ow-textarea ow-prompt-input" placeholder="描述这个组件要生成什么…">${escapeHtml(widget.prompt)}</textarea>
-          <div class="ow-row">
-            <select class="ow-select ow-preset-select" style="min-width:150px;"><option value="">选择预设…</option></select>
-            <button class="ow-btn" data-action="load-preset">读取条目</button>
+          <div class="ow-widget-card-body">
+            <div class="ow-field-label">名称</div>
+            <input type="text" class="ow-input ow-name-input" value="${escapeHtml(widget.name)}" placeholder="组件名称">
+            <div class="ow-field-label">提示词</div>
+            <textarea class="ow-textarea ow-prompt-input" placeholder="描述这个组件要生成什么…">${escapeHtml(widget.prompt)}</textarea>
+            <div class="ow-field-label">预设条目</div>
+            <div class="ow-row">
+              <select class="ow-select ow-preset-select ow-grow"><option value="">选择预设…</option></select>
+              <button class="ow-btn" data-action="load-preset">读取条目</button>
+            </div>
+            <div class="ow-preset-list" style="display:none;"></div>
+            <div class="ow-preset-chips">${chips}</div>
           </div>
-          <div class="ow-preset-list" style="display:none;"></div>
-          <div class="ow-preset-chips">${chips}</div>
         </div>`);
     }
 
     function bindWidgetCardEvents($root, renderList) {
         const s = settings();
 
+        $root.on('click', '[data-action="toggle-card"]', function () {
+            const $card = $(this).closest('.ow-widget-card');
+            $card.toggleClass('ow-collapsed');
+            const expanded = !$card.hasClass('ow-collapsed');
+            $card.find('.ow-caret i').attr('class', expanded ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-right');
+            if (expanded) {
+                // 展开时才填充预设下拉，避免列表很长时一次性构建大量 option
+                const $sel = $card.find('.ow-preset-select');
+                if ($sel.children().length <= 1) {
+                    for (const n of getPresetNames()) $sel.append(`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`);
+                }
+            }
+        });
+
         $root.on('input', '.ow-name-input', function () {
-            const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
-            if (w) { w.name = $(this).val(); saveSettings(); }
+            const $card = $(this).closest('.ow-widget-card');
+            const w = s.widgets.find((x) => x.id === $card.data('id'));
+            if (w) {
+                w.name = $(this).val();
+                saveSettings();
+                $card.find('.ow-widget-name').text(w.name || '未命名');
+            }
         });
         $root.on('input', '.ow-prompt-input', function () {
             const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
@@ -1512,7 +1598,7 @@
               <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-sub-body">
-              <div class="ow-hint">开关控制该表是否生成与显示，提示词随之增减。列格式：<code>英文字段名:中文列名</code>，每行一个。</div>
+              <div class="ow-hint">左侧开关：开＝生成该表并把规则写进提示词；关＝不生成、不显示、提示词也不含它。点表名展开可编辑列与规则。</div>
               <div id="ow_table_mgr_list"></div>
               <div class="ow-row" style="margin-top:12px;">
                 <button class="ow-btn ow-primary" id="ow_table_add">+ 新建表格</button>
@@ -1530,30 +1616,55 @@
             const $list = $ov.find('#ow_table_mgr_list');
             const tables = getOffscreenTables();
             if (!tables.length) { $list.html('<div class="ow-empty">还没有表格</div>'); return; }
-            $list.html(tables.map((t, i) => `
-              <div class="ow-widget-card" data-key="${escapeHtml(t.key)}">
+            $list.html(tables.map((t, i) => {
+                const on = t.enabled !== false;
+                return `
+              <div class="ow-widget-card ow-collapsed" data-key="${escapeHtml(t.key)}">
                 <div class="ow-widget-card-head">
-                  <input type="checkbox" class="ow-tbl-enabled" ${t.enabled !== false ? 'checked' : ''} title="是否启用">
-                  <input type="text" class="ow-input ow-tbl-title" value="${escapeHtml(t.title)}" placeholder="表名">
+                  <span class="ow-caret" data-action="tbl-toggle-card" title="展开/收起"><i class="fa-solid fa-chevron-right"></i></span>
+                  <label class="ow-switch" title="${on ? '已启用：会生成并显示，提示词包含该表' : '已禁用：不生成、不显示，提示词不含该表'}">
+                    <input type="checkbox" class="ow-tbl-enabled" ${on ? 'checked' : ''}><span class="ow-switch-track"></span>
+                  </label>
+                  <span class="ow-widget-name" data-action="tbl-toggle-card">${escapeHtml(t.title)}</span>
+                  <span class="ow-muted ow-widget-meta ow-tbl-status">${on ? '启用' : '禁用'} · ${t.columns.length}列</span>
+                  <span class="ow-spacer"></span>
                   <button class="ow-btn" data-action="tbl-up" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
                   <button class="ow-btn" data-action="tbl-down" title="下移" ${i === tables.length - 1 ? 'disabled' : ''}>↓</button>
                   <button class="ow-btn ow-danger" data-action="tbl-del" title="删除">✕</button>
                 </div>
-                <div class="ow-muted" style="margin:4px 0 2px;">列（英文字段名:中文列名，每行一个）</div>
-                <textarea class="ow-textarea ow-tbl-cols" style="min-height:70px;">${escapeHtml(t.columns.map((c) => `${c.field}:${c.label}`).join('\n'))}</textarea>
-                <div class="ow-muted" style="margin:6px 0 2px;">该表的规则说明（会原样写进提示词）</div>
-                <textarea class="ow-textarea ow-tbl-spec" style="min-height:90px;">${escapeHtml(t.spec || '')}</textarea>
-              </div>`).join(''));
+                <div class="ow-widget-card-body">
+                  <div class="ow-field-label">表名</div>
+                  <input type="text" class="ow-input ow-tbl-title" value="${escapeHtml(t.title)}" placeholder="表名">
+                  <div class="ow-field-label">列（英文字段名:中文列名，每行一个）</div>
+                  <textarea class="ow-textarea ow-tbl-cols" style="min-height:70px;">${escapeHtml(t.columns.map((c) => `${c.field}:${c.label}`).join('\n'))}</textarea>
+                  <div class="ow-field-label">规则说明（原样写进提示词）</div>
+                  <textarea class="ow-textarea ow-tbl-spec" style="min-height:110px;">${escapeHtml(t.spec || '')}</textarea>
+                </div>
+              </div>`;
+            }).join(''));
         }
         renderList();
 
+        $ov.on('click', '[data-action="tbl-toggle-card"]', function () {
+            const $card = $(this).closest('.ow-widget-card');
+            $card.toggleClass('ow-collapsed');
+            const expanded = !$card.hasClass('ow-collapsed');
+            $card.find('.ow-caret i').attr('class', expanded ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-right');
+        });
         $ov.on('change', '.ow-tbl-enabled', function () {
-            const key = $(this).closest('.ow-widget-card').data('key');
-            const t = getTableDef(key); if (t) { t.enabled = $(this).is(':checked'); saveSettings(); }
+            const $card = $(this).closest('.ow-widget-card');
+            const t = getTableDef($card.data('key'));
+            if (!t) return;
+            t.enabled = $(this).is(':checked');
+            saveSettings();
+            $card.find('.ow-tbl-status').text(`${t.enabled ? '启用' : '禁用'} · ${t.columns.length}列`);
+            log('info', 'ui', `表格「${t.title}」已${t.enabled ? '启用（提示词将包含该表）' : '禁用（提示词不再包含该表）'}`);
         });
         $ov.on('input', '.ow-tbl-title', function () {
             const key = $(this).closest('.ow-widget-card').data('key');
-            const t = getTableDef(key); if (t) { t.title = $(this).val(); saveSettings(); }
+            const $card = $(this).closest('.ow-widget-card');
+            const t = getTableDef($card.data('key'));
+            if (t) { t.title = $(this).val(); saveSettings(); $card.find('.ow-widget-name').text(t.title || '未命名'); }
         });
         $ov.on('input', '.ow-tbl-spec', function () {
             const key = $(this).closest('.ow-widget-card').data('key');
