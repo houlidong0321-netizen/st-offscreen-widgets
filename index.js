@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.1.2';
+    const EXT_VERSION = '2.2.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -239,17 +239,8 @@
             injectEnabled: true,
             injectPosition: 'IN_CHAT',
             injectDepth: 1,
-            directions: [
-                { id: 'he', name: 'HE', enabled: false },
-                { id: 'be', name: 'BE', enabled: false },
-                { id: 'gouxue', name: '狗血', enabled: false },
-                { id: 'nuexin', name: '虐心', enabled: false },
-                { id: 'richang', name: '日常', enabled: false },
-                { id: 'gongdou', name: '宫斗', enabled: false },
-                { id: 'shangzhan', name: '商战', enabled: false },
-                { id: 'haomen', name: '豪门', enabled: false },
-                { id: 'lizhi', name: '励志', enabled: false },
-            ],
+            sendCurrent: false, // 生成时是否把当前推演一并发给模型（默认不发）
+            directions: defaultPlotDirections(),
         },
         // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
         // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
@@ -281,7 +272,18 @@
         const es = ctx().extensionSettings;
         if (!es[MODULE_NAME]) es[MODULE_NAME] = {};
         deepMergeDefaults(es[MODULE_NAME], defaultSettings());
-        return es[MODULE_NAME];
+        // 迁移：旧版本的发展方向只有 {id,name,enabled}，没有 prompt 字段。
+        // deepMergeDefaults 不会深入数组元素，这里按 id 补上内置方向的默认提示词。
+        const st = es[MODULE_NAME];
+        if (Array.isArray(st.plot?.directions)) {
+            const builtin = defaultPlotDirections();
+            for (const d of st.plot.directions) {
+                if (d.prompt === undefined) {
+                    d.prompt = builtin.find((b) => b.id === d.id)?.prompt || '';
+                }
+            }
+        }
+        return st;
     }
 
     function saveSettings() {
@@ -548,6 +550,49 @@
     const PLOT_MARKER_RE = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/i;
     const PLOT_MARKER_RE_G = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/gi;
 
+    // 每个发展方向不只是一个标签，还带一段写进提示词的具体约束：
+    // 明确"可以写什么"与"不可以写什么"，避免模型自由发散跑偏。
+    function defaultPlotDirections() {
+        return [
+            { id: 'he', name: 'HE', enabled: false, prompt:
+`整体走向为 Happy Ending（圆满结局）。
+可以写：矛盾被正面解决、误会被澄清、关系最终确立或修复；角色为彼此做出实质让步与改变；遗留问题在结局前被逐一收束。
+不可以写：为了圆满而强行洗白已经确立的恶意行为或伤害；凭空出现未经铺垫的贵人、资源或转机来解决困境；让角色性格突变以迁就好结局。` },
+            { id: 'be', name: 'BE', enabled: false, prompt:
+`整体走向为 Bad Ending（悲剧结局）。
+可以写：误会层层累积无法挽回、时机永远错过、代价已经付出无法收回、清醒地选择分开。悲剧必须有明确的因果链。
+不可以写：为虐而虐、没有因果铺垫的突发不幸；让角色做出完全违背既定人设的自毁行为；用意外死亡草率收尾。` },
+            { id: 'gouxue', name: '狗血', enabled: false, prompt:
+`走强戏剧巧合路线。
+可以写：身世秘密被揭穿、关键对话被第三人撞见、旧情人回归、隐瞒的过去曝光、误会在最坏的时机爆发、身份错位。
+不可以写：穿越/重生/超自然等改变世界规则的设定（除非世界书里已经确立）；失忆症突然痊愈这类医学奇迹；一个巧合叠另一个巧合到失去可信度。` },
+            { id: 'nuexin', name: '虐心', enabled: false, prompt:
+`走情感痛感路线。
+可以写：求而不得、隐忍与克制、自我牺牲、迟来的真相、明知结果仍选择靠近。痛感来自处境与选择，不是来自伤害本身。
+不可以写：生理性酷刑、血腥或自残的具体描写；把死亡当成唯一的情绪手段；无意义地反复重复同一种伤害。` },
+            { id: 'richang', name: '日常', enabled: false, prompt:
+`走生活质感路线，但仍必须是"事件"而不是"事情"。
+可以写：由生活摩擦升级成的真实冲突——因为一顿饭的一句话彻底吵翻、因为一次接送迟到暴露了长期的忽视、因为一件旧物被丢弃引发的清算。
+不可以写：单纯的日程流水账（吃饭、上班、睡觉本身不是事件）；突然的凶案、绑架、车祸等脱离生活质感的强情节。` },
+            { id: 'gongdou', name: '宫斗', enabled: false, prompt:
+`走后宫/内宅权力斗争路线。
+可以写：位分与恩宠的争夺、构陷与自证、结盟与背叛、规矩与人情的冲突、借刀杀人、母族牵连。
+不可以写：现代科技、现代法律或平等观念；脱离世界书已确立的时代背景与等级制度；直接的武力火并解决问题。` },
+            { id: 'shangzhan', name: '商战', enabled: false, prompt:
+`走商业博弈路线。
+可以写：股权争夺、并购与反收购、合同陷阱、商业机密泄露、舆论战、董事会表决、资金链危机。
+不可以写：编造具体的财务数字、股价、法条并当作既定事实；用黑帮火并式暴力解决商业问题；主角凭一次演讲就翻盘。` },
+            { id: 'haomen', name: '豪门', enabled: false, prompt:
+`走豪门家族路线。
+可以写：继承权之争、联姻施压、长辈干涉、门第差距造成的羞辱与自尊冲突、家族丑闻、私生子与遗产。
+不可以写：无来由的巨额财富凭空出现或蒸发；把财富当成解决一切矛盾的万能钥匙；脱离世界书已确立的家族结构。` },
+            { id: 'lizhi', name: '励志', enabled: false, prompt:
+`走成长路线。
+可以写：目标受挫后的重建、具体可验证的能力成长节点、被否定后的自证、必须付出的取舍代价。
+不可以写：一夜成功；靠奇遇或贵人直接跳过努力过程；用空洞的口号代替具体行动。` },
+        ];
+    }
+
     const DEFAULT_PLOT_SYSTEM_PROMPT = `你是一个为角色扮演故事设计"网状剧情矩阵"的编剧引擎。
 
 【事件的绝对定义：宏观篇章，不是微观回合】
@@ -565,8 +610,16 @@
 2. 网状而非线性：事件之间基于用户的最终抉择交织跳转（可以从事件01直接跃迁到事件04），
    最终汇聚到多个不同结局。
 3. 电报体精简表述：只写核心与触发条件，绝不写过程，避免冗余。
-4. 严禁结构坍塌：每一个事件都必须写全分支，且每条分支都必须明确指向一个具体的事件编号或结局，
-   绝对禁止在后半段偷工减料省略分支。结局节点的分支 next 可以填 "END"。
+4. 严禁结构坍塌：每一个事件都必须写全分支，且每条分支都必须明确指向一个具体的事件编号，
+   绝对禁止在后半段偷工减料省略分支。
+
+【关于"结局"的重要限制】
+- 本次生成的只是故事的一段推演，不等于故事就此完结。**绝对不要把最后几个事件当成大结局来写**，
+  也不要出现"至此尘埃落定""故事画上句号"这类收束性表述。
+- 默认情况下所有分支的 next 都必须指向一个具体的事件编号。矩阵末端的事件，其分支可以指向
+  **尚未展开的新事件编号**（即比当前已生成编号更大的号码，留作下次续写的接口），保持故事向前敞开。
+- 只有当【发展方向】中明确出现 HE 或 BE 时，才允许生成真正的结局节点，此时相应结局分支的
+  next 才可以填 "END"。没有指定 HE/BE 时，整张矩阵里不允许出现任何 "END"。
 
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
@@ -600,17 +653,34 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
     function buildPlotUserPrompt(extras) {
         const s = settings();
         const parts = [];
-        const dirs = plotDirections();
-        parts.push(`【发展方向】${dirs.length ? dirs.join('、') : '（未指定，请根据现有剧情自行判断合适的走向）'}`);
+        const active = (s.plot.directions || []).filter((d) => d.enabled);
+        const dirs = active.map((d) => d.name);
+        if (active.length) {
+            const detail = active
+                .map((d) => `〔${d.name}〕\n${(d.prompt || '').trim() || '（未填写具体约束）'}`)
+                .join('\n\n');
+            parts.push(`【发展方向】${dirs.join('、')}\n以下是每个方向的具体写作约束，必须严格遵守其中的"可以写/不可以写"：\n\n${detail}`);
+            const hasEnding = active.some((d) => /^(he|be)$/i.test(d.name.trim()));
+            parts.push(hasEnding
+                ? '【结局许可】本次已指定 HE/BE，允许在矩阵中生成真正的结局节点（对应分支 next 可填 "END"）。'
+                : '【结局限制】本次未指定 HE 或 BE，禁止生成任何结局节点，所有分支的 next 都必须指向具体事件编号，末端事件可指向尚未展开的新编号，保持故事敞开。');
+        } else {
+            parts.push('【发展方向】（未指定，请根据现有剧情自行判断合适的走向）');
+            parts.push('【结局限制】未指定 HE 或 BE，禁止生成任何结局节点，所有分支的 next 都必须指向具体事件编号。');
+        }
+        parts.push('【通用约束】所有事件必须基于正文与世界书中已经确立的人物、场所、关系推导，禁止凭空引入未出现过的重要角色或设定，禁止改变世界规则。');
         parts.push(`【要求生成的事件节点数量】至少 ${s.plot.minEvents} 个`);
         if (extras.history) parts.push(`【最近聊天记录】\n${extras.history}`);
         if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
         if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
         const pl = chatData().plot;
-        if (pl.events?.length) {
-            parts.push(`【已有事件矩阵（若要重新生成，请尽量保留已经走过的事件，只扩展未来分支）】\n${JSON.stringify({ events: pl.events, path: pl.path })}`);
+        if (s.plot.sendCurrent && pl.events?.length) {
+            parts.push(`【已有事件矩阵（请在此基础上向后续写，保留已经走过的事件，扩展新的未来分支，不要重复已有内容）】\n${JSON.stringify({ events: pl.events, path: pl.path })}`);
+            parts.push('请基于以上信息续写并扩展网状事件矩阵。');
+        } else {
+            if (pl.events?.length) log('debug', 'system', '已有推演未随本次请求发送（设置里「生成时发送当前推演」为关）——本次将重新生成一份全新矩阵。');
+            parts.push('请基于以上信息生成一份全新的网状事件矩阵。');
         }
-        parts.push('请基于以上信息生成网状事件矩阵。');
         return parts.join('\n\n');
     }
 
@@ -2549,22 +2619,24 @@ ${innerHtml}
         return html;
     }
 
-    // ---------------- 发展方向子弹窗 ----------------
+    // ---------------- 发展方向子弹窗（与组件列表/表格管理同款交互） ----------------
     function openDirectionsDialog($plotPanel) {
         const s = settings();
         const $ov = $(`
         <div class="ow-sub-overlay">
-          <div class="ow-sub-modal" style="height:auto;max-height:80vh;width:min(520px,93vw);">
+          <div class="ow-sub-modal">
             <div class="ow-modal-header">
               <div class="ow-modal-title">剧情发展方向</div>
               <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-sub-body">
-              <div class="ow-hint">可多选。选中的方向会写进推演提示词，影响事件矩阵的整体走向。</div>
-              <div id="ow_dir_list" class="ow-dir-grid"></div>
+              <div class="ow-hint">勾选即启用（可多选）。点名称展开可编辑该方向的写作约束，这段文字会原样写进推演提示词，
+              用"可以写/不可以写"限制模型不要发散。<br>只有勾选 HE 或 BE 时才允许生成真正的结局节点。</div>
+              <div id="ow_dir_list"></div>
               <div class="ow-row" style="margin-top:12px;">
                 <input type="text" class="ow-input ow-grow" id="ow_dir_new" placeholder="添加自定义方向，如：悬疑、复仇、青梅竹马">
                 <button class="ow-btn ow-primary" id="ow_dir_add">添加</button>
+                <button class="ow-btn" id="ow_dir_reset">恢复默认方向</button>
               </div>
             </div>
           </div>
@@ -2574,41 +2646,84 @@ ${innerHtml}
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
         $ov.find('.ow-sub-close').on('click', close);
 
-        const renderDirs = () => {
-            $ov.find('#ow_dir_list').html((s.plot.directions || []).map((d) => `
-              <label class="ow-dir-item ${d.enabled ? 'ow-dir-on' : ''}" data-id="${escapeHtml(d.id)}">
-                <input type="checkbox" class="ow-dir-cb" ${d.enabled ? 'checked' : ''}>
-                <span>${escapeHtml(d.name)}</span>
-                <span class="ow-dir-del" title="删除">✕</span>
-              </label>`).join(''));
+        const renderList = () => {
+            const list = s.plot.directions || [];
+            const $list = $ov.find('#ow_dir_list');
+            if (!list.length) { $list.html('<div class="ow-empty">还没有方向</div>'); return; }
+            $list.html(list.map((d) => `
+              <div class="ow-widget-card ow-collapsed" data-id="${escapeHtml(d.id)}">
+                <div class="ow-widget-card-head">
+                  <span class="ow-caret" data-action="dir-toggle"><i class="fa-solid fa-chevron-right"></i></span>
+                  <label class="ow-switch" title="${d.enabled ? '已启用' : '未启用'}">
+                    <input type="checkbox" class="ow-dir-cb" ${d.enabled ? 'checked' : ''}><span class="ow-switch-track"></span>
+                  </label>
+                  <span class="ow-widget-name" data-action="dir-toggle">${escapeHtml(d.name)}</span>
+                  <span class="ow-muted ow-widget-meta ow-dir-status">${d.enabled ? '启用' : '未启用'}</span>
+                  <span class="ow-spacer"></span>
+                  <button class="ow-btn ow-danger" data-action="dir-del" title="删除"><i class="fa-solid fa-trash"></i></button>
+                </div>
+                <div class="ow-widget-card-body">
+                  <div class="ow-field-label">方向名称</div>
+                  <input type="text" class="ow-input ow-dir-name" value="${escapeHtml(d.name)}">
+                  <div class="ow-field-label">写作约束（写进提示词，建议写清"可以写 / 不可以写"）</div>
+                  <textarea class="ow-textarea ow-dir-prompt" style="min-height:130px;" placeholder="可以写：…&#10;不可以写：…">${escapeHtml(d.prompt || '')}</textarea>
+                </div>
+              </div>`).join(''));
         };
-        renderDirs();
+        renderList();
 
+        $ov.on('click', '[data-action="dir-toggle"]', function () {
+            const $card = $(this).closest('.ow-widget-card');
+            $card.toggleClass('ow-collapsed');
+            const expanded = !$card.hasClass('ow-collapsed');
+            $card.find('.ow-caret i').attr('class', expanded ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-right');
+        });
+        const findDir = (el) => s.plot.directions.find((x) => x.id === $(el).closest('.ow-widget-card').data('id'));
         $ov.on('change', '.ow-dir-cb', function () {
-            const id = $(this).closest('.ow-dir-item').data('id');
-            const d = s.plot.directions.find((x) => x.id === id);
-            if (d) { d.enabled = $(this).is(':checked'); saveSettings(); $(this).closest('.ow-dir-item').toggleClass('ow-dir-on', d.enabled); }
-        });
-        $ov.on('click', '.ow-dir-del', function (e) {
-            e.preventDefault(); e.stopPropagation();
-            const id = $(this).closest('.ow-dir-item').data('id');
-            const d = s.plot.directions.find((x) => x.id === id);
-            if (!d || !confirm(`删除方向「${d.name}」？`)) return;
-            s.plot.directions = s.plot.directions.filter((x) => x.id !== id);
+            const d = findDir(this); if (!d) return;
+            d.enabled = $(this).is(':checked');
             saveSettings();
-            renderDirs();
+            $(this).closest('.ow-widget-card').find('.ow-dir-status').text(d.enabled ? '启用' : '未启用');
         });
+        $ov.on('input', '.ow-dir-name', function () {
+            const d = findDir(this); if (!d) return;
+            d.name = $(this).val();
+            saveSettings();
+            $(this).closest('.ow-widget-card').find('.ow-widget-name').text(d.name || '未命名');
+        });
+        $ov.on('input', '.ow-dir-prompt', function () {
+            const d = findDir(this); if (!d) return;
+            d.prompt = $(this).val();
+            saveSettings();
+        });
+        $ov.on('click', '[data-action="dir-del"]', function () {
+            const d = findDir(this);
+            if (!d || !confirm(`删除方向「${d.name}」？`)) return;
+            s.plot.directions = s.plot.directions.filter((x) => x.id !== d.id);
+            saveSettings();
+            renderList();
+        });
+
         const addDir = () => {
             const name = String($ov.find('#ow_dir_new').val() || '').trim();
             if (!name) return;
             if (s.plot.directions.some((x) => x.name === name)) { toast('已经有这个方向了', 'warning'); return; }
-            s.plot.directions.push({ id: `dir_${Date.now().toString(36)}`, name, enabled: true });
+            s.plot.directions.push({
+                id: `dir_${Date.now().toString(36)}`, name, enabled: true,
+                prompt: `可以写：\n（列出这个方向下允许出现的情节类型）\n不可以写：\n（列出要禁止的内容，避免模型发散）`,
+            });
             saveSettings();
             $ov.find('#ow_dir_new').val('');
-            renderDirs();
+            renderList();
         };
         $ov.find('#ow_dir_add').on('click', addDir);
         $ov.find('#ow_dir_new').on('keydown', (e) => { if (e.key === 'Enter') addDir(); });
+        $ov.find('#ow_dir_reset').on('click', function () {
+            if (!confirm('恢复为内置的 9 个方向？自定义方向与已编辑的约束会丢失。')) return;
+            s.plot.directions = defaultPlotDirections();
+            saveSettings();
+            renderList();
+        });
     }
 
     // ---------------- 世界书 / 聊天书发送设置面板 ----------------
@@ -2870,6 +2985,12 @@ ${innerHtml}
           <div class="ow-row">
             <label>至少生成 <input type="number" class="ow-input ow-num" id="ow_plot_min" min="2" value="${s.plot.minEvents}"> 个事件节点</label>
           </div>
+          <div class="ow-field-label">生成</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_plot_send_current" ${s.plot.sendCurrent ? 'checked' : ''}> 生成时发送当前推演</label>
+          </div>
+          <div class="ow-muted" style="padding-left:2px;">关：重新生成一份全新矩阵（对当前不满意时用）。开：把现有矩阵发给模型续写（剧情已走完、想接着往下推时用）。</div>
+
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
@@ -2975,6 +3096,7 @@ ${innerHtml}
         $panel.find('#ow_off_history_depth').on('change', function () { s.offscreen.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_plot_history').on('change', function () { s.plot.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_plot_min').on('change', function () { s.plot.minEvents = Math.max(2, Number($(this).val()) || 2); saveSettings(); });
+        $panel.find('#ow_plot_send_current').on('change', function () { s.plot.sendCurrent = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_plot_inject').on('change', function () { s.plot.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_plot_inject_pos').on('change', function () { s.plot.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_plot_inject_depth').on('change', function () { s.plot.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
