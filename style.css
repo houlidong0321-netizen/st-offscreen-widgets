@@ -727,3 +727,140 @@
     font-family: var(--ow-mono);
     font-size: 11px;
 }
+
+/* ------------------------------------------------------------ 剧情推演思维树 */
+.ow-tree { position: relative; padding-left: 6px; }
+
+.ow-tree-node {
+    position: relative;
+    border: 1px solid var(--ow-border);
+    border-left: 3px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    background: var(--ow-surface);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    transition: border-color 0.15s, opacity 0.15s;
+}
+/* 节点之间的竖向连接线 */
+.ow-tree-node::before {
+    content: '';
+    position: absolute;
+    left: -4px;
+    top: 100%;
+    height: 10px;
+    width: 2px;
+    background: var(--ow-border);
+}
+.ow-tree-node:last-child::before { display: none; }
+
+.ow-node-current {
+    border-left-color: var(--ow-accent);
+    background: color-mix(in srgb, var(--ow-accent) 10%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--ow-accent) 30%, transparent);
+}
+.ow-node-done { opacity: 0.72; border-left-color: #6a9b6a; }
+
+.ow-node-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+
+.ow-node-id {
+    font-family: var(--ow-mono);
+    font-size: 11px;
+    font-weight: 700;
+    background: var(--ow-surface-2);
+    border-radius: 5px;
+    padding: 2px 7px;
+    flex: 0 0 auto;
+}
+.ow-node-title { font-weight: 600; font-size: 13.5px; }
+
+.ow-node-badge {
+    font-size: 10.5px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-weight: 600;
+    flex: 0 0 auto;
+}
+.ow-badge-current { background: var(--ow-accent); color: #fff; }
+.ow-badge-done { background: rgba(106, 155, 106, 0.25); color: #8fc98f; }
+
+.ow-node-line { font-size: 12.5px; line-height: 1.6; margin: 3px 0; }
+.ow-node-label {
+    display: inline-block;
+    min-width: 44px;
+    font-size: 11px;
+    color: var(--ow-text-dim);
+    margin-right: 6px;
+}
+
+.ow-branches { margin-top: 8px; padding-left: 10px; border-left: 2px dashed var(--ow-border); }
+
+.ow-branch {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    padding: 5px 0;
+    flex-wrap: wrap;
+}
+
+.ow-branch-key {
+    font-family: var(--ow-mono);
+    font-weight: 700;
+    font-size: 11px;
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--ow-surface-2);
+    border: 1px solid var(--ow-border);
+    flex: 0 0 auto;
+}
+.ow-branch-cond { flex: 1 1 200px; min-width: 0; }
+.ow-branch-arrow { color: var(--ow-text-dim); flex: 0 0 auto; }
+.ow-branch-next {
+    font-size: 11.5px;
+    background: var(--ow-surface-2);
+    border-radius: 5px;
+    padding: 1px 7px;
+    flex: 0 0 auto;
+}
+.ow-branch-take { padding: 2px 8px !important; font-size: 11px !important; }
+
+/* 未走的分支置灰 */
+.ow-branch-dead {
+    opacity: 0.38;
+    text-decoration: line-through;
+    text-decoration-color: var(--ow-text-dim);
+}
+.ow-branch-dead .ow-branch-key { background: transparent; }
+
+.ow-branch-taken .ow-branch-key { background: #6a9b6a; color: #fff; border-color: transparent; }
+.ow-branch-taken .ow-branch-next { background: rgba(106, 155, 106, 0.25); }
+
+/* 发展方向选择 */
+.ow-dir-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+
+.ow-dir-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--ow-border);
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 12.5px;
+    cursor: pointer;
+    background: var(--ow-surface);
+    transition: background 0.15s, border-color 0.15s;
+    position: relative;
+}
+.ow-dir-item:hover { border-color: var(--ow-text-dim); }
+.ow-dir-on {
+    background: color-mix(in srgb, var(--ow-accent) 18%, transparent);
+    border-color: var(--ow-accent);
+    font-weight: 500;
+}
+.ow-dir-item input { accent-color: var(--ow-accent); margin: 0; }
+.ow-dir-del { opacity: 0.35; font-size: 10px; margin-left: 2px; }
+.ow-dir-del:hover { opacity: 1; color: #e5787d; }

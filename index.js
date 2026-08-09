@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.0.0';
+    const EXT_VERSION = '2.1.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -153,6 +153,7 @@
     const PROMPT_TYPES = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
     const INJECT_KEY_WIDGETS = `${MODULE_NAME}_widgets`;
     const INJECT_KEY_OFFSCREEN = `${MODULE_NAME}_offscreen`;
+    const INJECT_KEY_PLOT = `${MODULE_NAME}_plot`;
 
     // ------------------------------------------------------------------
     // 日志诊断模块：记录每一步关键动作（发送了什么/收到了什么/解析是否成功），
@@ -225,15 +226,36 @@
         prompts: {
             widgetSystemPrompt: DEFAULT_WIDGET_SYSTEM_PROMPT,
             offscreenPreamble: DEFAULT_OFFSCREEN_PREAMBLE,
+            plotSystemPrompt: DEFAULT_PLOT_SYSTEM_PROMPT,
+            plotInjectTemplate: DEFAULT_PLOT_INJECT_TEMPLATE,
         },
         offscreenTables: defaultOffscreenTables(),
         // 收藏夹：跨聊天全局保存，folders 为文件夹，items 为收藏的组件快照
         favorites: { folders: [{ id: 'default', name: '默认收藏夹', createdAt: Date.now() }], items: [] },
+        // 剧情推演
+        plot: {
+            historyDepth: 20,
+            minEvents: 10,
+            injectEnabled: true,
+            injectPosition: 'IN_CHAT',
+            injectDepth: 1,
+            directions: [
+                { id: 'he', name: 'HE', enabled: false },
+                { id: 'be', name: 'BE', enabled: false },
+                { id: 'gouxue', name: '狗血', enabled: false },
+                { id: 'nuexin', name: '虐心', enabled: false },
+                { id: 'richang', name: '日常', enabled: false },
+                { id: 'gongdou', name: '宫斗', enabled: false },
+                { id: 'shangzhan', name: '商战', enabled: false },
+                { id: 'haomen', name: '豪门', enabled: false },
+                { id: 'lizhi', name: '励志', enabled: false },
+            ],
+        },
         // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
         // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
         worldInfoOverrides: {},
         // 自动触发的细分开关：除了"检测到正文闭合标签"，还支持按楼层数（消息条数）独立触发
-        // 组件生成与镜头之外生成，两者的间隔互不影响。
+        // 组件生成与表格生成，两者的间隔互不影响。
         autoTriggers: {
             onContentTag: true,
             widgetsByFloor: { enabled: false, interval: 5 },
@@ -289,6 +311,14 @@
                 delete off[legacyKey];
             }
         }
+        // 剧情推演状态
+        if (!c.chatMetadata[MODULE_NAME].plot) {
+            c.chatMetadata[MODULE_NAME].plot = { events: [], currentId: '', deadBranches: {}, path: [], updatedAt: null };
+        }
+        const pl = c.chatMetadata[MODULE_NAME].plot;
+        if (!Array.isArray(pl.events)) pl.events = [];
+        if (!pl.deadBranches) pl.deadBranches = {};
+        if (!Array.isArray(pl.path)) pl.path = [];
         return c.chatMetadata[MODULE_NAME];
     }
 
@@ -350,7 +380,7 @@
         return parts.join('\n\n');
     }
 
-    // 镜头之外：默认表格定义。每张表自带"规则说明(spec)"，提示词按启用的表动态拼装，
+    // 表格生成：默认表格定义。每张表自带"规则说明(spec)"，提示词按启用的表动态拼装，
     // 用户在「表格管理」里增删表或改规则，提示词随之变化，不需要改代码。
     function defaultOffscreenTables() {
         return [
@@ -508,6 +538,187 @@
         }
         parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成或更新以上表格。');
         return parts.join('\n\n');
+    }
+
+    // ------------------------------------------------------------------
+    // 剧情推演：生成一张"网状事件矩阵"，每个事件是宏观剧情篇章而非单个回合，
+    // 事件之间按用户的最终抉择跳转（分支明确指向某个事件编号）。
+    // 正文里事件结束时会带一个隐藏标记，扩展扫描到后自动把未走的分支置灰并推进。
+    // ------------------------------------------------------------------
+    const PLOT_MARKER_RE = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/i;
+    const PLOT_MARKER_RE_G = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/gi;
+
+    const DEFAULT_PLOT_SYSTEM_PROMPT = `你是一个为角色扮演故事设计"网状剧情矩阵"的编剧引擎。
+
+【事件的绝对定义：宏观篇章，不是微观回合】
+- 一个【事件】是一个宏观剧情篇章（例如：遭遇家族激烈催婚、两人流落荒岛求生、公司股权被恶意收购），
+  绝对不是用户的一次单句对话或一个单一动作。
+- 反例对照：单纯"吃饭"不是事件；"因为吃饭时的一句话彻底吵翻"、"吃饭时弄丢了关键物品"才是事件。
+  判断标准是：它是否制造了持续的戏剧张力与需要多轮互动才能收束的冲突。
+- 一个事件在其【终局分支】条件被彻底触发前，剧情应当锁死在该事件内部，允许并鼓励几十个回合的
+  沟通、试探、争执与反应。绝不可把一次普通抗议或一句台词误判为事件结束。
+
+【设计内核】
+1. 事件的本质是"情感与关系的炼金炉"，必须具备强戏剧性与冲突性：逼迫角色面临两难抉择、
+   打破原有社交边界、暴露隐藏的软肋、面临考验、催生极端情绪或引发立场反转。
+   每个事件都应是对当前情感状态的一次定向爆破。
+2. 网状而非线性：事件之间基于用户的最终抉择交织跳转（可以从事件01直接跃迁到事件04），
+   最终汇聚到多个不同结局。
+3. 电报体精简表述：只写核心与触发条件，绝不写过程，避免冗余。
+4. 严禁结构坍塌：每一个事件都必须写全分支，且每条分支都必须明确指向一个具体的事件编号或结局，
+   绝对禁止在后半段偷工减料省略分支。结局节点的分支 next 可以填 "END"。
+
+【输出格式】
+只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
+{"events":[{"id":"01","title":"事件代号","core":"戏剧核心：本事件旨在催生/改变的情感张力",
+"trigger":"导火索(起)：如何在正文中自然触发","branches":[
+{"key":"A","condition":"若用户最终做出XX行为/决定","next":"02"},
+{"key":"B","condition":"若用户最终做出XX行为/决定","next":"03"}]}]}
+id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。next 必须是已存在或将要生成的事件 id，或 "END"。`;
+
+    const DEFAULT_PLOT_INJECT_TEMPLATE = `[剧情推演·当前事件（隐藏指令，绝不可在正文中直接复述或提及本段存在）]
+当前所处事件：{{event_title}}
+戏剧核心：{{event_core}}
+导火索：{{event_trigger}}
+终局分支：
+{{branches}}
+
+运行法则：
+- 本事件是一个宏观篇章，需要经历多轮互动才能收束。在用户的行为真正满足下面某条终局分支条件之前，
+  请持续在本事件内部深化细节、对话与拉扯，不要急于推进，按当前对话的自然速率行进。
+- 每次回复前在后台比对用户输入：若判定其行为真正满足了某条终局分支条件，则在本次正文的末尾
+  以自然叙事手法无痕引入下一事件的导火索，并在正文最末尾追加一行隐藏标记：
+  {{marker_example}}
+  其中最后一个字母替换为实际触发的分支字母。该标记是 HTML 注释，不会显示给用户，请务必原样输出。
+- 若未满足任何分支条件，则不要输出该标记，继续在当前事件中推进。`;
+
+    function plotDirections() {
+        const s = settings();
+        return (s.plot.directions || []).filter((d) => d.enabled).map((d) => d.name);
+    }
+
+    function buildPlotUserPrompt(extras) {
+        const s = settings();
+        const parts = [];
+        const dirs = plotDirections();
+        parts.push(`【发展方向】${dirs.length ? dirs.join('、') : '（未指定，请根据现有剧情自行判断合适的走向）'}`);
+        parts.push(`【要求生成的事件节点数量】至少 ${s.plot.minEvents} 个`);
+        if (extras.history) parts.push(`【最近聊天记录】\n${extras.history}`);
+        if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
+        if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
+        const pl = chatData().plot;
+        if (pl.events?.length) {
+            parts.push(`【已有事件矩阵（若要重新生成，请尽量保留已经走过的事件，只扩展未来分支）】\n${JSON.stringify({ events: pl.events, path: pl.path })}`);
+        }
+        parts.push('请基于以上信息生成网状事件矩阵。');
+        return parts.join('\n\n');
+    }
+
+    function normalizePlotEvents(rows) {
+        const out = [];
+        rows.forEach((r, i) => {
+            if (!r || typeof r !== 'object') return;
+            const id = String(r.id ?? r.编号 ?? r.事件编号 ?? String(i + 1).padStart(2, '0')).trim();
+            const branchesRaw = Array.isArray(r.branches) ? r.branches : (Array.isArray(r.终局分支) ? r.终局分支 : []);
+            const branches = branchesRaw.map((b, bi) => ({
+                key: String(b?.key ?? b?.分支 ?? String.fromCharCode(65 + bi)).trim().toUpperCase().slice(0, 1),
+                condition: String(b?.condition ?? b?.条件 ?? b?.触发条件 ?? '').trim(),
+                next: String(b?.next ?? b?.指向 ?? b?.下一事件 ?? '').trim(),
+            })).filter((b) => b.key);
+            out.push({
+                id,
+                title: String(r.title ?? r.标题 ?? r.事件代号 ?? r.代号 ?? `事件${id}`).trim(),
+                core: String(r.core ?? r.戏剧核心 ?? r.核心 ?? '').trim(),
+                trigger: String(r.trigger ?? r.导火索 ?? r.起 ?? '').trim(),
+                branches,
+            });
+        });
+        return out;
+    }
+
+    async function generatePlot() {
+        const s = settings();
+        log('info', 'system', `开始生成剧情推演矩阵（方向：${plotDirections().join('、') || '未指定'}）`);
+        const extras = await gatherExtras({ historyDepth: s.plot.historyDepth });
+        const userPrompt = buildPlotUserPrompt(extras);
+        const raw = await callModel(s.prompts.plotSystemPrompt, userPrompt, '剧情推演');
+        const parsed = tryParseJsonRobust(raw, '剧情推演');
+        if (!parsed) throw new Error('未能从模型响应中解析出 JSON，剧情矩阵未更新。请在「日志」标签页查看完整响应。');
+        const rows = Array.isArray(parsed.events) ? parsed.events : (Array.isArray(parsed) ? parsed : null);
+        if (!rows) throw new Error('响应 JSON 里没有找到 events 数组。');
+        const events = normalizePlotEvents(rows);
+        if (!events.length) throw new Error('解析出的事件列表为空。');
+        const cd = chatData();
+        cd.plot.events = events;
+        if (!cd.plot.currentId || !events.some((e) => e.id === cd.plot.currentId)) {
+            cd.plot.currentId = events[0].id;
+        }
+        cd.plot.updatedAt = Date.now();
+        saveChatData();
+        log('info', 'system', `剧情推演生成完成：${events.length} 个事件节点，当前节点 ${cd.plot.currentId}`);
+        updateInjections();
+        return events;
+    }
+
+    function getPlotEvent(id) {
+        return chatData().plot.events.find((e) => e.id === id);
+    }
+
+    // 扫描正文里的隐藏标记：事件结束 + 走了哪条分支
+    function scanPlotMarker(mesText) {
+        const cd = chatData();
+        const pl = cd.plot;
+        if (!pl.events.length) return false;
+        let matched = null;
+        let m;
+        PLOT_MARKER_RE_G.lastIndex = 0;
+        while ((m = PLOT_MARKER_RE_G.exec(String(mesText || '')))) matched = m; // 取最后一个
+        if (!matched) return false;
+        const eventId = matched[1];
+        const branchKey = matched[2].toUpperCase();
+        const ev = getPlotEvent(eventId);
+        if (!ev) {
+            log('warn', 'trigger', `正文里出现剧情标记，但事件 ${eventId} 不在当前矩阵中，已忽略`, matched[0]);
+            return false;
+        }
+        const taken = ev.branches.find((b) => b.key === branchKey);
+        if (!taken) {
+            log('warn', 'trigger', `事件 ${eventId} 没有分支 ${branchKey}，已忽略`, ev.branches.map((b) => b.key));
+            return false;
+        }
+        // 未走的分支置灰
+        pl.deadBranches[eventId] = ev.branches.filter((b) => b.key !== branchKey).map((b) => b.key);
+        pl.path.push({ eventId, branchKey, at: Date.now() });
+        const next = taken.next;
+        if (next && next.toUpperCase() !== 'END' && getPlotEvent(next)) {
+            pl.currentId = next;
+            log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 结束 → 进入事件 ${next}；分支 ${pl.deadBranches[eventId].join('/')} 已置灰`);
+        } else {
+            pl.currentId = '';
+            log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 结束 → 已抵达结局（next=${next || '空'}）`);
+        }
+        saveChatData();
+        updateInjections();
+        return true;
+    }
+
+    function buildPlotInjectionText() {
+        const s = settings();
+        const pl = chatData().plot;
+        if (!pl.currentId) return '';
+        const ev = getPlotEvent(pl.currentId);
+        if (!ev) return '';
+        const branches = ev.branches
+            .map((b) => `  分支${b.key}：${b.condition || '（条件未写明）'} → 指向 ${b.next || '未指定'}`)
+            .join('\n');
+        const markerExample = `<!--EGO_PLOT:${ev.id}:A-->`;
+        return String(s.prompts.plotInjectTemplate || DEFAULT_PLOT_INJECT_TEMPLATE)
+            .replace(/\{\{event_id\}\}/g, ev.id)
+            .replace(/\{\{event_title\}\}/g, `[事件${ev.id}] ${ev.title}`)
+            .replace(/\{\{event_core\}\}/g, ev.core || '—')
+            .replace(/\{\{event_trigger\}\}/g, ev.trigger || '—')
+            .replace(/\{\{branches\}\}/g, branches)
+            .replace(/\{\{marker_example\}\}/g, markerExample);
     }
 
     // ------------------------------------------------------------------
@@ -749,7 +960,7 @@
                 await generateWidget(w);
                 onProgress?.(w, 'done');
             } catch (err) {
-                console.error('[镜头之外] 组件生成失败', w.name, err);
+                console.error('[Ego] 组件生成失败', w.name, err);
                 const cd = chatData();
                 cd.widgetResults[w.id] = { html: `<p style="color:#c33;font-family:sans-serif;padding:10px;">生成失败：${escapeHtml(err.message || String(err))}</p>`, updatedAt: Date.now(), error: true };
                 saveChatData();
@@ -763,15 +974,15 @@
     // 生成：镜头之外
     // ------------------------------------------------------------------
     async function generateOffscreen({ onProgress } = {}) {
-        log('info', 'system', '开始生成/更新「镜头之外」内容');
+        log('info', 'system', '开始生成/更新「表格生成」内容');
         onProgress?.('offscreen', 'start');
         const sOff = settings().offscreen;
         const depth = sOff.followWidgets ? settings().historyDepth : sOff.historyDepth;
         const extras = await gatherExtras({ historyDepth: depth });
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
-            const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '镜头之外');
-            const parsed = tryParseJsonRobust(raw, '镜头之外');
+            const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '表格生成');
+            const parsed = tryParseJsonRobust(raw, '表格生成');
             if (!parsed) {
                 throw new Error('未能从模型响应中解析出 JSON，表格因此没有更新。请在「日志」标签页查看完整响应内容。');
             }
@@ -792,10 +1003,10 @@
             }
             cd.offscreen.updatedAt = Date.now();
             saveChatData();
-            log('info', 'system', `「镜头之外」更新完成：${changed.join('、') || '（无表被更新，请检查上面的 parse 警告）'}`);
+            log('info', 'system', `「表格生成」更新完成：${changed.join('、') || '（无表被更新，请检查上面的 parse 警告）'}`);
             onProgress?.('offscreen', 'done');
         } catch (err) {
-            log('error', 'system', `「镜头之外」生成失败：${err.message || err}`, err);
+            log('error', 'system', `「表格生成」生成失败：${err.message || err}`, err);
             onProgress?.('offscreen', 'error', err);
             throw err;
         }
@@ -892,6 +1103,19 @@
 
     async function onCharacterMessageRendered(messageId) {
         const s = settings();
+
+        // 剧情推演标记扫描：与手动/自动模式无关，只要正文里出现标记就推进
+        try {
+            const c0 = ctx();
+            const mes0 = c0.chat?.[messageId];
+            if (mes0 && !mes0.is_user && !mes0.is_system && scanPlotMarker(mes0.mes)) {
+                toast('剧情已推进到下一个事件', 'info');
+                if ($modal) renderPlotPanel($modal.find('.ow-panel[data-panel="plot"]'));
+            }
+        } catch (err) {
+            log('error', 'trigger', `剧情标记扫描出错：${err.message || err}`, err);
+        }
+
         if (s.triggerMode !== 'auto') {
             log('debug', 'trigger', `收到 CHARACTER_MESSAGE_RENDERED（消息#${messageId}），但当前为手动模式，跳过`);
             return;
@@ -908,7 +1132,7 @@
         const currentFloor = c.chat.length; // 以当前聊天总消息条数作为"楼层数"
         let ranFullPipeline = false;
 
-        // 触发方式一：检测正文闭合标签（命中则组件与镜头之外一起触发，行为与之前一致）
+        // 触发方式一：检测正文闭合标签（命中则组件与表格一起触发，行为与之前一致）
         if (s.autoTriggers.onContentTag) {
             const matched = messageHasClosedContentTag(mes.mes);
             log(matched ? 'info' : 'debug', 'trigger',
@@ -954,17 +1178,17 @@
             if (s.offscreen.enabled && !s.offscreen.followWidgets && s.autoTriggers.offscreenByFloor?.enabled) {
                 const interval2 = Math.max(1, Number(s.autoTriggers.offscreenByFloor.interval) || 1);
                 const delta2 = currentFloor - (at.lastOffscreenFloor || 0);
-                log('debug', 'trigger', `[镜头之外楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta2}层，间隔设置${interval2}层`);
+                log('debug', 'trigger', `[表格楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta2}层，间隔设置${interval2}层`);
                 if (delta2 >= interval2) {
-                    log('info', 'trigger', `[镜头之外楼层触发] 达到间隔，自动生成镜头之外`);
+                    log('info', 'trigger', `[表格楼层触发] 达到间隔，自动生成表格`);
                     try {
                         await generateOffscreen();
                         at.lastOffscreenFloor = currentFloor;
                         saveChatData();
                         refreshOpenPanels();
                     } catch (err) {
-                        log('error', 'trigger', '[镜头之外楼层触发] 生成失败', err);
-                        toast('按楼层自动生成镜头之外时出错，详见日志标签页', 'error');
+                        log('error', 'trigger', '[表格楼层触发] 生成失败', err);
+                        toast('按楼层自动生成表格时出错，详见日志标签页', 'error');
                     }
                 }
             }
@@ -981,7 +1205,7 @@
     function updateInjections() {
         const c = ctx();
         const s = settings();
-        log('debug', 'inject', `更新正文注入（组件注入:${s.injectWidgets ? '开' : '关'}，镜头之外注入:${s.offscreen.enabled && s.offscreen.injectTables ? '开' : '关'}）`);
+        log('debug', 'inject', `更新正文注入（组件注入:${s.injectWidgets ? '开' : '关'}，表格注入:${s.offscreen.enabled && s.offscreen.injectTables ? '开' : '关'}）`);
         // 组件注入
         if (s.injectWidgets) {
             const cd = chatData();
@@ -999,17 +1223,29 @@
             c.setExtensionPrompt(INJECT_KEY_WIDGETS, '', PROMPT_TYPES.IN_PROMPT, 0);
         }
 
-        // 镜头之外表格注入
+        // 表格注入
         if (s.offscreen.enabled && s.offscreen.injectTables) {
             const cd = chatData();
             const text = renderOffscreenAsPlainText(cd.offscreen);
             if (text) {
-                c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, `[镜头之外参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`, positionKeyToEnum(s.offscreen.injectPosition), Number(s.offscreen.injectDepth) || 0);
+                c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`, positionKeyToEnum(s.offscreen.injectPosition), Number(s.offscreen.injectDepth) || 0);
             } else {
                 c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
             }
         } else {
             c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
+        }
+
+        // 剧情推演注入
+        if (s.plot.injectEnabled) {
+            const text = buildPlotInjectionText();
+            if (text) {
+                c.setExtensionPrompt(INJECT_KEY_PLOT, text, positionKeyToEnum(s.plot.injectPosition), Number(s.plot.injectDepth) || 0);
+            } else {
+                c.setExtensionPrompt(INJECT_KEY_PLOT, '', PROMPT_TYPES.IN_PROMPT, 0);
+            }
+        } else {
+            c.setExtensionPrompt(INJECT_KEY_PLOT, '', PROMPT_TYPES.IN_PROMPT, 0);
         }
     }
 
@@ -1046,7 +1282,7 @@
                 .filter((p) => p && (p.content || '').trim().length > 0)
                 .map((p) => ({ identifier: p.identifier, name: p.name || p.identifier, content: p.content }));
         } catch (e) {
-            console.warn('[镜头之外] 读取预设条目失败', e);
+            console.warn('[Ego] 读取预设条目失败', e);
             return [];
         }
     }
@@ -1061,7 +1297,7 @@
                 return;
             }
         } catch (e) { /* ignore */ }
-        console.log(`[镜头之外] ${msg}`);
+        console.log(`[Ego] ${msg}`);
     }
 
     // ------------------------------------------------------------------
@@ -1320,7 +1556,8 @@
             </div>
             <div class="ow-tabs">
               <div class="ow-tab active" data-tab="widgets">组件生成</div>
-              <div class="ow-tab" data-tab="offscreen">镜头之外</div>
+              <div class="ow-tab" data-tab="offscreen">表格生成</div>
+              <div class="ow-tab" data-tab="plot">剧情推演</div>
               <div class="ow-tab" data-tab="favorites">收藏夹</div>
               <div class="ow-tab" data-tab="worldinfo">世界书</div>
               <div class="ow-tab" data-tab="prompts">提示词</div>
@@ -1329,6 +1566,7 @@
             </div>
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
+            <div class="ow-panel" data-panel="plot"></div>
             <div class="ow-panel" data-panel="favorites"></div>
             <div class="ow-panel" data-panel="worldinfo"></div>
             <div class="ow-panel" data-panel="prompts"></div>
@@ -1354,6 +1592,7 @@
         const panels = [
             ['widgets', renderWidgetsPanel],
             ['offscreen', renderOffscreenPanel],
+            ['plot', renderPlotPanel],
             ['favorites', renderFavoritesPanel],
             ['worldinfo', renderWorldInfoPanel],
             ['prompts', renderPromptsPanel],
@@ -1393,6 +1632,7 @@
         if (!$modal) return;
         renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+        renderPlotPanel($modal.find('.ow-panel[data-panel="plot"]'));
     }
 
     // ---------------- 日志面板 ----------------
@@ -1466,7 +1706,7 @@
         renderWidgetResults($panel);
 
         $panel.find('#ow_generate_now').on('click', () => {
-            startBackgroundTask('组件与镜头之外', () => runGenerationPipeline());
+            startBackgroundTask('组件与表格', () => runGenerationPipeline());
         });
         $panel.find('#ow_widget_list_btn').on('click', () => openWidgetListDialog($panel));
         refreshGeneratingIndicator();
@@ -1870,7 +2110,7 @@ ${innerHtml}
         let html = `
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
-            <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用镜头之外</label>
+            <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用表格生成</label>
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成/更新</button>
             <span class="ow-muted">${off.updatedAt ? `上次更新 ${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
           </div>
@@ -1906,7 +2146,7 @@ ${innerHtml}
         });
 
         $panel.find('#ow_off_generate').on('click', function () {
-            startBackgroundTask('镜头之外', () => generateOffscreen());
+            startBackgroundTask('表格生成', () => generateOffscreen());
         });
 
         $panel.find('#ow_table_manager_btn').on('click', () => openTableManager($panel));
@@ -2134,6 +2374,189 @@ ${innerHtml}
         }
     }
 
+    // ---------------- 剧情推演面板（思维树） ----------------
+    function renderPlotPanel($panel) {
+        const s = settings();
+        const pl = chatData().plot;
+        const dirs = (s.plot.directions || []).filter((d) => d.enabled).map((d) => d.name);
+
+        $panel.html(`
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <button class="ow-btn ow-primary ow-gen-btn" id="ow_plot_gen"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成推演</button>
+            <span class="ow-muted">${pl.events.length ? `${pl.events.length} 个事件` : '尚未生成'}${pl.updatedAt ? ' · ' + new Date(pl.updatedAt).toLocaleString() : ''}</span>
+          </div>
+          <button class="ow-btn" id="ow_plot_dir_btn"><i class="fa-solid fa-compass"></i> 发展方向${dirs.length ? `（${dirs.length}）` : ''}</button>
+        </div>
+        ${dirs.length ? `<div class="ow-row" style="margin-top:-4px;margin-bottom:10px;">${dirs.map((d) => `<span class="ow-chip">${escapeHtml(d)}</span>`).join('')}</div>` : ''}
+        <div id="ow_plot_tree"></div>`);
+
+        const $tree = $panel.find('#ow_plot_tree');
+        if (!pl.events.length) {
+            $tree.html('<div class="ow-empty">还没有推演。点右上角选择发展方向，再点「生成推演」。<br><span class="ow-muted">生成后当前事件会自动注入聊天，正文里事件结束时会带隐藏标记，扩展会自动置灰未走的分支并推进。</span></div>');
+        } else {
+            $tree.html(renderPlotTreeHtml(pl));
+        }
+
+        $panel.find('#ow_plot_gen').on('click', function () {
+            startBackgroundTask('剧情推演', () => generatePlot());
+        });
+        $panel.find('#ow_plot_dir_btn').on('click', () => openDirectionsDialog($panel));
+
+        // 手动把某条分支标记为"已走"（模型没输出标记时的兜底）
+        $tree.on('click', '[data-action="plot-take"]', function () {
+            const evId = $(this).data('event');
+            const key = String($(this).data('key'));
+            const ev = getPlotEvent(evId);
+            if (!ev) return;
+            const taken = ev.branches.find((b) => b.key === key);
+            if (!taken) return;
+            if (!confirm(`手动把事件 ${evId} 标记为经分支 ${key} 结束？其他分支会被置灰，并推进到 ${taken.next || '结局'}。`)) return;
+            pl.deadBranches[evId] = ev.branches.filter((b) => b.key !== key).map((b) => b.key);
+            pl.path.push({ eventId: evId, branchKey: key, at: Date.now(), manual: true });
+            pl.currentId = (taken.next && taken.next.toUpperCase() !== 'END' && getPlotEvent(taken.next)) ? taken.next : '';
+            saveChatData();
+            updateInjections();
+            log('info', 'ui', `手动推进：事件 ${evId} → 分支 ${key} → ${pl.currentId || '结局'}`);
+            renderPlotPanel($panel);
+        });
+
+        $tree.on('click', '[data-action="plot-goto"]', function () {
+            const evId = $(this).data('event');
+            if (!getPlotEvent(evId)) return;
+            pl.currentId = evId;
+            saveChatData();
+            updateInjections();
+            toast(`当前事件已设为 ${evId}`, 'success');
+            renderPlotPanel($panel);
+        });
+
+        $tree.on('click', '[data-action="plot-reset"]', function () {
+            if (!confirm('清空推演进度（置灰状态与已走路径），事件矩阵保留？')) return;
+            pl.deadBranches = {};
+            pl.path = [];
+            pl.currentId = pl.events[0]?.id || '';
+            saveChatData();
+            updateInjections();
+            renderPlotPanel($panel);
+        });
+
+        refreshGeneratingIndicator();
+    }
+
+    function renderPlotTreeHtml(pl) {
+        const doneIds = new Set(pl.path.map((p) => p.eventId));
+        let html = `<div class="ow-row" style="margin-bottom:10px;">
+            <span class="ow-muted">当前事件：${pl.currentId ? `<b>[事件${escapeHtml(pl.currentId)}]</b>` : '（已抵达结局或未设定）'}</span>
+            <span class="ow-spacer"></span>
+            <button class="ow-btn" data-action="plot-reset">重置进度</button>
+        </div><div class="ow-tree">`;
+
+        for (const ev of pl.events) {
+            const isCurrent = ev.id === pl.currentId;
+            const isDone = doneIds.has(ev.id);
+            const dead = pl.deadBranches[ev.id] || [];
+            const cls = ['ow-tree-node'];
+            if (isCurrent) cls.push('ow-node-current');
+            if (isDone) cls.push('ow-node-done');
+            html += `
+            <div class="${cls.join(' ')}" data-event="${escapeHtml(ev.id)}">
+              <div class="ow-node-head">
+                <span class="ow-node-id">${escapeHtml(ev.id)}</span>
+                <span class="ow-node-title">${escapeHtml(ev.title)}</span>
+                ${isCurrent ? '<span class="ow-node-badge ow-badge-current">进行中</span>' : ''}
+                ${isDone ? '<span class="ow-node-badge ow-badge-done">已经历</span>' : ''}
+                <span class="ow-spacer"></span>
+                ${!isCurrent ? `<button class="ow-btn" data-action="plot-goto" data-event="${escapeHtml(ev.id)}" title="设为当前事件"><i class="fa-solid fa-location-crosshairs"></i></button>` : ''}
+              </div>
+              ${ev.core ? `<div class="ow-node-line"><span class="ow-node-label">核心</span>${escapeHtml(ev.core)}</div>` : ''}
+              ${ev.trigger ? `<div class="ow-node-line"><span class="ow-node-label">导火索</span>${escapeHtml(ev.trigger)}</div>` : ''}
+              <div class="ow-branches">
+                ${ev.branches.map((b) => {
+                    const isDead = dead.includes(b.key);
+                    const wasTaken = pl.path.some((x) => x.eventId === ev.id && x.branchKey === b.key);
+                    const bcls = ['ow-branch'];
+                    if (isDead) bcls.push('ow-branch-dead');
+                    if (wasTaken) bcls.push('ow-branch-taken');
+                    const nextLabel = !b.next ? '未指定' : (b.next.toUpperCase() === 'END' ? '结局' : `事件${b.next}`);
+                    return `
+                    <div class="${bcls.join(' ')}">
+                      <span class="ow-branch-key">${escapeHtml(b.key)}</span>
+                      <span class="ow-branch-cond">${escapeHtml(b.condition || '（条件未写明）')}</span>
+                      <span class="ow-branch-arrow">→</span>
+                      <span class="ow-branch-next">${escapeHtml(nextLabel)}</span>
+                      ${(!isDead && !wasTaken) ? `<button class="ow-btn ow-branch-take" data-action="plot-take" data-event="${escapeHtml(ev.id)}" data-key="${escapeHtml(b.key)}" title="手动标记走这条分支">走这条</button>` : ''}
+                    </div>`;
+                }).join('')}
+              </div>
+            </div>`;
+        }
+        html += '</div>';
+        return html;
+    }
+
+    // ---------------- 发展方向子弹窗 ----------------
+    function openDirectionsDialog($plotPanel) {
+        const s = settings();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:80vh;width:min(520px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">剧情发展方向</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">可多选。选中的方向会写进推演提示词，影响事件矩阵的整体走向。</div>
+              <div id="ow_dir_list" class="ow-dir-grid"></div>
+              <div class="ow-row" style="margin-top:12px;">
+                <input type="text" class="ow-input ow-grow" id="ow_dir_new" placeholder="添加自定义方向，如：悬疑、复仇、青梅竹马">
+                <button class="ow-btn ow-primary" id="ow_dir_add">添加</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.body);
+
+        const close = () => { $ov.remove(); renderPlotPanel($plotPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        const renderDirs = () => {
+            $ov.find('#ow_dir_list').html((s.plot.directions || []).map((d) => `
+              <label class="ow-dir-item ${d.enabled ? 'ow-dir-on' : ''}" data-id="${escapeHtml(d.id)}">
+                <input type="checkbox" class="ow-dir-cb" ${d.enabled ? 'checked' : ''}>
+                <span>${escapeHtml(d.name)}</span>
+                <span class="ow-dir-del" title="删除">✕</span>
+              </label>`).join(''));
+        };
+        renderDirs();
+
+        $ov.on('change', '.ow-dir-cb', function () {
+            const id = $(this).closest('.ow-dir-item').data('id');
+            const d = s.plot.directions.find((x) => x.id === id);
+            if (d) { d.enabled = $(this).is(':checked'); saveSettings(); $(this).closest('.ow-dir-item').toggleClass('ow-dir-on', d.enabled); }
+        });
+        $ov.on('click', '.ow-dir-del', function (e) {
+            e.preventDefault(); e.stopPropagation();
+            const id = $(this).closest('.ow-dir-item').data('id');
+            const d = s.plot.directions.find((x) => x.id === id);
+            if (!d || !confirm(`删除方向「${d.name}」？`)) return;
+            s.plot.directions = s.plot.directions.filter((x) => x.id !== id);
+            saveSettings();
+            renderDirs();
+        });
+        const addDir = () => {
+            const name = String($ov.find('#ow_dir_new').val() || '').trim();
+            if (!name) return;
+            if (s.plot.directions.some((x) => x.name === name)) { toast('已经有这个方向了', 'warning'); return; }
+            s.plot.directions.push({ id: `dir_${Date.now().toString(36)}`, name, enabled: true });
+            saveSettings();
+            $ov.find('#ow_dir_new').val('');
+            renderDirs();
+        };
+        $ov.find('#ow_dir_add').on('click', addDir);
+        $ov.find('#ow_dir_new').on('keydown', (e) => { if (e.key === 'Enter') addDir(); });
+    }
+
     // ---------------- 世界书 / 聊天书发送设置面板 ----------------
     function renderWorldInfoPanel($panel) {
         $panel.html(`
@@ -2246,7 +2669,7 @@ ${innerHtml}
     function renderPromptsPanel($panel) {
         const s = settings();
         $panel.html(`
-        <div class="ow-hint">编辑即保存。各表自己的规则写在「镜头之外 → 表格管理」里，这里只放组件提示词与表格总则。</div>
+        <div class="ow-hint">编辑即保存。各表自己的规则写在「表格生成 → 表格管理」里，这里只放组件提示词与表格总则。</div>
 
         <div class="ow-group">
           <div class="ow-group-title"><i class="fa-solid fa-puzzle-piece"></i> 组件生成提示词</div>
@@ -2262,6 +2685,20 @@ ${innerHtml}
           </div>
           <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:220px;">${escapeHtml(s.prompts.offscreenPreamble)}</textarea>
           <pre id="ow_prompt_preview" class="ow-preview-box" style="display:none;"></pre>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-code-branch"></i> 剧情推演 · 生成提示词</div>
+          <div class="ow-row"><button class="ow-btn" id="ow_prompt_plot_reset">恢复默认</button></div>
+          <textarea class="ow-textarea" id="ow_prompt_plot" style="min-height:240px;">${escapeHtml(s.prompts.plotSystemPrompt)}</textarea>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-syringe"></i> 剧情推演 · 注入聊天提示词</div>
+          <div class="ow-hint">可用占位符：<code>{{event_id}}</code> <code>{{event_title}}</code> <code>{{event_core}}</code> <code>{{event_trigger}}</code> <code>{{branches}}</code> <code>{{marker_example}}</code>。
+          其中 <code>{{marker_example}}</code> 会替换成当前事件的隐藏标记样例，扩展就是靠扫描这个标记来自动置灰分支并推进的，删掉它自动推进就会失效。</div>
+          <div class="ow-row"><button class="ow-btn" id="ow_prompt_plotinj_reset">恢复默认</button></div>
+          <textarea class="ow-textarea" id="ow_prompt_plotinj" style="min-height:200px;">${escapeHtml(s.prompts.plotInjectTemplate)}</textarea>
         </div>`);
 
         $panel.find('#ow_prompt_widget').on('input', function () {
@@ -2283,6 +2720,18 @@ ${innerHtml}
             s.prompts.offscreenPreamble = DEFAULT_OFFSCREEN_PREAMBLE;
             saveSettings();
             renderPromptsPanel($panel);
+        });
+        $panel.find('#ow_prompt_plot').on('input', function () { s.prompts.plotSystemPrompt = $(this).val(); saveSettings(); });
+        $panel.find('#ow_prompt_plot_reset').on('click', function () {
+            if (!confirm('确定恢复“剧情推演生成提示词”为默认内容吗？')) return;
+            s.prompts.plotSystemPrompt = DEFAULT_PLOT_SYSTEM_PROMPT;
+            saveSettings(); renderPromptsPanel($panel);
+        });
+        $panel.find('#ow_prompt_plotinj').on('input', function () { s.prompts.plotInjectTemplate = $(this).val(); saveSettings(); updateInjections(); });
+        $panel.find('#ow_prompt_plotinj_reset').on('click', function () {
+            if (!confirm('确定恢复“剧情推演注入提示词”为默认内容吗？')) return;
+            s.prompts.plotInjectTemplate = DEFAULT_PLOT_INJECT_TEMPLATE;
+            saveSettings(); updateInjections(); renderPromptsPanel($panel);
         });
         $panel.find('#ow_prompt_preview_btn').on('click', function () {
             const $box = $panel.find('#ow_prompt_preview');
@@ -2327,7 +2776,7 @@ ${innerHtml}
         </div>
 
         <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-table-list"></i> 表格（镜头之外）</div>
+          <div class="ow-group-title"><i class="fa-solid fa-table-list"></i> 表格生成</div>
 
           <div class="ow-row">
             <label><input type="checkbox" id="ow_off_enabled_set" ${s.offscreen.enabled ? 'checked' : ''}> 启用表格功能</label>
@@ -2351,6 +2800,24 @@ ${innerHtml}
             <select class="ow-select" id="ow_off_inject_pos">${posOptions(s.offscreen.injectPosition)}</select>
             <label>深度 <input type="number" class="ow-input ow-num" id="ow_off_inject_depth" min="0" value="${s.offscreen.injectDepth}"></label>
           </div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-code-branch"></i> 剧情推演</div>
+          <div class="ow-field-label">上下文</div>
+          <div class="ow-row">
+            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_plot_history" min="0" value="${s.plot.historyDepth}"> 楼聊天记录</label>
+          </div>
+          <div class="ow-row">
+            <label>至少生成 <input type="number" class="ow-input ow-num" id="ow_plot_min" min="2" value="${s.plot.minEvents}"> 个事件节点</label>
+          </div>
+          <div class="ow-field-label">注入正文</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
+            <select class="ow-select" id="ow_plot_inject_pos">${posOptions(s.plot.injectPosition)}</select>
+            <label>深度 <input type="number" class="ow-input ow-num" id="ow_plot_inject_depth" min="0" value="${s.plot.injectDepth}"></label>
+          </div>
+          <div class="ow-muted">世界书发送范围跟随下方「世界书」模块的设定。</div>
         </div>
 
         <div class="ow-group">
@@ -2447,6 +2914,11 @@ ${innerHtml}
             $f.find('.ow-follow-note').toggle(on);
         });
         $panel.find('#ow_off_history_depth').on('change', function () { s.offscreen.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_plot_history').on('change', function () { s.plot.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_plot_min').on('change', function () { s.plot.minEvents = Math.max(2, Number($(this).val()) || 2); saveSettings(); });
+        $panel.find('#ow_plot_inject').on('change', function () { s.plot.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
+        $panel.find('#ow_plot_inject_pos').on('change', function () { s.plot.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
+        $panel.find('#ow_plot_inject_depth').on('change', function () { s.plot.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
         $panel.find('#ow_open_ext_manager').on('click', function () {
             // 尝试打开酒馆自带的扩展管理器（不同版本入口 id 略有差异，逐个尝试）
             const candidates = ['#extensionsMenuButton', '#extensions_button', '#rm_extensions_block', '#extensions_details'];
