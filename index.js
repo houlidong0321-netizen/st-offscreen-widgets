@@ -205,8 +205,9 @@
         theme: { mode: 'system', customCss: '' },
         prompts: {
             widgetSystemPrompt: DEFAULT_WIDGET_SYSTEM_PROMPT,
-            offscreenSystemPrompt: DEFAULT_OFFSCREEN_SYSTEM_PROMPT,
+            offscreenPreamble: DEFAULT_OFFSCREEN_PREAMBLE,
         },
+        offscreenTables: defaultOffscreenTables(),
         // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
         // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
         worldInfoOverrides: {},
@@ -247,10 +248,7 @@
     // 每聊天数据（组件生成结果 / 镜头之外四张表）随存档保存
     function chatData() {
         const c = ctx();
-        const emptyOffscreen = () => ({
-            scheduleTable: [], characterTable: [], sceneTable: [], itemAnchorTable: [],
-            timelineTable: [], foreshadowTable: [], updatedAt: null,
-        });
+        const emptyOffscreen = () => ({ tables: {}, updatedAt: null });
         if (!c.chatMetadata[MODULE_NAME]) {
             c.chatMetadata[MODULE_NAME] = { widgetResults: {}, offscreen: emptyOffscreen(), autoTriggerState: { lastWidgetFloor: 0, lastOffscreenFloor: 0 } };
         }
@@ -261,11 +259,15 @@
             c.chatMetadata[MODULE_NAME].autoTriggerState = { lastWidgetFloor: 0, lastOffscreenFloor: 0 };
         }
         const off = c.chatMetadata[MODULE_NAME].offscreen;
-        // 兼容旧版本存档结构（曾经有 narrative/event_table 字段，或缺少新表）
-        if (!Array.isArray(off.sceneTable)) off.sceneTable = [];
-        if (!Array.isArray(off.itemAnchorTable)) off.itemAnchorTable = [];
-        if (!Array.isArray(off.timelineTable)) off.timelineTable = [];
-        if (!Array.isArray(off.foreshadowTable)) off.foreshadowTable = [];
+        // 迁移旧版存档：以前每张表是 offscreen 下的一个平铺数组字段，
+        // 现在统一收进 offscreen.tables[key]，以支持用户自定义表格。
+        if (!off.tables) off.tables = {};
+        for (const legacyKey of ['scheduleTable', 'characterTable', 'sceneTable', 'itemAnchorTable', 'timelineTable', 'foreshadowTable']) {
+            if (Array.isArray(off[legacyKey])) {
+                if (!off.tables[legacyKey]?.length) off.tables[legacyKey] = off[legacyKey];
+                delete off[legacyKey];
+            }
+        }
         return c.chatMetadata[MODULE_NAME];
     }
 
@@ -327,116 +329,163 @@
         return parts.join('\n\n');
     }
 
-    // 镜头之外：六张表的说明（不使用"表X"编号标识，仅用表名）。
-    // 场景表 / 物品轨迹表严格遵循"正文触发原则"；角色表不受此原则约束；
-    // 日程表沿用自身原有的、允许合理推断的规则；核心待办事项表与伏笔表各自的
-    // 增删规则相互独立，不共用同一套清理标准。
-    const DEFAULT_OFFSCREEN_TABLE_SPEC = `
-# 总原则（务必先读）
-- "正文触发原则"仅适用于【场景表】与【物品轨迹表】：
-  · 正文中明确描写了变化 → 允许更新对应表格字段。
-  · 正文中未提及 → 必须原样保留上一版对应条目的所有字段，一字不改地照抄，不允许新增/删除/修改。
-  · 禁止基于逻辑推理、默认进程、或"应该发生了"而主动修改这两张表的状态。
-- 【角色表】不需要遵守"正文触发原则"，可以合理描写正文中不在场角色目前应该在做的事。
-- 【日程表】遵循自己小节内的规则（允许基于身份与时间点做合理推断/弹性填充），同样不受"正文触发原则"约束。
-- 六张表各自的生命周期（新增/更新/删除时机）互不相同、不共用一套标准，严格按各表小节内注明的规则执行，不要把某张表的清理逻辑套用到另一张表上。
-- 所有带编号的标签字段，输出时必须整体带上反引号"\`"符号，例如 \`[Scene_1]\`、\`[Item_Anchor_1]\`、\`[Chapter_1]\`、\`[Foreshadow_1]\`。
-
-## 日程表
-列结构：角色 | 固定日程规律 | 时节性必然事件 | 弹性事务参考池
-本表只记录正文中尚未提及的角色日常生活信息。记录两类内容：因身份而必然存在的规律性/时节性事务，
-以及供离场角色抽取参考的弹性生活素材，均由"身份+当前故事时间点"自然推导得出。
+    // 镜头之外：默认表格定义。每张表自带"规则说明(spec)"，提示词按启用的表动态拼装，
+    // 用户在「表格管理」里增删表或改规则，提示词随之变化，不需要改代码。
+    function defaultOffscreenTables() {
+        return [
+            {
+                key: 'scheduleTable', jsonKey: 'schedule_table', title: '日程表', enabled: true,
+                columns: [
+                    { field: 'role', label: '角色' },
+                    { field: 'routine', label: '固定日程规律' },
+                    { field: 'seasonal', label: '时节性必然事件' },
+                    { field: 'pool', label: '弹性事务参考池' },
+                ],
+                spec: `本表只记录正文中尚未提及的角色日常生活信息，由"身份+当前故事时间点"自然推导得出，不受"正文触发原则"约束。
 "固定日程规律"：日常性、按周期反复发生的日程锚点，含具体星期与时段。
 "时节性必然事件"：结合角色身份与当前故事日期所处季节/月份/节日/星期推导出的大概率事务，写法为"时间节点：事务"，无关联时留空"—"。
 "弹性事务参考池"：与角色身份/性格相符、结合当前季节/星期/天气合理存在的偶发小事清单，用中文分号分隔多项，不要求真实发生过。
-时节性事件时间窗口过去后应删除（下次进入类似节点可重新生成）；固定日程规律与弹性事务参考池仅在角色身份根本变化时整体更新。
-
-## 角色表
-列结构：姓名 | 昵称 | 与用户的关系 | 当前位置与正在做的事 | 对用户的态度
-记录所有已出场角色的身份信息与实时状态，确保离场角色也拥有可查证的当前生活状态。
+时节性事件时间窗口过去后应删除；固定日程规律与弹性事务参考池仅在角色身份根本变化时整体更新。`,
+            },
+            {
+                key: 'characterTable', jsonKey: 'character_table', title: '角色表', enabled: true,
+                columns: [
+                    { field: 'name', label: '姓名' },
+                    { field: 'alias', label: '昵称' },
+                    { field: 'relation', label: '与用户的关系' },
+                    { field: 'location', label: '当前位置与正在做的事' },
+                    { field: 'attitude', label: '对用户的态度' },
+                ],
+                spec: `记录所有已出场角色的身份信息与实时状态，确保离场角色也拥有可查证的当前生活状态。
+本表【不受"正文触发原则"约束】，可以合理描写正文中不在场角色此刻在做的事。
 "当前位置与正在做的事"：绝对上帝视角的物理位置与客观动作，不带情绪与内心活动，禁止写"未知"。
 "对用户的态度"：用2-3个简写标签描述当前状态快照。
-不删除，永久保留，即使角色长期不出场也不清理；每次更新都应覆盖"当前位置与正在做的事"字段。
-
-## 场景表
-1. 收录标准：仅收录具备明确功能或剧情停留价值的室内/室外固定场所。不收录通道类，如马路、街道、走廊、过道、楼梯间。不收录建筑附属部件，如门、窗、墙（作为整体建筑的一部分即可，无需拆分"东门西门"）。不收录未发生任何剧情对话或动作的经过性地点。每次生成如发现之前收录过的条目不符合以上标准，请在此条中立即删除。
-2. 基本原则：做加法，不做覆盖。同一场景再次出现时，若正文补充了新细节，追加到对应字段。仅当同一特征出现前后矛盾的描写时，以最新描写为准，并删除旧内容。
-3. 失活清理规则（维护动作，不算脑补剧情变化，因此不受"正文触发原则"约束）：若某场景标签连续10章未在正文中出现，且当前"核心待办事项表"与"伏笔表"中均无条目指向该场景，下次生成场景表时直接删除该行，不需要正文给出"这个场景被放弃"的描写作为触发依据。若10章内再次出现或被其他表引用，则保留，计数清零重新计算。
-4. \`[Scene_X]\`：场景标签。X为阿拉伯数字，按场景首次出场顺序从1开始递增。
+不删除，永久保留，即使角色长期不出场也不清理；每次更新都应覆盖"当前位置与正在做的事"字段。`,
+            },
+            {
+                key: 'sceneTable', jsonKey: 'scene_table', title: '场景表', enabled: true,
+                columns: [
+                    { field: 'tag', label: '标签' },
+                    { field: 'name', label: '场景名称' },
+                    { field: 'location', label: '地理位置/距离参照' },
+                    { field: 'structure', label: '建筑/环境构造细节' },
+                    { field: 'usage', label: '用途' },
+                ],
+                spec: `【严格遵循"正文触发原则"】
+1. 收录标准：仅收录具备明确功能或剧情停留价值的室内/室外固定场所。不收录通道类（马路、街道、走廊、过道、楼梯间）。不收录建筑附属部件（门、窗、墙）。不收录未发生任何剧情对话或动作的经过性地点。每次生成如发现之前收录过的条目不符合以上标准，立即删除。
+2. 基本原则：做加法，不做覆盖。同一场景再次出现时，若正文补充了新细节，追加到对应字段。仅当同一特征出现前后矛盾的描写时，以最新描写为准并删除旧内容。
+3. 失活清理规则（维护动作，不受"正文触发原则"约束）：若某场景标签连续10章未在正文中出现，且当前"核心待办事项表"与"伏笔表"中均无条目指向该场景，下次生成时直接删除该行。若10章内再次出现或被其他表引用，则保留，计数清零重算。
+4. 标签：\`[Scene_X]\`，X按场景首次出场顺序从1递增。
 5. 场景名称：只写一层整体空间，如"A的公寓""街角咖啡馆"。
 6. 地理位置/距离参照：参照物可用场景标签或通用地标。
-7. 建筑/环境构造细节：仅记录正文明确描写的客观物理存在。禁止写入依赖特定时间、天气、氛围的感官评价（如"灯光昏暗"）。当需要注明子空间时，在该字段内以"功能区：具体客观陈设"的格式追加，如："卧室：有一张双人床、嵌入式衣柜。"
-8. 用途：仅写正文中明确提及或被角色行为证实的绝对物理化用途（"A的住所""A常在此喝咖啡"）。禁止写功能性用途（"施压用场景"）。
-9. 未描写皆可为空，禁止想象、脑补。
-
-## 物品轨迹表
-1. 收录标准，仅收录满足以下任一条件的物品，其余物品一律不收录：
+7. 建筑/环境构造细节：仅记录正文明确描写的客观物理存在。禁止写依赖时间/天气/氛围的感官评价（如"灯光昏暗"）。子空间用"功能区：具体客观陈设"格式追加。
+8. 用途：仅写正文明确提及或被角色行为证实的绝对物理化用途。禁止写功能性用途（如"施压用场景"）。
+9. 正文未描写的字段留空，禁止想象脑补。`,
+            },
+            {
+                key: 'itemAnchorTable', jsonKey: 'item_anchor_table', title: '物品轨迹表', enabled: true,
+                columns: [
+                    { field: 'tag', label: '标签' },
+                    { field: 'name', label: '物品名称' },
+                    { field: 'chapters', label: '关联章节' },
+                    { field: 'location', label: '当前位置' },
+                    { field: 'status', label: '状态' },
+                ],
+                spec: `【严格遵循"正文触发原则"】
+1. 收录标准，仅收录满足以下任一条件的物品：
    - 纪念意义：角色主动赠予、留存、珍藏的物品，或与角色重大过去强关联的信物。
    - 剧情杠杆：对后文剧情发展可能产生关键影响的物品。
-   - 禁止收录手机，除非离开主人身边。如看到不合规的手机项，请在此条中立刻删掉。
-2. 终态判定（决定是否删除，两类物品判定标准不同）：
-   - 剧情杠杆类：该物品所关联的剧情段落明确结束后，下一轮删除该行。
-   - 纪念意义类：不因单段剧情结束而自动删除，仅当正文明确描写了不可逆的处置动作（被清走、被烧毁、被永久赠予且对方已带离场景、被明确证实无法找回）时，才视为终态，下一轮删除。若正文只描写了"扔进垃圾桶/藏起来/丢在某处"但未描写后续被清走或彻底销毁，视为"可逆位置"，继续保留追踪，位置字段照实填写当前所在处，不判定删除。
-3. \`[Item_Anchor_X]\`：物品编号标签。X为阿拉伯数字，按物品首次出场顺序从1开始递增。每个物品终身固定此标签，不可变更。
-4. 物品名称：必须包含可辨识的描述性特征，以便区分同类物品。当物品为虚拟物品，如照片、文件等，需要写清它的上一级物品，如"有着XX照片的XX的手机"，位置为手机的位置。
-5. 关联章节：该物品首次出现和移动的章节标签\`[Chapter_X]\`，可为多个（用顿号或逗号分隔）。
-6. 当前位置：记录物品此刻所在的绝对位置。角色持有写"A的口袋""B的手中"；场景内位置写"A书房抽屉\`[Scene_1]\`"。禁止自创场景标签，只能引用场景表中已存在的\`[Scene_X]\`标签。
-7. 状态：根据第2条终态判定，标注"留存"或"待删（下轮删除）"。
-
-## 核心待办事项表
-1. 收录范围：此表只追踪"尚未开始"的待办事项。一旦该事项在正文中开始发生（无论是持续几章还是持续几十章的长事件，如一场旅行），下一轮生成时立即将该行整行删除——事项进行中及之后的发展由正文本身、场景表、角色表自然承载，不再需要本表追踪，避免长事件反复累积关联章节标签。
-2. 更新原则：严格根据上一轮的待办表和本章新正文进行更新。若正文未推进任何待办进度，则完全继承旧表，不许妄动。
-3. 时间：必须对应到确切的日期与时间节点（例如：2023.11.06 14:00）。绝对禁止使用模糊表述（如"下周""明天""两个小时后"）。若无具体的时分刻度，必须填写"待定"或"全天"。
+   - 禁止收录手机，除非离开主人身边。发现不合规的手机项立刻删掉。
+2. 终态判定（两类物品标准不同）：
+   - 剧情杠杆类：所关联的剧情段落明确结束后，下一轮删除该行。
+   - 纪念意义类：不因单段剧情结束而删除，仅当正文明确描写不可逆处置（被清走、烧毁、永久赠予且对方已带离场景、明确证实无法找回）才视为终态，下一轮删除。若只描写"扔进垃圾桶/藏起来/丢在某处"但未描写后续被清走或销毁，视为"可逆位置"，继续保留追踪，位置字段照实填当前所在处。
+3. 标签：\`[Item_Anchor_X]\`，X按首次出场顺序从1递增，终身固定不可变更。
+4. 物品名称：必须含可辨识的描述性特征。虚拟物品（照片、文件等）需写清上一级物品，如"有着XX照片的XX的手机"，位置为手机的位置。
+5. 关联章节：首次出现和移动的章节标签\`[Chapter_X]\`，可多个。
+6. 当前位置：角色持有写"A的口袋"；场景内位置写"A书房抽屉\`[Scene_1]\`"。禁止自创场景标签，只能引用场景表已有的标签。
+7. 状态：按第2条判定，标注"留存"或"待删（下轮删除）"。`,
+            },
+            {
+                key: 'timelineTable', jsonKey: 'timeline_table', title: '核心待办事项表', enabled: true,
+                columns: [
+                    { field: 'time', label: '时间' },
+                    { field: 'task', label: '事项' },
+                    { field: 'chapter', label: '关联章节' },
+                ],
+                spec: `1. 收录范围：只追踪"尚未开始"的待办事项。一旦该事项在正文中开始发生（无论持续几章），下一轮立即整行删除——进行中及之后的发展由正文、场景表、角色表自然承载。
+2. 更新原则：严格根据上一轮待办表和本章新正文更新。若正文未推进任何待办进度，则完全继承旧表，不许妄动。
+3. 时间：必须是确切日期与时间节点（如 2023.11.06 14:00）。禁止模糊表述（"下周""明天""两小时后"）。无具体时分刻度则填"待定"或"全天"。
 4. 事项：简写清楚具体的任务或事件。
-5. 关联章节：只记录该事项**首次被提及/确立**的那一个章节标签\`[Chapter_X]\`，不随事项被反复提起而追加新标签——保留这一条是为了防止事项在很多章之前被提到过一次后就被遗忘，回看这一个标签即可定位起点。
+5. 关联章节：只记录该事项**首次被提及/确立**的那一个章节标签\`[Chapter_X]\`，不随反复提起而追加。`,
+            },
+            {
+                key: 'foreshadowTable', jsonKey: 'foreshadow_table', title: '伏笔表', enabled: true,
+                columns: [
+                    { field: 'tag', label: '标签' },
+                    { field: 'content', label: '内容' },
+                    { field: 'chapter', label: '埋设章节' },
+                    { field: 'status', label: '状态' },
+                ],
+                spec: `1. 收录标准：正文中出现的、尚未解释清楚的异常细节、隐藏信息、角色未说明的反常举动或态度。
+2. 更新原则：只在正文明确埋下新伏笔时新增，只在正文明确回收（谜底揭晓/信息被说明）时把状态改为"已回收"，已回收的伏笔下一轮整行删除。不因时间推移或长期未提及而清理——不受场景表那类失活清理规则约束。
+3. 标签：\`[Foreshadow_X]\`，X按首次出现顺序从1递增。
+4. 内容：简要描述伏笔本身，需能让人一眼回忆起是什么事，不写"某某很奇怪"这类无信息量记录。
+5. 埋设章节：首次出现的章节标签\`[Chapter_X]\`。
+6. 状态：仅限"未回收""已回收"。`,
+            },
+        ];
+    }
 
-## 伏笔表
-1. 收录标准：正文中出现的、尚未解释清楚的异常细节、隐藏信息、角色未说明的反常举动或态度，均可收录。
-2. 更新原则：只在正文明确埋下新伏笔时新增，只在正文明确回收（谜底揭晓/信息被说明）时将状态改为"已回收"，已回收的伏笔在下一轮生成时整行删除。不因时间推移或长期未提及而清理——伏笔的价值就在于"很久不提也不能忘"，不受场景表那类失活清理规则约束。
-3. \`[Foreshadow_X]\`：伏笔标签。X为阿拉伯数字，按伏笔首次出现顺序从1开始递增。
-4. 内容：简要描述伏笔本身，需能让人一眼回忆起是什么事，不写"某某很奇怪"这类无信息量的记录。
-5. 埋设章节：该伏笔首次出现的章节标签\`[Chapter_X]\`。
-6. 状态：仅限"未回收""已回收"，已回收的行下一轮删除。
+    const DEFAULT_OFFSCREEN_PREAMBLE = `你是一个为角色扮演故事维护"镜头之外"状态数据库的助手。你需要维护下列结构化表格。
+内容绝不能与正文已确认的剧情冲突，也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折。
 
-## 关于"章节标签 \`[Chapter_X]\`"的说明
-若当前故事本身没有明确的"第X章"式章节划分，请你自行以连续递增的编号维护一套章节标签体系
-（例如可以按剧情自然段落划分），只要求前后编号保持一致、不重新编号已经分配过的章节即可，
-不强制要求与任何外部章节系统对齐。
-`.trim();
+# 总原则
+- "正文触发原则"（仅适用于下方明确标注遵循该原则的表）：
+  · 正文中明确描写了变化 → 允许更新对应表格字段。
+  · 正文中未提及 → 必须原样保留上一版条目的所有字段，一字不改地照抄，不允许新增/删除/修改。
+  · 禁止基于逻辑推理、默认进程、或"应该发生了"而主动修改这些表的状态。
+- 各表生命周期（新增/更新/删除时机）互不相同、不共用一套标准，严格按各表小节内的规则执行，不要把某张表的清理逻辑套用到另一张表上。
+- 所有带编号的标签字段，输出时必须整体带上反引号，例如 \`[Scene_1]\`、\`[Item_Anchor_1]\`、\`[Chapter_1]\`、\`[Foreshadow_1]\`。
+- 若故事本身没有明确章节划分，请自行以连续递增的编号维护一套 \`[Chapter_X]\` 标签体系，保持前后一致、不重新编号已分配过的章节。`;
 
-    const DEFAULT_OFFSCREEN_SYSTEM_PROMPT =
-        '你是一个为角色扮演故事维护"镜头之外"状态数据库的助手。你需要维护六张结构化表格，方便用户直接查看与编辑。' +
-        '这些内容绝不能与正文已经确认的剧情冲突，也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折。\n\n' +
-        '维护规则如下：\n' + DEFAULT_OFFSCREEN_TABLE_SPEC + '\n\n' +
-        '请仅输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：\n' +
-        '{"schedule_table":[{"role":"","routine":"","seasonal":"","pool":""}],' +
-        '"character_table":[{"name":"","alias":"","relation":"","location":"","attitude":""}],' +
-        '"scene_table":[{"tag":"`[Scene_1]`","name":"","location":"","structure":"","usage":""}],' +
-        '"item_anchor_table":[{"tag":"`[Item_Anchor_1]`","name":"","chapters":"","location":"","status":""}],' +
-        '"timeline_table":[{"time":"","task":"","chapter":"`[Chapter_1]`"}],' +
-        '"foreshadow_table":[{"tag":"`[Foreshadow_1]`","content":"","chapter":"`[Chapter_1]`","status":"未回收"}]}\n' +
-        '六张表都需要在已有表格数据的基础上按各自小节的规则更新（新增/修改/按规则删除），而不是每次全部推倒重写；' +
-        '未被规则要求变更的表格或行，请原样保留上一版数据。';
+    // 按当前启用的表格动态拼装完整的系统提示词
+    function buildOffscreenSystemPrompt() {
+        const s = settings();
+        const tables = getOffscreenTables({ onlyEnabled: true });
+        const specs = tables.map((t) => {
+            const cols = t.columns.map((c) => c.label).join(' | ');
+            return `## ${t.title}\n列结构：${cols}\n${t.spec || ''}`.trim();
+        }).join('\n\n');
+        const schema = '{' + tables.map((t) => {
+            const obj = t.columns.map((c) => `"${c.field}":""`).join(',');
+            return `"${t.jsonKey}":[{${obj}}]`;
+        }).join(',') + '}';
+        return [
+            s.prompts.offscreenPreamble || DEFAULT_OFFSCREEN_PREAMBLE,
+            '维护规则如下：\n' + specs,
+            '请仅输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：\n' + schema,
+            '所有表都需要在已有数据基础上按各自规则更新（新增/修改/按规则删除），而不是每次推倒重写；未被规则要求变更的表格或行，请原样保留上一版数据。',
+        ].join('\n\n');
+    }
 
     function buildOffscreenUserPrompt(extras) {
         const parts = [];
         if (extras.history) parts.push(`【最近聊天记录】\n${extras.history}`);
         if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
         if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
-        const existing = chatData().offscreen;
-        const hasExisting = ['scheduleTable', 'characterTable', 'sceneTable', 'itemAnchorTable', 'timelineTable', 'foreshadowTable']
-            .some((k) => existing[k]?.length);
-        if (hasExisting) {
-            parts.push(`【已有表格数据（除"正文触发原则"要求变更的部分外，请原样保留，不要从零重写）】\n${JSON.stringify({
-                schedule_table: existing.scheduleTable,
-                character_table: existing.characterTable,
-                scene_table: existing.sceneTable,
-                item_anchor_table: existing.itemAnchorTable,
-                timeline_table: existing.timelineTable,
-                foreshadow_table: existing.foreshadowTable,
-            })}`);
+        const off = chatData().offscreen;
+        const tables = getOffscreenTables({ onlyEnabled: true });
+        const existing = {};
+        let hasExisting = false;
+        for (const t of tables) {
+            const rows = off.tables?.[t.key] || [];
+            existing[t.jsonKey] = rows;
+            if (rows.length) hasExisting = true;
         }
-        parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成或更新以上六张表。');
+        if (hasExisting) {
+            parts.push(`【已有表格数据（除"正文触发原则"要求变更的部分外，请原样保留，不要从零重写）】\n${JSON.stringify(existing)}`);
+        }
+        parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成或更新以上表格。');
         return parts.join('\n\n');
     }
 
@@ -698,33 +747,29 @@
         const extras = await gatherExtras();
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
-            const raw = await callModel(settings().prompts.offscreenSystemPrompt, userPrompt, '镜头之外');
+            const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '镜头之外');
             const parsed = tryParseJsonRobust(raw, '镜头之外');
             if (!parsed) {
-                throw new Error('未能从模型响应中解析出 JSON，表格因此没有更新。请在「日志」标签页查看完整响应内容，确认模型是否遵循了 JSON 格式要求。');
+                throw new Error('未能从模型响应中解析出 JSON，表格因此没有更新。请在「日志」标签页查看完整响应内容。');
             }
             if (typeof parsed !== 'object' || Array.isArray(parsed)) {
                 throw new Error(`解析出的内容不是预期的对象结构（实际类型：${Array.isArray(parsed) ? 'array' : typeof parsed}）`);
             }
             const cd = chatData();
-            let changed = [];
-            const applyTable = (jsonKey, storeKey, label, normalizeFn) => {
-                if (Array.isArray(parsed[jsonKey])) {
-                    cd.offscreen[storeKey] = normalizeFn(parsed[jsonKey]);
-                    changed.push(`${label}(${cd.offscreen[storeKey].length}行)`);
+            cd.offscreen.tables = cd.offscreen.tables || {};
+            const changed = [];
+            for (const t of getOffscreenTables({ onlyEnabled: true })) {
+                const rows = parsed[t.jsonKey];
+                if (Array.isArray(rows)) {
+                    cd.offscreen.tables[t.key] = normalizeRowsGeneric(rows, t.columns);
+                    changed.push(`${t.title}(${cd.offscreen.tables[t.key].length}行)`);
                 } else {
-                    log('warn', 'parse', `响应 JSON 中没有找到合法的 ${jsonKey} 数组字段（${label}未更新，本轮保留旧数据）`, parsed);
+                    log('warn', 'parse', `响应中没有合法的 ${t.jsonKey} 数组（${t.title}未更新，保留旧数据）`, parsed);
                 }
-            };
-            applyTable('schedule_table', 'scheduleTable', '日程表', normalizeScheduleRows);
-            applyTable('character_table', 'characterTable', '角色表', normalizeCharacterRows);
-            applyTable('scene_table', 'sceneTable', '场景表', normalizeSceneRows);
-            applyTable('item_anchor_table', 'itemAnchorTable', '物品轨迹表', normalizeItemAnchorRows);
-            applyTable('timeline_table', 'timelineTable', '核心待办事项表', normalizeTimelineRows);
-            applyTable('foreshadow_table', 'foreshadowTable', '伏笔表', normalizeForeshadowRows);
+            }
             cd.offscreen.updatedAt = Date.now();
             saveChatData();
-            log('info', 'system', `「镜头之外」更新完成，已写入 chatMetadata.${MODULE_NAME}.offscreen：${changed.join('、') || '（无字段被更新，请检查上面的 parse 警告）'}`);
+            log('info', 'system', `「镜头之外」更新完成：${changed.join('、') || '（无表被更新，请检查上面的 parse 警告）'}`);
             onProgress?.('offscreen', 'done');
         } catch (err) {
             log('error', 'system', `「镜头之外」生成失败：${err.message || err}`, err);
@@ -734,56 +779,67 @@
         updateInjections();
     }
 
-    // 兼容模型可能使用的不同字段名（中文/拼音/英文），尽量把返回内容对齐到内部统一字段
-    function normalizeScheduleRows(rows) {
-        return rows.map((r) => ({
-            role: r.role ?? r.角色 ?? r.name ?? '',
-            routine: r.routine ?? r.固定日程规律 ?? r.fixed_schedule ?? '',
-            seasonal: r.seasonal ?? r.时节性必然事件 ?? r.seasonal_event ?? '',
-            pool: r.pool ?? r.弹性事务参考池 ?? r.flexible_pool ?? '',
-        }));
+    // ------------------------------------------------------------------
+    // 后台任务管理：生成流程必须独立于界面存活。
+    // 之前 UI 直接 await 生成流程，弹窗一关、DOM 被移除后 finally 里的
+    // 界面操作会连带影响流程感知，用户看起来就是"关掉界面就不生成了"。
+    // 现在统一走这里：任务挂在模块级变量上，与弹窗生命周期完全解耦，
+    // 关闭界面照常跑完，并在开始/结束时用 toast 通知。
+    // ------------------------------------------------------------------
+    const bgTask = { running: false, label: '', startedAt: 0, promise: null };
+
+    function isGenerating() {
+        return bgTask.running;
     }
-    function normalizeCharacterRows(rows) {
-        return rows.map((r) => ({
-            name: r.name ?? r.姓名 ?? '',
-            alias: r.alias ?? r.昵称 ?? r.nickname ?? '',
-            relation: r.relation ?? r.关系 ?? r['与用户的关系'] ?? '',
-            location: r.location ?? r.当前位置与正在做的事 ?? r.status ?? '',
-            attitude: r.attitude ?? r.态度 ?? r['对用户的态度'] ?? '',
-        }));
+
+    /**
+     * 启动一个后台生成任务。不会被 UI await，弹窗关闭也会继续执行。
+     * @param {string} label 任务名称，用于提示与日志
+     * @param {() => Promise<any>} fn 实际执行的异步函数
+     */
+    function startBackgroundTask(label, fn) {
+        if (bgTask.running) {
+            toast(`「${bgTask.label}」正在生成中，请等它结束后再开始新任务`, 'warning');
+            return bgTask.promise;
+        }
+        bgTask.running = true;
+        bgTask.label = label;
+        bgTask.startedAt = Date.now();
+        log('info', 'system', `▶ 后台任务开始：${label}（关闭界面不会中断）`);
+        toast(`开始生成：${label}（可关闭窗口，后台继续）`, 'info');
+        refreshGeneratingIndicator();
+
+        bgTask.promise = (async () => {
+            try {
+                await fn();
+                const secs = ((Date.now() - bgTask.startedAt) / 1000).toFixed(1);
+                log('info', 'system', `■ 后台任务完成：${label}，耗时 ${secs}s`);
+                toast(`生成完成：${label}（耗时 ${secs}s）`, 'success');
+            } catch (err) {
+                log('error', 'system', `■ 后台任务失败：${label} — ${err.message || err}`, err);
+                toast(`生成失败：${label} — ${err.message || err}，详见日志`, 'error');
+            } finally {
+                bgTask.running = false;
+                bgTask.label = '';
+                bgTask.promise = null;
+                refreshGeneratingIndicator();
+                // 任务结束后如果界面还开着，刷新一下结果显示
+                refreshOpenPanels();
+            }
+        })();
+        return bgTask.promise;
     }
-    function normalizeSceneRows(rows) {
-        return rows.map((r) => ({
-            tag: r.tag ?? r.标签 ?? r['Scene标签'] ?? '',
-            name: r.name ?? r.场景名称 ?? '',
-            location: r.location ?? r['地理位置/距离参照'] ?? r.地理位置 ?? '',
-            structure: r.structure ?? r['建筑/环境构造细节'] ?? r.构造细节 ?? '',
-            usage: r.usage ?? r.用途 ?? '',
-        }));
-    }
-    function normalizeItemAnchorRows(rows) {
-        return rows.map((r) => ({
-            tag: r.tag ?? r.标签 ?? '',
-            name: r.name ?? r.物品名称 ?? '',
-            chapters: r.chapters ?? r.关联章节 ?? '',
-            location: r.location ?? r.当前位置 ?? '',
-            status: r.status ?? r.状态 ?? '',
-        }));
-    }
-    function normalizeTimelineRows(rows) {
-        return rows.map((r) => ({
-            time: r.time ?? r.时间 ?? '',
-            task: r.task ?? r.事项 ?? '',
-            chapter: r.chapter ?? r.关联章节 ?? '',
-        }));
-    }
-    function normalizeForeshadowRows(rows) {
-        return rows.map((r) => ({
-            tag: r.tag ?? r.标签 ?? '',
-            content: r.content ?? r.内容 ?? '',
-            chapter: r.chapter ?? r.埋设章节 ?? '',
-            status: r.status ?? r.状态 ?? '未回收',
-        }));
+
+    // 在弹窗标题栏显示"生成中"状态，并禁用生成按钮
+    function refreshGeneratingIndicator() {
+        if (!$modal) return;
+        const $ind = $modal.find('#ow_generating_indicator');
+        if (bgTask.running) {
+            $ind.html(`<i class="fa-solid fa-spinner ow-spin"></i> ${escapeHtml(bgTask.label)}`).show();
+        } else {
+            $ind.hide().empty();
+        }
+        $modal.find('.ow-gen-btn').prop('disabled', bgTask.running);
     }
 
     async function runGenerationPipeline(onProgress) {
@@ -794,10 +850,10 @@
             try {
                 await generateOffscreen({ onProgress });
             } catch (e) {
-                toast(`「镜头之外」生成失败：${e.message || e}，详情请看日志标签页`, 'error');
+                log('warn', 'system', `「镜头之外」生成失败：${e.message || e}`);
             }
         } else {
-            log('info', 'system', '"镜头之外"当前未启用（设置页 / 镜头之外标签页里的开关），本次批量生成跳过了它。若你希望它随组件一起生成，请先勾选"启用镜头之外"。');
+            log('info', 'system', '"镜头之外"未启用，本次跳过。');
         }
         log('info', 'system', '=== 批量生成流程结束 ===');
     }
@@ -934,23 +990,11 @@
 
     function renderOffscreenAsPlainText(off) {
         const parts = [];
-        if (off.scheduleTable?.length) {
-            parts.push('日程表：\n' + off.scheduleTable.map((r) => `- ${r.role}｜${r.routine || '—'}｜${r.seasonal || '—'}｜${r.pool || '—'}`).join('\n'));
-        }
-        if (off.characterTable?.length) {
-            parts.push('角色表：\n' + off.characterTable.map((r) => `- ${r.name}（${r.alias || '—'}）｜关系:${r.relation || '—'}｜${r.location || '—'}｜态度:${r.attitude || '—'}`).join('\n'));
-        }
-        if (off.sceneTable?.length) {
-            parts.push('场景表：\n' + off.sceneTable.map((r) => `- ${r.tag} ${r.name}｜${r.location || '—'}｜${r.structure || '—'}｜${r.usage || '—'}`).join('\n'));
-        }
-        if (off.itemAnchorTable?.length) {
-            parts.push('物品轨迹表：\n' + off.itemAnchorTable.map((r) => `- ${r.tag} ${r.name}｜${r.chapters || '—'}｜${r.location || '—'}｜${r.status || '—'}`).join('\n'));
-        }
-        if (off.timelineTable?.length) {
-            parts.push('核心待办事项表：\n' + off.timelineTable.map((r) => `- ${r.time}｜${r.task}｜${r.chapter || '—'}`).join('\n'));
-        }
-        if (off.foreshadowTable?.length) {
-            parts.push('伏笔表：\n' + off.foreshadowTable.map((r) => `- ${r.tag} ${r.content}｜${r.chapter || '—'}｜${r.status || '未回收'}`).join('\n'));
+        for (const t of getOffscreenTables({ onlyEnabled: true })) {
+            const rows = off.tables?.[t.key] || [];
+            if (!rows.length) continue;
+            const body = rows.map((r) => '- ' + t.columns.map((c) => `${c.label}:${r[c.field] || '—'}`).join('｜')).join('\n');
+            parts.push(`${t.title}：\n${body}`);
         }
         return parts.join('\n\n');
     }
@@ -1006,7 +1050,9 @@
         <div class="ow-modal-overlay" id="ow_modal_overlay">
           <div class="ow-modal">
             <div class="ow-modal-header">
-              <div class="ow-modal-title">🎬 镜头之外 · 组件生成器</div>
+              <div class="ow-modal-title">🎬 镜头之外 · 组件生成器
+                <span id="ow_generating_indicator" class="ow-generating" style="display:none;"></span>
+              </div>
               <div class="ow-close-btn" id="ow_close_btn"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-tabs">
@@ -1045,6 +1091,7 @@
         renderSettingsPanel($modal.find('.ow-panel[data-panel="settings"]'));
         $logPanel = $modal.find('.ow-panel[data-panel="log"]');
         renderLogEntries($logPanel);
+        refreshGeneratingIndicator();
         log('info', 'ui', '主界面已打开');
 
         // 每次打开都重新检查一次更新（有缓存也无妨，请求很轻量），完成后刷新横幅/设置页状态/菜单角标
@@ -1074,7 +1121,7 @@
         <div class="ow-row">
           <button class="ow-btn" id="ow_log_copy"><i class="fa-regular fa-copy"></i> 复制全部日志</button>
           <button class="ow-btn ow-danger" id="ow_log_clear"><i class="fa-solid fa-broom"></i> 清空日志</button>
-          <span class="ow-muted">日志仅保存在本次页面会话的内存中，刷新页面会清空；出问题时请复制后发给开发者对照排查。</span>
+          <span class="ow-muted">仅存于本次会话内存，刷新即清空。</span>
         </div>
         <div id="ow_log_entries"></div>`);
         $panel.find('#ow_log_copy').on('click', async () => {
@@ -1126,57 +1173,26 @@
     // ---------------- 组件生成面板：模块一「组件显示」+ 模块二「组件列表」 ----------------
     function renderWidgetsPanel($panel) {
         const s = settings();
-
         $panel.html(`
-        <div class="ow-row">
-          <button class="ow-btn ow-primary" id="ow_generate_now"><i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件</button>
-          <span class="ow-muted">当前触发模式：${s.triggerMode === 'auto' ? '自动（检测到新正文自动生成）' : '手动'}，可在“设置”中修改；生成过程详情见“日志”标签页</span>
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <button class="ow-btn ow-primary ow-gen-btn" id="ow_generate_now"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成全部组件</button>
+            <span class="ow-muted">${s.triggerMode === 'auto' ? '自动模式' : '手动模式'}</span>
+          </div>
+          <button class="ow-btn" id="ow_widget_list_btn"><i class="fa-solid fa-list"></i> 组件列表</button>
         </div>
-
-        <div class="ow-section-title">① 组件显示（API 返回的渲染结果）</div>
-        <div id="ow_widget_results"></div>
-
-        <div class="ow-section-title" style="margin-top:20px;">② 组件列表（新建 / 编辑 / 勾选预设条目）</div>
-        <div class="ow-row">
-          <button class="ow-btn ow-primary" id="ow_add_widget"><i class="fa-solid fa-plus"></i> 新建组件</button>
-        </div>
-        <div id="ow_widget_list"></div>`);
+        <div id="ow_widget_results"></div>`);
 
         renderWidgetResults($panel);
-        renderWidgetList($panel);
 
-        $panel.find('#ow_add_widget').on('click', () => {
-            s.widgets.push({ id: uid(), name: '新组件', prompt: '', enabled: true, presetEntries: [] });
-            saveSettings();
-            log('info', 'ui', '新建了一个组件');
-            renderWidgetList($panel);
+        $panel.find('#ow_generate_now').on('click', () => {
+            startBackgroundTask('组件与镜头之外', () => runGenerationPipeline());
         });
-
-        $panel.find('#ow_generate_now').on('click', async () => {
-            const $btn = $panel.find('#ow_generate_now');
-            $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner ow-spin"></i> 生成中…');
-            try {
-                await runGenerationPipeline((w, phase) => {
-                    const name = (w && w.name) ? w.name : (w === 'offscreen' ? '镜头之外' : String(w));
-                    if (phase === 'start') toast(`正在生成：${name}`, 'info');
-                    if (phase === 'error') toast(`「${name}」生成出错，详见日志标签页`, 'error');
-                });
-                toast('全部生成任务已结束（若有失败项请查看日志标签页）', 'success');
-            } catch (err) {
-                log('error', 'system', '批量生成流程抛出未捕获异常', err);
-                toast('生成过程中出现错误，详见日志标签页', 'error');
-            } finally {
-                $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成全部已开启组件');
-                renderWidgetResults($panel);
-                if ($modal) {
-                    log('debug', 'ui', '批量生成结束，刷新"镜头之外"标签页显示（即使当前未切换到该标签页也一并更新，避免数据已写入但界面未重绘）');
-                    renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
-                }
-            }
-        });
+        $panel.find('#ow_widget_list_btn').on('click', () => openWidgetListDialog($panel));
+        refreshGeneratingIndicator();
     }
 
-    // ---- 模块一：组件显示（只读结果，带前端渲染预览）----
+    // ---- 组件显示（占满整个面板）----
     function renderWidgetResults($panel) {
         const s = settings();
         const cd = chatData();
@@ -1185,28 +1201,27 @@
 
         const withResults = s.widgets.filter((w) => cd.widgetResults[w.id]);
         if (!withResults.length) {
-            $results.append('<div class="ow-empty">还没有任何生成结果。点「立即生成全部已开启组件」，或到下方组件列表里单独生成某一个。</div>');
+            $results.append('<div class="ow-empty">还没有生成结果。点「生成全部组件」，或在右上角「组件列表」里新建/单独生成。</div>');
             return;
         }
         for (const w of withResults) {
             const result = cd.widgetResults[w.id];
             $results.append(`
-              <div class="ow-result-frame-wrap" data-id="${w.id}" style="margin-bottom:12px;position:relative;">
+              <div class="ow-result-frame-wrap" data-id="${w.id}">
                 <div class="ow-result-head">
-                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 生成失败' : `✅ ${new Date(result.updatedAt).toLocaleString()}`}</span>
+                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}</span>
                   <span>
-                    <button class="ow-btn" data-action="view-raw" data-id="${w.id}">查看源码</button>
-                    <button class="ow-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
+                    <button class="ow-btn" data-action="fullscreen" data-id="${w.id}" title="全屏"><i class="fa-solid fa-expand"></i></button>
+                    <button class="ow-btn" data-action="view-raw" data-id="${w.id}">源码</button>
+                    <button class="ow-btn ow-gen-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
                   </span>
                 </div>
                 <iframe class="ow-result-frame" sandbox="allow-scripts" allowfullscreen srcdoc="${escapeHtml(result.html)}"></iframe>
-                <button class="ow-btn ow-fullscreen-corner-btn" data-action="fullscreen" data-id="${w.id}" title="全屏沉浸式查看"><i class="fa-solid fa-expand"></i></button>
               </div>`);
         }
 
         $results.off('click', '[data-action="view-raw"]').on('click', '[data-action="view-raw"]', function () {
-            const id = $(this).data('id');
-            const res = chatData().widgetResults[id];
+            const res = chatData().widgetResults[$(this).data('id')];
             if (!res) return;
             const w = window.open('', '_blank');
             if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(res.html)}</pre>`);
@@ -1214,138 +1229,131 @@
 
         $results.off('click', '[data-action="fullscreen"]').on('click', '[data-action="fullscreen"]', function () {
             const id = $(this).data('id');
-            const iframeEl = $results.find(`.ow-result-frame-wrap[data-id="${id}"] iframe`)[0];
-            if (!iframeEl) return;
-            const req = iframeEl.requestFullscreen || iframeEl.webkitRequestFullscreen || iframeEl.mozRequestFullScreen || iframeEl.msRequestFullscreen;
-            if (req) {
-                req.call(iframeEl).catch((err) => {
-                    log('warn', 'ui', `进入全屏失败：${err.message || err}`);
-                    toast('无法进入全屏，浏览器可能不支持或已阻止', 'warning');
-                });
-            } else {
-                toast('当前浏览器不支持全屏 API', 'warning');
-            }
+            const el = $results.find(`.ow-result-frame-wrap[data-id="${id}"] iframe`)[0];
+            if (!el) return;
+            const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+            if (req) req.call(el).catch((err) => toast(`无法进入全屏：${err.message || err}`, 'warning'));
+            else toast('当前浏览器不支持全屏 API', 'warning');
         });
 
-        $results.off('click', '[data-action="regen-one"]').on('click', '[data-action="regen-one"]', async function () {
+        $results.off('click', '[data-action="regen-one"]').on('click', '[data-action="regen-one"]', function () {
             const id = $(this).data('id');
-            const w = s.widgets.find((x) => x.id === id);
+            const w = settings().widgets.find((x) => x.id === id);
             if (!w) return;
-            const $btn = $(this);
-            $btn.prop('disabled', true);
-            try {
+            startBackgroundTask(`组件：${w.name}`, async () => {
                 await generateWidget(w);
-                toast(`「${w.name}」已重新生成`, 'success');
-            } catch (err) {
-                toast(`「${w.name}」生成失败：${err.message || err}`, 'error');
-            } finally {
                 updateInjections();
-                renderWidgetResults($panel);
-            }
+            });
         });
+        refreshGeneratingIndicator();
     }
 
-    // ---- 模块二：组件列表（管理，不包含结果预览）----
-    function renderWidgetList($panel) {
+    // ---------------- 组件列表子弹窗 ----------------
+    function openWidgetListDialog($widgetsPanel) {
         const s = settings();
-        const $list = $panel.find('#ow_widget_list');
-        $list.empty();
-        if (!s.widgets.length) {
-            $list.append('<div class="ow-empty">还没有组件，点上方「新建组件」添加一个吧。</div>');
-        }
-        for (const w of s.widgets) {
-            $list.append(renderWidgetCard(w));
-        }
-        bindWidgetCardEvents($panel);
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">组件列表</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-row"><button class="ow-btn ow-primary" id="ow_add_widget"><i class="fa-solid fa-plus"></i> 新建组件</button></div>
+              <div id="ow_widget_list"></div>
+            </div>
+          </div>
+        </div>`).appendTo(document.body);
+
+        const close = () => { $ov.remove(); renderWidgetsPanel($widgetsPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        const renderList = () => {
+            const $list = $ov.find('#ow_widget_list');
+            $list.empty();
+            if (!s.widgets.length) {
+                $list.append('<div class="ow-empty">还没有组件，点上方「新建组件」添加。</div>');
+                return;
+            }
+            for (const w of s.widgets) $list.append(renderWidgetCard(w));
+            $ov.find('.ow-preset-select').each(function () {
+                const $sel = $(this);
+                for (const n of getPresetNames()) $sel.append(`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`);
+            });
+        };
+        renderList();
+
+        $ov.find('#ow_add_widget').on('click', () => {
+            s.widgets.push({ id: uid(), name: '新组件', prompt: '', enabled: true, presetEntries: [] });
+            saveSettings();
+            renderList();
+        });
+
+        bindWidgetCardEvents($ov, renderList);
     }
 
     function renderWidgetCard(widget) {
         const chips = (widget.presetEntries || [])
             .map((e, idx) => `<span class="ow-chip" data-widget="${widget.id}" data-idx="${idx}">${escapeHtml(e.name)}<span class="ow-chip-x" title="移除">✕</span></span>`)
             .join('');
-
         return $(`
         <div class="ow-widget-card" data-id="${widget.id}">
           <div class="ow-widget-card-head">
-            <input type="checkbox" class="ow-enabled-toggle" ${widget.enabled ? 'checked' : ''} title="是否随批量生成一起发送">
+            <input type="checkbox" class="ow-enabled-toggle" ${widget.enabled ? 'checked' : ''} title="是否随批量生成">
             <input type="text" class="ow-input ow-name-input" value="${escapeHtml(widget.name)}" placeholder="组件名称">
-            <button class="ow-btn" data-action="gen-one" title="仅生成此组件（结果显示在上方模块①）"><i class="fa-solid fa-play"></i></button>
-            <button class="ow-btn ow-danger" data-action="delete" title="删除组件"><i class="fa-solid fa-trash"></i></button>
+            <button class="ow-btn ow-gen-btn" data-action="gen-one" title="单独生成"><i class="fa-solid fa-play"></i></button>
+            <button class="ow-btn ow-danger" data-action="delete" title="删除"><i class="fa-solid fa-trash"></i></button>
           </div>
-          <textarea class="ow-textarea ow-prompt-input" placeholder="描述这个组件要生成什么，例如：生成一个虚构论坛帖子，主题是……">${escapeHtml(widget.prompt)}</textarea>
+          <textarea class="ow-textarea ow-prompt-input" placeholder="描述这个组件要生成什么…">${escapeHtml(widget.prompt)}</textarea>
           <div class="ow-row">
-            <select class="ow-select ow-preset-select" style="min-width:160px;"><option value="">选择预设…</option></select>
-            <button class="ow-btn" data-action="load-preset">读取该预设条目</button>
+            <select class="ow-select ow-preset-select" style="min-width:150px;"><option value="">选择预设…</option></select>
+            <button class="ow-btn" data-action="load-preset">读取条目</button>
           </div>
           <div class="ow-preset-list" style="display:none;"></div>
           <div class="ow-preset-chips">${chips}</div>
         </div>`);
     }
 
-    function bindWidgetCardEvents($panel) {
+    function bindWidgetCardEvents($root, renderList) {
         const s = settings();
 
-        $panel.off('input', '.ow-name-input').on('input', '.ow-name-input', function () {
-            const id = $(this).closest('.ow-widget-card').data('id');
-            const w = s.widgets.find((x) => x.id === id);
+        $root.on('input', '.ow-name-input', function () {
+            const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
             if (w) { w.name = $(this).val(); saveSettings(); }
         });
-
-        $panel.off('input', '.ow-prompt-input').on('input', '.ow-prompt-input', function () {
-            const id = $(this).closest('.ow-widget-card').data('id');
-            const w = s.widgets.find((x) => x.id === id);
+        $root.on('input', '.ow-prompt-input', function () {
+            const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
             if (w) { w.prompt = $(this).val(); saveSettings(); }
         });
-
-        $panel.off('change', '.ow-enabled-toggle').on('change', '.ow-enabled-toggle', function () {
-            const id = $(this).closest('.ow-widget-card').data('id');
-            const w = s.widgets.find((x) => x.id === id);
+        $root.on('change', '.ow-enabled-toggle', function () {
+            const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
             if (w) { w.enabled = $(this).is(':checked'); saveSettings(); }
         });
-
-        $panel.off('click', '[data-action="delete"]').on('click', '[data-action="delete"]', function () {
+        $root.on('click', '[data-action="delete"]', function () {
             const id = $(this).closest('.ow-widget-card').data('id');
             if (!confirm('确定删除该组件吗？')) return;
             s.widgets = s.widgets.filter((x) => x.id !== id);
             delete chatData().widgetResults[id];
             saveSettings(); saveChatData();
-            renderWidgetList($panel);
-            renderWidgetResults($panel);
+            renderList();
         });
-
-        $panel.off('click', '[data-action="gen-one"]').on('click', '[data-action="gen-one"]', async function () {
-            const id = $(this).closest('.ow-widget-card').data('id');
-            const w = s.widgets.find((x) => x.id === id);
+        $root.on('click', '[data-action="gen-one"]', function () {
+            const w = s.widgets.find((x) => x.id === $(this).closest('.ow-widget-card').data('id'));
             if (!w) return;
-            const $btn = $(this);
-            $btn.prop('disabled', true);
-            try {
+            startBackgroundTask(`组件：${w.name}`, async () => {
                 await generateWidget(w);
-                toast(`「${w.name}」生成完成，结果见上方模块①`, 'success');
-            } catch (err) {
-                toast(`「${w.name}」生成失败：${err.message || err}，详见日志标签页`, 'error');
-            } finally {
-                $btn.prop('disabled', false);
                 updateInjections();
-                renderWidgetResults($panel);
-            }
+            });
         });
-
-        // 预设下拉：填充选项
-        $panel.find('.ow-preset-select').each(function () {
-            const names = getPresetNames();
-            const $sel = $(this);
-            for (const n of names) $sel.append(`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`);
-        });
-
-        $panel.off('click', '[data-action="load-preset"]').on('click', '[data-action="load-preset"]', function () {
+        $root.on('click', '[data-action="load-preset"]', function () {
             const $card = $(this).closest('.ow-widget-card');
             const presetName = $card.find('.ow-preset-select').val();
             if (!presetName) { toast('请先选择一个预设', 'warning'); return; }
             const entries = getPresetEntries(presetName);
             const $list = $card.find('.ow-preset-list');
             if (!entries.length) {
-                $list.html('<div class="ow-muted">该预设下没有可用的文本条目（或当前主 API 不是 Chat Completion 类型）。</div>').show();
+                $list.html('<div class="ow-muted">该预设下没有可用条目（或当前主 API 不是 Chat Completion 类型）。</div>').show();
                 return;
             }
             $list.html(entries.map((e, idx) => `
@@ -1353,15 +1361,12 @@
                   <input type="checkbox" data-idx="${idx}">
                   <label title="${escapeHtml(e.content).slice(0, 300)}">${escapeHtml(e.name)}</label>
                 </div>`).join('') +
-                `<div class="ow-row" style="margin-top:6px;"><button class="ow-btn ow-primary" data-action="confirm-add-preset">添加勾选的条目到组件</button></div>`).show();
-            $list.data('preset-name', presetName);
+                `<div class="ow-row" style="margin-top:6px;"><button class="ow-btn ow-primary" data-action="confirm-add-preset">添加勾选条目</button></div>`).show();
             $list.data('entries', entries);
         });
-
-        $panel.off('click', '[data-action="confirm-add-preset"]').on('click', '[data-action="confirm-add-preset"]', function () {
+        $root.on('click', '[data-action="confirm-add-preset"]', function () {
             const $card = $(this).closest('.ow-widget-card');
-            const id = $card.data('id');
-            const w = s.widgets.find((x) => x.id === id);
+            const w = s.widgets.find((x) => x.id === $card.data('id'));
             const $list = $card.find('.ow-preset-list');
             const entries = $list.data('entries') || [];
             const checked = $list.find('input[type="checkbox"]:checked').map(function () { return Number($(this).data('idx')); }).get();
@@ -1369,124 +1374,81 @@
             w.presetEntries = w.presetEntries || [];
             for (const idx of checked) {
                 const e = entries[idx];
-                if (e && !w.presetEntries.some((x) => x.identifier === e.identifier)) {
-                    w.presetEntries.push(e);
-                }
+                if (e && !w.presetEntries.some((x) => x.identifier === e.identifier)) w.presetEntries.push(e);
             }
             saveSettings();
-            renderWidgetList($panel);
+            renderList();
         });
-
-        $panel.off('click', '.ow-chip-x').on('click', '.ow-chip-x', function (e) {
+        $root.on('click', '.ow-chip-x', function (e) {
             e.stopPropagation();
             const $chip = $(this).closest('.ow-chip');
-            const id = $chip.data('widget');
-            const idx = $chip.data('idx');
-            const w = s.widgets.find((x) => x.id === id);
-            if (w) { w.presetEntries.splice(idx, 1); saveSettings(); renderWidgetList($panel); }
+            const w = s.widgets.find((x) => x.id === $chip.data('widget'));
+            if (w) { w.presetEntries.splice($chip.data('idx'), 1); saveSettings(); renderList(); }
         });
     }
 
     // ---------------- 镜头之外面板 ----------------
-    // 四张表的定义（列 key、列显示名、数据数组的存储字段名），用统一逻辑渲染/编辑/增删行，
-    // 避免四张表各写一份重复代码。
-    const OFFSCREEN_TABLES = [
-        {
-            key: 'scheduleTable',
-            title: '日程表',
-            rowFactory: () => ({ role: '', routine: '', seasonal: '', pool: '' }),
-            columns: [
-                { field: 'role', label: '角色' },
-                { field: 'routine', label: '固定日程规律' },
-                { field: 'seasonal', label: '时节性必然事件' },
-                { field: 'pool', label: '弹性事务参考池' },
-            ],
-        },
-        {
-            key: 'characterTable',
-            title: '角色表',
-            rowFactory: () => ({ name: '', alias: '', relation: '', location: '', attitude: '' }),
-            columns: [
-                { field: 'name', label: '姓名' },
-                { field: 'alias', label: '昵称' },
-                { field: 'relation', label: '与用户的关系' },
-                { field: 'location', label: '当前位置与正在做的事' },
-                { field: 'attitude', label: '对用户的态度' },
-            ],
-        },
-        {
-            key: 'sceneTable',
-            title: '场景表',
-            rowFactory: () => ({ tag: '', name: '', location: '', structure: '', usage: '' }),
-            columns: [
-                { field: 'tag', label: '标签' },
-                { field: 'name', label: '场景名称' },
-                { field: 'location', label: '地理位置/距离参照' },
-                { field: 'structure', label: '建筑/环境构造细节' },
-                { field: 'usage', label: '用途' },
-            ],
-        },
-        {
-            key: 'itemAnchorTable',
-            title: '物品轨迹表',
-            rowFactory: () => ({ tag: '', name: '', chapters: '', location: '', status: '' }),
-            columns: [
-                { field: 'tag', label: '标签' },
-                { field: 'name', label: '物品名称' },
-                { field: 'chapters', label: '关联章节' },
-                { field: 'location', label: '当前位置' },
-                { field: 'status', label: '状态' },
-            ],
-        },
-        {
-            key: 'timelineTable',
-            title: '核心待办事项表',
-            rowFactory: () => ({ time: '', task: '', chapter: '' }),
-            columns: [
-                { field: 'time', label: '时间' },
-                { field: 'task', label: '事项' },
-                { field: 'chapter', label: '关联章节' },
-            ],
-        },
-        {
-            key: 'foreshadowTable',
-            title: '伏笔表',
-            rowFactory: () => ({ tag: '', content: '', chapter: '', status: '未回收' }),
-            columns: [
-                { field: 'tag', label: '标签' },
-                { field: 'content', label: '内容' },
-                { field: 'chapter', label: '埋设章节' },
-                { field: 'status', label: '状态' },
-            ],
-        },
-    ];
+
+    function getOffscreenTables({ onlyEnabled = false } = {}) {
+        const list = settings().offscreenTables || [];
+        return onlyEnabled ? list.filter((t) => t.enabled !== false) : list;
+    }
+
+    function getTableDef(key) {
+        return getOffscreenTables().find((t) => t.key === key);
+    }
+
+    function rowFactoryFor(tableDef) {
+        const row = {};
+        for (const c of tableDef.columns) row[c.field] = '';
+        return row;
+    }
+
+    // 通用行归一化：优先取英文 field，其次取中文列名作为别名，兼容模型返回中文键名
+    function normalizeRowsGeneric(rows, columns) {
+        return rows.map((r) => {
+            const out = {};
+            for (const c of columns) out[c.field] = r?.[c.field] ?? r?.[c.label] ?? '';
+            return out;
+        });
+    }
 
     function renderOffscreenPanel($panel) {
         const s = settings();
         const off = chatData().offscreen;
+        const tables = getOffscreenTables({ onlyEnabled: true });
 
         let html = `
-        <div class="ow-row">
-          <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用"镜头之外"</label>
-          <button class="ow-btn ow-primary" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成/更新</button>
-          <span class="ow-muted">${off.updatedAt ? `上次更新：${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用镜头之外</label>
+            <button class="ow-btn ow-primary ow-gen-btn" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成/更新</button>
+            <span class="ow-muted">${off.updatedAt ? `上次更新 ${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
+          </div>
+          <button class="ow-btn" id="ow_table_manager_btn"><i class="fa-solid fa-table-list"></i> 表格管理</button>
         </div>
-        <div class="ow-hint">随组件一起发送四张表的生成提示词，但结果单独展示在这里，不会出现在"组件生成"界面。可在下方直接点击单元格编辑。</div>`;
-
-        for (const t of OFFSCREEN_TABLES) {
-            html += `
-        <div class="ow-section-title">${t.title}</div>
-        <table class="ow-table" data-table-key="${t.key}">
-          <thead><tr>${t.columns.map((c) => `<th>${c.label}</th>`).join('')}<th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <div class="ow-row"><button class="ow-btn" data-action="add-row" data-table-key="${t.key}">+ 添加一行</button></div>`;
-        }
+        <div id="ow_offscreen_tables"></div>`;
         $panel.html(html);
 
-        for (const t of OFFSCREEN_TABLES) {
-            const $tbody = $panel.find(`table[data-table-key="${t.key}"] tbody`);
-            for (const row of off[t.key] || []) $tbody.append(offscreenRowHtml(t, row));
+        const $wrap = $panel.find('#ow_offscreen_tables');
+        if (!tables.length) {
+            $wrap.html('<div class="ow-empty">没有启用任何表格。点右上角「表格管理」开启或新建表格。</div>');
+        } else {
+            let tHtml = '';
+            for (const t of tables) {
+                tHtml += `
+                <div class="ow-section-title">${escapeHtml(t.title)}</div>
+                <table class="ow-table" data-table-key="${escapeHtml(t.key)}">
+                  <thead><tr>${t.columns.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}<th></th></tr></thead>
+                  <tbody></tbody>
+                </table>
+                <div class="ow-row"><button class="ow-btn" data-action="add-row" data-table-key="${escapeHtml(t.key)}">+ 添加一行</button></div>`;
+            }
+            $wrap.html(tHtml);
+            for (const t of tables) {
+                const $tbody = $wrap.find(`table[data-table-key="${t.key}"] tbody`);
+                for (const row of off.tables?.[t.key] || []) $tbody.append(offscreenRowHtml(t, row));
+            }
         }
 
         $panel.find('#ow_off_enabled').on('change', function () {
@@ -1494,52 +1456,163 @@
             saveSettings();
         });
 
-        $panel.find('#ow_off_generate').on('click', async function () {
-            const $btn = $(this);
-            $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner ow-spin"></i> 生成中…');
-            try {
-                await generateOffscreen();
-                toast('镜头之外内容已更新', 'success');
-            } catch (err) {
-                toast(`生成失败：${err.message || err}，详见日志标签页`, 'error');
-            } finally {
-                $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> 立即生成/更新');
-                renderOffscreenPanel($panel);
-            }
+        $panel.find('#ow_off_generate').on('click', function () {
+            startBackgroundTask('镜头之外', () => generateOffscreen());
         });
 
-        $panel.find('[data-action="add-row"]').on('click', function () {
+        $panel.find('#ow_table_manager_btn').on('click', () => openTableManager($panel));
+
+        $wrap.find('[data-action="add-row"]').on('click', function () {
             const key = $(this).data('table-key');
-            const t = OFFSCREEN_TABLES.find((x) => x.key === key);
-            off[key] = off[key] || [];
-            off[key].push(t.rowFactory());
+            const t = getTableDef(key);
+            if (!t) return;
+            off.tables = off.tables || {};
+            off.tables[key] = off.tables[key] || [];
+            off.tables[key].push(rowFactoryFor(t));
             saveChatData();
             renderOffscreenPanel($panel);
         });
 
-        bindOffscreenTableEvents($panel, off);
+        bindOffscreenTableEvents($wrap, off, tables);
+        refreshGeneratingIndicator();
     }
 
     function offscreenRowHtml(tableDef, row) {
-        const cells = tableDef.columns.map((c) => `<td contenteditable="true" data-field="${c.field}">${escapeHtml(row[c.field])}</td>`).join('');
+        const cells = tableDef.columns
+            .map((c) => `<td contenteditable="true" data-field="${escapeHtml(c.field)}">${escapeHtml(row[c.field])}</td>`)
+            .join('');
         return `<tr>${cells}<td><button class="ow-btn ow-danger" data-action="del-row">✕</button></td></tr>`;
     }
 
-    function bindOffscreenTableEvents($panel, off) {
-        for (const t of OFFSCREEN_TABLES) {
-            const $table = $panel.find(`table[data-table-key="${t.key}"]`);
+    function bindOffscreenTableEvents($wrap, off, tables) {
+        for (const t of tables) {
+            const $table = $wrap.find(`table[data-table-key="${t.key}"]`);
             $table.on('blur', 'td[contenteditable]', function () {
                 const idx = $(this).closest('tr').index();
                 const field = $(this).data('field');
-                if (off[t.key]?.[idx]) { off[t.key][idx][field] = $(this).text(); saveChatData(); }
+                if (off.tables?.[t.key]?.[idx]) { off.tables[t.key][idx][field] = $(this).text(); saveChatData(); }
             });
             $table.on('click', '[data-action="del-row"]', function () {
                 const idx = $(this).closest('tr').index();
-                off[t.key].splice(idx, 1);
+                off.tables?.[t.key]?.splice(idx, 1);
                 saveChatData();
                 $(this).closest('tr').remove();
             });
         }
+    }
+
+    // ---------------- 表格管理子弹窗 ----------------
+    function openTableManager($offscreenPanel) {
+        const s = settings();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">表格管理</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">开关控制该表是否生成与显示，提示词随之增减。列格式：<code>英文字段名:中文列名</code>，每行一个。</div>
+              <div id="ow_table_mgr_list"></div>
+              <div class="ow-row" style="margin-top:12px;">
+                <button class="ow-btn ow-primary" id="ow_table_add">+ 新建表格</button>
+                <button class="ow-btn" id="ow_table_reset">恢复默认表格</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.body);
+
+        const close = () => { $ov.remove(); renderOffscreenPanel($offscreenPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        function renderList() {
+            const $list = $ov.find('#ow_table_mgr_list');
+            const tables = getOffscreenTables();
+            if (!tables.length) { $list.html('<div class="ow-empty">还没有表格</div>'); return; }
+            $list.html(tables.map((t, i) => `
+              <div class="ow-widget-card" data-key="${escapeHtml(t.key)}">
+                <div class="ow-widget-card-head">
+                  <input type="checkbox" class="ow-tbl-enabled" ${t.enabled !== false ? 'checked' : ''} title="是否启用">
+                  <input type="text" class="ow-input ow-tbl-title" value="${escapeHtml(t.title)}" placeholder="表名">
+                  <button class="ow-btn" data-action="tbl-up" title="上移" ${i === 0 ? 'disabled' : ''}>↑</button>
+                  <button class="ow-btn" data-action="tbl-down" title="下移" ${i === tables.length - 1 ? 'disabled' : ''}>↓</button>
+                  <button class="ow-btn ow-danger" data-action="tbl-del" title="删除">✕</button>
+                </div>
+                <div class="ow-muted" style="margin:4px 0 2px;">列（英文字段名:中文列名，每行一个）</div>
+                <textarea class="ow-textarea ow-tbl-cols" style="min-height:70px;">${escapeHtml(t.columns.map((c) => `${c.field}:${c.label}`).join('\n'))}</textarea>
+                <div class="ow-muted" style="margin:6px 0 2px;">该表的规则说明（会原样写进提示词）</div>
+                <textarea class="ow-textarea ow-tbl-spec" style="min-height:90px;">${escapeHtml(t.spec || '')}</textarea>
+              </div>`).join(''));
+        }
+        renderList();
+
+        $ov.on('change', '.ow-tbl-enabled', function () {
+            const key = $(this).closest('.ow-widget-card').data('key');
+            const t = getTableDef(key); if (t) { t.enabled = $(this).is(':checked'); saveSettings(); }
+        });
+        $ov.on('input', '.ow-tbl-title', function () {
+            const key = $(this).closest('.ow-widget-card').data('key');
+            const t = getTableDef(key); if (t) { t.title = $(this).val(); saveSettings(); }
+        });
+        $ov.on('input', '.ow-tbl-spec', function () {
+            const key = $(this).closest('.ow-widget-card').data('key');
+            const t = getTableDef(key); if (t) { t.spec = $(this).val(); saveSettings(); }
+        });
+        $ov.on('change', '.ow-tbl-cols', function () {
+            const key = $(this).closest('.ow-widget-card').data('key');
+            const t = getTableDef(key); if (!t) return;
+            const cols = String($(this).val()).split('\n').map((line) => {
+                const [field, label] = line.split(':');
+                if (!field?.trim()) return null;
+                return { field: field.trim(), label: (label || field).trim() };
+            }).filter(Boolean);
+            if (!cols.length) { toast('至少要有一列', 'warning'); renderList(); return; }
+            t.columns = cols;
+            saveSettings();
+            log('info', 'ui', `表格「${t.title}」的列已更新为：${cols.map((c) => c.field).join(', ')}`);
+        });
+        $ov.on('click', '[data-action="tbl-del"]', function () {
+            const key = $(this).closest('.ow-widget-card').data('key');
+            const t = getTableDef(key);
+            if (!t || !confirm(`确定删除表格「${t.title}」吗？该表已生成的数据也会一并删除。`)) return;
+            s.offscreenTables = s.offscreenTables.filter((x) => x.key !== key);
+            const off = chatData().offscreen;
+            if (off.tables) delete off.tables[key];
+            saveSettings(); saveChatData();
+            renderList();
+        });
+        const move = (key, dir) => {
+            const i = s.offscreenTables.findIndex((x) => x.key === key);
+            const j = i + dir;
+            if (i < 0 || j < 0 || j >= s.offscreenTables.length) return;
+            [s.offscreenTables[i], s.offscreenTables[j]] = [s.offscreenTables[j], s.offscreenTables[i]];
+            saveSettings(); renderList();
+        };
+        $ov.on('click', '[data-action="tbl-up"]', function () { move($(this).closest('.ow-widget-card').data('key'), -1); });
+        $ov.on('click', '[data-action="tbl-down"]', function () { move($(this).closest('.ow-widget-card').data('key'), 1); });
+
+        $ov.find('#ow_table_add').on('click', function () {
+            const name = prompt('新表格的名称：', '新表格');
+            if (!name) return;
+            const key = `custom_${Date.now().toString(36)}`;
+            s.offscreenTables.push({
+                key,
+                jsonKey: key,
+                title: name,
+                enabled: true,
+                columns: [{ field: 'col1', label: '列1' }, { field: 'col2', label: '列2' }],
+                spec: `列结构：列1 | 列2\n（在此填写该表的收录标准、更新与删除规则）`,
+            });
+            saveSettings();
+            renderList();
+        });
+        $ov.find('#ow_table_reset').on('click', function () {
+            if (!confirm('确定恢复为默认的六张表吗？自定义表格定义会丢失（已生成的数据保留）。')) return;
+            s.offscreenTables = defaultOffscreenTables();
+            saveSettings();
+            renderList();
+        });
     }
 
     // ---------------- 设置面板 ----------------
@@ -1590,12 +1663,7 @@
           <button class="ow-btn ow-primary" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 拉取/刷新条目列表</button>
           <button class="ow-btn" id="ow_wi_reset">全部恢复默认（跟随酒馆启用状态）</button>
         </div>
-        <div class="ow-hint">
-          当前识别到的世界书/聊天书：<span id="ow_wi_book_names">（点击上方按钮拉取）</span><br>
-          默认发送"当前处于启用状态"的条目（即该条目在酒馆世界书编辑器里没有被禁用）。你可以在下面为每个条目
-          单独覆盖是否要在生成组件/镜头之外时随行发送——覆盖只影响本扩展的发送行为，不会改变酒馆世界书本身的启用状态。
-          识别范围包括：酒馆世界书面板里当前勾选激活的全局世界书、当前角色绑定的主世界书、当前聊天绑定的聊天书。
-        </div>
+        <div class="ow-hint">来源：<span id="ow_wi_book_names">—</span><br>默认跟随条目在酒馆中的启用状态；此处改动只影响本扩展，不改酒馆世界书。需在「设置 → 上下文」勾选后生效。</div>
         <div id="ow_wi_entry_list"></div>`);
 
         $panel.find('#ow_wi_refresh').on('click', () => loadAndRenderWorldInfoEntries($panel));
@@ -1653,15 +1721,20 @@
     function renderPromptsPanel($panel) {
         const s = settings();
         $panel.html(`
-        <div class="ow-hint">这里是实际发送给模型的系统提示词原文，直接编辑即可自动保存生效，不需要修改扩展代码就能微调措辞。</div>
+        <div class="ow-hint">编辑即保存。</div>
 
         <div class="ow-section-title">组件生成提示词</div>
         <div class="ow-row"><button class="ow-btn" id="ow_prompt_widget_reset">恢复默认</button></div>
         <textarea class="ow-textarea" id="ow_prompt_widget" style="min-height:220px;">${escapeHtml(s.prompts.widgetSystemPrompt)}</textarea>
 
-        <div class="ow-section-title">镜头之外 / 表格生成提示词</div>
+        <div class="ow-section-title">镜头之外 · 总则</div>
+        <div class="ow-hint">各表自己的规则写在「镜头之外 → 表格管理」里，这里只放总则；实际发送时会自动拼上启用表格的规则与 JSON 格式说明。</div>
         <div class="ow-row"><button class="ow-btn" id="ow_prompt_offscreen_reset">恢复默认</button></div>
-        <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:360px;">${escapeHtml(s.prompts.offscreenSystemPrompt)}</textarea>`);
+        <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:240px;">${escapeHtml(s.prompts.offscreenPreamble)}</textarea>
+
+        <div class="ow-section-title">实际发送的完整提示词（预览）</div>
+        <div class="ow-row"><button class="ow-btn" id="ow_prompt_preview_btn">生成预览</button></div>
+        <pre id="ow_prompt_preview" class="ow-preview-box" style="display:none;"></pre>`);
 
         $panel.find('#ow_prompt_widget').on('input', function () {
             s.prompts.widgetSystemPrompt = $(this).val();
@@ -1675,12 +1748,16 @@
         });
 
         $panel.find('#ow_prompt_offscreen').on('input', function () {
-            s.prompts.offscreenSystemPrompt = $(this).val();
+            s.prompts.offscreenPreamble = $(this).val();
             saveSettings();
         });
+        $panel.find('#ow_prompt_preview_btn').on('click', function () {
+            const $box = $panel.find('#ow_prompt_preview');
+            $box.text(buildOffscreenSystemPrompt()).toggle();
+        });
         $panel.find('#ow_prompt_offscreen_reset').on('click', function () {
-            if (!confirm('确定恢复"镜头之外/表格生成提示词"为默认内容吗？当前编辑内容会被覆盖。')) return;
-            s.prompts.offscreenSystemPrompt = DEFAULT_OFFSCREEN_SYSTEM_PROMPT;
+            if (!confirm('确定恢复"镜头之外总则"为默认内容吗？当前编辑内容会被覆盖。')) return;
+            s.prompts.offscreenPreamble = DEFAULT_OFFSCREEN_PREAMBLE;
             saveSettings();
             renderPromptsPanel($panel);
         });
@@ -1688,100 +1765,78 @@
 
     function renderSettingsPanel($panel) {
         const s = settings();
+        const posOptions = (sel) => `
+            <option value="IN_PROMPT" ${sel === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
+            <option value="IN_CHAT" ${sel === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
+            <option value="BEFORE_PROMPT" ${sel === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>`;
         const html = `
-        <div class="ow-section-title">触发方式</div>
+        <div class="ow-section-title">触发</div>
         <div class="ow-row">
-          <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动（点击生成按钮）</label>
+          <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动</label>
           <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
         </div>
-        <div class="ow-col" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'} padding-left:4px;">
-          <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到新回复中出现完整 &lt;content&gt;…&lt;/content&gt; 时触发（同时生成组件与镜头之外）</label>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 组件每
-              <input type="number" class="ow-input" id="ow_auto_widget_floor_n" style="width:60px;margin:0 4px;" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">
-            楼层自动生成一次</label>
-          </div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''}> 镜头之外每
-              <input type="number" class="ow-input" id="ow_auto_offscreen_floor_n" style="width:60px;margin:0 4px;" min="1" value="${s.autoTriggers.offscreenByFloor.interval}">
-            楼层自动生成一次（需先在"镜头之外"标签页里启用该功能）</label>
-          </div>
-          <div class="ow-hint">"楼层"按当前聊天的总消息条数计算，三种触发方式可以同时开启、互不冲突；标签触发命中的那一轮不会与楼层触发重复生成。</div>
+        <div class="ow-col" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'} padding-left:12px;">
+          <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
+          <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 组件每
+            <input type="number" class="ow-input" id="ow_auto_widget_floor_n" style="width:56px;margin:0 4px;" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成</label>
+          <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''}> 镜头之外每
+            <input type="number" class="ow-input" id="ow_auto_offscreen_floor_n" style="width:56px;margin:0 4px;" min="1" value="${s.autoTriggers.offscreenByFloor.interval}">楼层生成</label>
         </div>
 
-        <div class="ow-section-title">发送时携带的上下文</div>
+        <div class="ow-section-title">上下文</div>
         <div class="ow-row">
-          <label class="ow-col" style="flex-direction:row;align-items:center;">随行发送最近
-            <input type="number" class="ow-input" id="ow_history_depth" style="width:70px;margin:0 6px;" min="0" value="${s.historyDepth}">
-            条聊天记录
-          </label>
+          <label>随行发送最近
+            <input type="number" class="ow-input" id="ow_history_depth" style="width:60px;margin:0 6px;" min="0" value="${s.historyDepth}">条聊天记录</label>
         </div>
         <div class="ow-row">
-          <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书/聊天书条目（具体收发哪些书、哪些条目，去"世界书"标签页管理）</label>
-          <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 随行发送角色卡内嵌世界书全文</label>
+          <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 世界书条目（在「世界书」页选择）</label>
+          <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 角色卡内嵌世界书</label>
         </div>
 
-        <div class="ow-section-title">组件正文注入</div>
+        <div class="ow-section-title">注入正文</div>
         <div class="ow-row">
-          <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 下次生成正文时注入组件结果（默认关闭）</label>
+          <label style="min-width:80px;"><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 组件</label>
+          <select class="ow-select" id="ow_inject_pos">${posOptions(s.injectPosition)}</select>
+          深度<input type="number" class="ow-input" id="ow_inject_depth" style="width:56px;" min="0" value="${s.injectDepth}">
         </div>
         <div class="ow-row">
-          位置：
-          <select class="ow-select" id="ow_inject_pos">
-            <option value="IN_PROMPT" ${s.injectPosition === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部（角色定义之前）</option>
-            <option value="IN_CHAT" ${s.injectPosition === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度插入）</option>
-            <option value="BEFORE_PROMPT" ${s.injectPosition === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>
-          </select>
-          深度：<input type="number" class="ow-input" id="ow_inject_depth" style="width:70px;" min="0" value="${s.injectDepth}">
+          <label style="min-width:80px;"><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 表格</label>
+          <select class="ow-select" id="ow_off_inject_pos">${posOptions(s.offscreen.injectPosition)}</select>
+          深度<input type="number" class="ow-input" id="ow_off_inject_depth" style="width:56px;" min="0" value="${s.offscreen.injectDepth}">
         </div>
 
-        <div class="ow-section-title">镜头之外表格正文注入</div>
+        <div class="ow-section-title">API</div>
         <div class="ow-row">
-          <label><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 下次生成正文时注入镜头之外表格与叙述（默认关闭）</label>
+          <label><input type="radio" name="ow_api_mode" value="system" ${s.api.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
+          <label><input type="radio" name="ow_api_mode" value="custom" ${s.api.mode === 'custom' ? 'checked' : ''}> 独立 API</label>
         </div>
-        <div class="ow-row">
-          位置：
-          <select class="ow-select" id="ow_off_inject_pos">
-            <option value="IN_PROMPT" ${s.offscreen.injectPosition === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部（角色定义之前）</option>
-            <option value="IN_CHAT" ${s.offscreen.injectPosition === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度插入）</option>
-            <option value="BEFORE_PROMPT" ${s.offscreen.injectPosition === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>
-          </select>
-          深度：<input type="number" class="ow-input" id="ow_off_inject_depth" style="width:70px;" min="0" value="${s.offscreen.injectDepth}">
-        </div>
-
-        <div class="ow-section-title">API 设置</div>
-        <div class="ow-row">
-          <label><input type="radio" name="ow_api_mode" value="system" ${s.api.mode === 'system' ? 'checked' : ''}> 跟随酒馆当前 API</label>
-          <label><input type="radio" name="ow_api_mode" value="custom" ${s.api.mode === 'custom' ? 'checked' : ''}> 使用独立 API（OpenAI 兼容）</label>
-        </div>
-        <div class="ow-col" id="ow_custom_api_fields" style="${s.api.mode === 'custom' ? '' : 'display:none;'}">
-          <input type="text" class="ow-input" id="ow_api_url" placeholder="API 基础 URL，例如 https://api.openai.com/v1" value="${escapeHtml(s.api.url)}">
+        <div class="ow-col" id="ow_custom_api_fields" style="${s.api.mode === 'custom' ? '' : 'display:none;'} padding-left:12px;">
+          <input type="text" class="ow-input" id="ow_api_url" placeholder="URL，如 https://api.openai.com/v1" value="${escapeHtml(s.api.url)}">
           <input type="password" class="ow-input" id="ow_api_key" placeholder="API Key" value="${escapeHtml(s.api.key)}">
           <div class="ow-row">
             <select class="ow-select ow-grow" id="ow_api_model">
               ${s.api.model ? `<option value="${escapeHtml(s.api.model)}" selected>${escapeHtml(s.api.model)}</option>` : ''}
               ${(s.api.modelList || []).filter((m) => m !== s.api.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
             </select>
-            <button class="ow-btn" id="ow_api_pull_models">拉取模型列表</button>
+            <button class="ow-btn" id="ow_api_pull_models">拉取模型</button>
           </div>
-          <div class="ow-hint">填写后即自动保存，无需再点确认按钮。⚠️ API Key 会以明文形式保存在浏览器/酒馆设置文件中，客户端扩展无法安全加密存储密钥，请自行评估风险。</div>
+          <div class="ow-hint">填写即保存。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
         </div>
 
         <div class="ow-section-title">主题</div>
         <div class="ow-row">
-          <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆系统配色</label>
+          <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
           <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
         </div>
-        <div class="ow-col" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'}">
-          <div class="ow-hint">在此填写的 CSS 仅作用于本扩展弹窗，建议使用 .ow- 开头的选择器进行覆盖，例如 .ow-modal { background: #222; }</div>
-          <textarea class="ow-textarea" id="ow_theme_css" style="min-height:100px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
+        <div class="ow-col" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'} padding-left:12px;">
+          <textarea class="ow-textarea" id="ow_theme_css" style="min-height:90px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
           <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
         </div>
 
         <div class="ow-section-title">关于 / 更新</div>
         <div class="ow-row">
           <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;">
-            <i class="fa-brands fa-github"></i> 在 GitHub 上查看仓库
+            <i class="fa-brands fa-github"></i> 仓库
           </a>
           <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
         </div>
