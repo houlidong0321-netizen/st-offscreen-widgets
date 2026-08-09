@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.1.1';
+    const EXT_VERSION = '2.1.2';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -771,78 +771,99 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         return [...names].filter(Boolean);
     }
 
-    // 拉取这些世界书里的全部条目，用于设置页里的"世界书/聊天书发送设置"管理列表
-    async function fetchWorldInfoEntriesForManagement() {
-        const c = ctx();
-        const bookNames = getBoundWorldInfoBookNames();
-        const result = [];
-        for (const bookName of bookNames) {
-            try {
-                const book = await c.loadWorldInfo(bookName);
-                const entries = book?.entries ? Object.values(book.entries) : [];
-                for (const e of entries) {
-                    result.push({
-                        book: bookName,
-                        uid: String(e.uid),
-                        label: e.comment || (Array.isArray(e.key) ? e.key.join('，') : '') || `条目#${e.uid}`,
-                        disabledInST: !!e.disable,
-                    });
-                }
-            } catch (err) {
-                log('warn', 'system', `读取世界书「${bookName}」失败：${err.message || err}`, err);
-            }
-        }
-        // 角色卡内嵌世界书单独归为一组，让它的条目也能逐条开关
-        for (const e of getCharBookEntries()) {
-            result.push({ book: CHAR_BOOK_KEY, uid: e.uid, label: e.label, disabledInST: e.disabledInST });
-        }
-        return result;
-    }
-
+    // ------------------------------------------------------------------
+    // 统一收集所有可用的世界书条目，并按内容去重。
+    // 关键背景：酒馆导入角色卡时，importEmbeddedWorldInfo() 会把卡里的
+    // data.character_book 转存成一本独立世界书文件，并通过 data.extensions.world
+    // 绑定回角色——但卡里原来的 character_book 不会被清除。于是同一批内容会同时
+    // 存在于"独立世界书"和"卡内嵌书"两处。若两处都收，就会重复发送、浪费 token。
+    // 因此这里以独立世界书为准，卡内嵌书中内容已出现过的条目直接跳过。
+    // ------------------------------------------------------------------
+    // 某条目是否要发送：优先用用户在「世界书」标签页里的手动覆盖，
+    // 没有覆盖时跟随该条目在酒馆/角色卡里的启用状态。
     function isWorldInfoEntrySendEnabled(s, bookName, uidStr, disabledInST) {
         const key = `${bookName}::${uidStr}`;
         const override = s.worldInfoOverrides[key];
         return override !== undefined ? override : !disabledInST;
     }
 
-    async function gatherWorldInfo() {
+    function normContentKey(str) {
+        return String(str || '').replace(/\s+/g, '').trim();
+    }
+
+    async function collectAllLoreEntries() {
         const c = ctx();
-        const s = settings();
-        let text = '';
-        try {
-            const bookNames = getBoundWorldInfoBookNames();
-            const sent = [];
-            const skipped = [];
-            for (const bookName of bookNames) {
+        const out = [];
+        const seen = new Set();
+
+        for (const bookName of getBoundWorldInfoBookNames()) {
+            try {
                 const book = await c.loadWorldInfo(bookName);
                 const entries = book?.entries ? Object.values(book.entries) : [];
                 for (const e of entries) {
-                    const label = e.comment || (Array.isArray(e.key) ? e.key.join(',') : '条目');
-                    if (!isWorldInfoEntrySendEnabled(s, bookName, String(e.uid), !!e.disable)) {
-                        skipped.push(`${bookName}/${label}`);
-                        continue;
-                    }
-                    sent.push(`${bookName}/${label}`);
-                    text += `【${bookName} - ${label}】\n${e.content}\n\n`;
+                    const content = e.content || '';
+                    out.push({
+                        source: 'world',
+                        book: bookName,
+                        uid: String(e.uid),
+                        label: e.comment || (Array.isArray(e.key) ? e.key.join('，') : '') || `条目#${e.uid}`,
+                        content,
+                        disabledInST: !!e.disable,
+                    });
+                    if (content.trim()) seen.add(normContentKey(content));
                 }
+            } catch (err) {
+                log('warn', 'system', `读取世界书「${bookName}」失败：${err.message || err}`, err);
             }
-            log('debug', 'system', `世界书条目筛选：发送 ${sent.length} 条，跳过 ${skipped.length} 条`, { 已发送: sent, 已跳过: skipped });
-        } catch (err) {
-            log('warn', 'system', `读取世界书失败：${err.message || err}`, err);
         }
-        return text.trim();
+
+        const embedded = getCharBookEntries();
+        const uniqueEmbedded = embedded.filter((e) => !e.content.trim() || !seen.has(normContentKey(e.content)));
+        const dupCount = embedded.length - uniqueEmbedded.length;
+        if (dupCount > 0) {
+            log('debug', 'system',
+                `角色卡内嵌世界书有 ${dupCount}/${embedded.length} 条与已绑定的独立世界书内容重复，已自动去重（酒馆导入角色卡时会把内嵌书转存为独立世界书，但卡里仍保留一份副本）。`);
+        }
+        for (const e of uniqueEmbedded) {
+            out.push({ source: 'charbook', book: CHAR_BOOK_KEY, uid: e.uid, label: e.label, content: e.content, disabledInST: e.disabledInST });
+        }
+        return out;
     }
 
-    function gatherCharBook() {
+    // 管理列表用（设置页「世界书」标签页）
+    async function fetchWorldInfoEntriesForManagement() {
+        return collectAllLoreEntries();
+    }
+
+    async function gatherWorldInfo() {
         const s = settings();
-        const entries = getCharBookEntries();
-        if (!entries.length) return '';
-        const kept = entries.filter((e) => isWorldInfoEntrySendEnabled(s, CHAR_BOOK_KEY, e.uid, e.disabledInST));
-        const skipped = entries.length - kept.length;
-        if (skipped > 0) {
-            log('debug', 'system', `角色卡内嵌世界书：${entries.length} 条中发送 ${kept.length} 条，已按开关跳过 ${skipped} 条`);
+        const all = await collectAllLoreEntries();
+        return buildLoreText(all.filter((e) => e.source === 'world'), s, '世界书/聊天书');
+    }
+
+    async function gatherCharBook() {
+        const s = settings();
+        const all = await collectAllLoreEntries();
+        return buildLoreText(all.filter((e) => e.source === 'charbook'), s, '角色卡内嵌世界书');
+    }
+
+    function buildLoreText(entries, s, labelForLog) {
+        const sent = [];
+        const skipped = [];
+        let text = '';
+        for (const e of entries) {
+            if (!isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)) {
+                skipped.push(e.label);
+                continue;
+            }
+            sent.push(e.label);
+            const bookLabel = e.book === CHAR_BOOK_KEY ? CHAR_BOOK_LABEL : e.book;
+            text += `【${bookLabel} - ${e.label}】\n${e.content}\n\n`;
         }
-        return kept.map((e) => `【${e.label}】\n${e.content}`).join('\n\n');
+        if (entries.length) {
+            log('debug', 'system', `${labelForLog} 条目筛选：发送 ${sent.length} 条，跳过 ${skipped.length} 条`, { 已发送: sent, 已跳过: skipped });
+        }
+        return text.trim();
     }
 
     async function gatherExtras({ historyDepth } = {}) {
@@ -850,7 +871,7 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         const extras = { history: '', worldInfo: '', charBook: '' };
         extras.history = gatherHistory(historyDepth === undefined ? s.historyDepth : historyDepth);
         if (s.includeWorldInfo) extras.worldInfo = await gatherWorldInfo();
-        if (s.includeCharBook) extras.charBook = gatherCharBook();
+        if (s.includeCharBook) extras.charBook = await gatherCharBook();
         return extras;
     }
 
