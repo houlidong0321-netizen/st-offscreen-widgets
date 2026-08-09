@@ -1,12 +1,12 @@
 {
-    "display_name": "镜头之外 · 组件生成器",
+    "display_name": "Ego 小助手",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "Custom (built with Claude)",
-    "version": "1.0.0",
-    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "version": "2.0.0",
+    "homePage": "https://github.com/houlidong0321-netizen/st-offscreen-widgets",
     "auto_update": false
 }

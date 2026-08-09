@@ -1,5 +1,5 @@
 // ============================================================================
-// 镜头之外 · 组件生成器 (Off-Screen & Widget Generator) for SillyTavern
+// Ego 小助手 (Ego Assistant) for SillyTavern — 组件生成 · 镜头之外表格 · 收藏夹
 // ----------------------------------------------------------------------------
 // 使用 SillyTavern.getContext() 全局接口编写，避免相对路径导入随版本变化失效。
 // 参考: https://docs.sillytavern.app/for-contributors/writing-extensions/
@@ -20,6 +20,8 @@
     // ——酒馆前端把这个参数拼成"third-party/<文件夹名>"后去掉字面量"third-party"这几个字符
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
+    const EXT_NAME = 'Ego 小助手';
+    const EXT_VERSION = '2.0.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -171,7 +173,7 @@
         logs.push(entry);
         if (logs.length > MAX_LOGS) logs.shift();
         const consoleFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
-        consoleFn(`[镜头之外][${tag}] ${msg}`, data !== undefined ? data : '');
+        consoleFn(`[Ego][${tag}] ${msg}`, data !== undefined ? data : '');
         if ($logPanel) renderLogEntries($logPanel);
         return entry;
     }
@@ -212,6 +214,8 @@
         injectDepth: 0,
         offscreen: {
             enabled: false,
+            followWidgets: true,   // 表格随组件一起生成（此时楼层间隔与上下文楼层跟随组件设置）
+            historyDepth: 5,       // 仅在不跟随组件时生效
             injectTables: false,
             injectPosition: 'IN_CHAT',
             injectDepth: 0,
@@ -597,10 +601,10 @@
             .join('\n\n');
     }
 
-    async function gatherExtras() {
+    async function gatherExtras({ historyDepth } = {}) {
         const s = settings();
         const extras = { history: '', worldInfo: '', charBook: '' };
-        extras.history = gatherHistory(s.historyDepth);
+        extras.history = gatherHistory(historyDepth === undefined ? s.historyDepth : historyDepth);
         if (s.includeWorldInfo) extras.worldInfo = await gatherWorldInfo();
         if (s.includeCharBook) extras.charBook = gatherCharBook();
         return extras;
@@ -761,7 +765,9 @@
     async function generateOffscreen({ onProgress } = {}) {
         log('info', 'system', '开始生成/更新「镜头之外」内容');
         onProgress?.('offscreen', 'start');
-        const extras = await gatherExtras();
+        const sOff = settings().offscreen;
+        const depth = sOff.followWidgets ? settings().historyDepth : sOff.historyDepth;
+        const extras = await gatherExtras({ historyDepth: depth });
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
             const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '镜头之外');
@@ -863,14 +869,16 @@
         log('info', 'system', '=== 开始批量生成流程 ===');
         await generateAllWidgets({ onProgress });
         const s = settings();
-        if (s.offscreen.enabled) {
+        if (s.offscreen.enabled && s.offscreen.followWidgets) {
             try {
                 await generateOffscreen({ onProgress });
             } catch (e) {
-                log('warn', 'system', `「镜头之外」生成失败：${e.message || e}`);
+                log('warn', 'system', `表格生成失败：${e.message || e}`);
             }
+        } else if (!s.offscreen.enabled) {
+            log('info', 'system', '表格功能未启用，本次跳过。');
         } else {
-            log('info', 'system', '"镜头之外"未启用，本次跳过。');
+            log('info', 'system', '表格设置为“不跟随组件”，本次不随组件生成（按自身楼层间隔独立触发）。');
         }
         log('info', 'system', '=== 批量生成流程结束 ===');
     }
@@ -943,7 +951,7 @@
                     }
                 }
             }
-            if (s.offscreen.enabled && s.autoTriggers.offscreenByFloor?.enabled) {
+            if (s.offscreen.enabled && !s.offscreen.followWidgets && s.autoTriggers.offscreenByFloor?.enabled) {
                 const interval2 = Math.max(1, Number(s.autoTriggers.offscreenByFloor.interval) || 1);
                 const delta2 = currentFloor - (at.lastOffscreenFloor || 0);
                 log('debug', 'trigger', `[镜头之外楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta2}层，间隔设置${interval2}层`);
@@ -1049,7 +1057,7 @@
     function toast(msg, type = 'info') {
         try {
             if (window.toastr && typeof window.toastr[type] === 'function') {
-                window.toastr[type](msg, '镜头之外 · 组件生成器');
+                window.toastr[type](msg, EXT_NAME);
                 return;
             }
         } catch (e) { /* ignore */ }
@@ -1305,7 +1313,7 @@
         <div class="ow-modal-overlay" id="ow_modal_overlay">
           <div class="ow-modal">
             <div class="ow-modal-header">
-              <div class="ow-modal-title">🎬 镜头之外 · 组件生成器
+              <div class="ow-modal-title">🧠 Ego 小助手
                 <span id="ow_generating_indicator" class="ow-generating" style="display:none;"></span>
               </div>
               <div class="ow-close-btn" id="ow_close_btn"><i class="fa-solid fa-xmark"></i></div>
@@ -2072,35 +2080,39 @@ ${innerHtml}
     function renderUpdateSection($panel) {
         const $status = $panel.find('#ow_update_status');
         if (!$status.length) return;
+
         if (!updateState.checked) {
-            $status.html('尚未检查，或检查失败——详情见"日志"标签页。可能是网络问题，或本扩展安装方式不是通过 Git 地址（无法使用酒馆内置的自动更新接口）。');
+            $status.html(`未能获取版本信息。<br>
+                <span class="ow-muted">尝试的 extensionName：<code>${escapeHtml(EXTENSION_ID_PARAM)}</code>（用户扩展与全局扩展两种方式都试过了）。
+                详细请求结果见「日志」标签页。也可以直接用酒馆自带的扩展管理器更新（更可靠）。</span>`);
             return;
         }
         const shortHash = (updateState.currentCommitHash || '').slice(0, 7);
         if (!shortHash) {
-            $status.html('未能识别为 Git 仓库（可能不是通过 Git 地址安装的，或安装目录被移动过），无法自动检查/更新，请通过酒馆「扩展」面板手动管理，或重新用仓库地址安装。');
+            // 服务端明确回了 200 但没有 commit hash：该目录不是 Git 仓库
+            $status.html(`该扩展目录不是 Git 仓库，无法自动更新。<br>
+                <span class="ow-muted">常见原因：是手动解压/复制安装的，而不是在酒馆里用 Git 地址安装。
+                解决办法：卸载后用「Install extension」粘贴仓库地址重装，之后就能自动更新了。</span>`);
             return;
         }
+        const where = updateState.global ? '全局扩展' : '用户扩展';
         if (updateState.isUpToDate) {
-            $status.html(`✅ 已是最新版本（当前提交 ${escapeHtml(shortHash)}${updateState.currentBranchName ? `，分支 ${escapeHtml(updateState.currentBranchName)}` : ''}）`);
+            $status.html(`✅ 已是最新版本 <span class="ow-muted">（${where} · ${escapeHtml(shortHash)}${updateState.currentBranchName ? ' · ' + escapeHtml(updateState.currentBranchName) : ''}）</span>`);
             updateMenuBadge();
         } else {
-            $status.html(`⚠️ 发现新版本可更新（当前提交 ${escapeHtml(shortHash)}） <button class="ow-btn ow-primary" id="ow_do_update" style="margin-left:6px;">立即更新</button>`);
+            $status.html(`⚠️ 有新版本可更新 <span class="ow-muted">（${where} · 当前 ${escapeHtml(shortHash)}）</span>
+                <button class="ow-btn ow-primary" id="ow_do_update" style="margin-left:8px;">立即更新</button>`);
             $panel.find('#ow_do_update').on('click', async function () {
                 const $btn = $(this);
                 $btn.prop('disabled', true).text('更新中…');
                 try {
                     const result = await performExtensionUpdate();
-                    toast(`已更新到 ${result.shortCommitHash || '最新版本'}，需要刷新页面才能生效`, 'success');
-                    if (confirm('扩展已更新完成，是否立即刷新页面以应用更新？')) {
-                        location.reload();
-                    } else {
-                        $status.html(`✅ 已更新到 ${escapeHtml(result.shortCommitHash || '')}，请记得手动刷新页面`);
-                        updateMenuBadge();
-                        if ($modal) renderUpdateBanner($modal);
-                    }
+                    toast(`已更新到 ${result.shortCommitHash || '最新版本'}，刷新页面生效`, 'success');
+                    if (confirm('扩展已更新完成，是否立即刷新页面？')) location.reload();
+                    else { $status.html(`✅ 已更新，请手动刷新页面`); updateMenuBadge(); if ($modal) renderUpdateBanner($modal); }
                 } catch (err) {
-                    toast(`更新失败：${err.message || err}，详见日志标签页`, 'error');
+                    toast(`更新失败：${err.message || err}`, 'error');
+                    $status.append(`<br><span class="ow-muted">更新请求失败：${escapeHtml(String(err.message || err))}。可改用酒馆扩展管理器更新。</span>`);
                     $btn.prop('disabled', false).text('立即更新');
                 }
             });
@@ -2108,191 +2120,125 @@ ${innerHtml}
         }
     }
 
-    // ---------------- 世界书 / 聊天书发送设置面板 ----------------
-    function renderWorldInfoPanel($panel) {
-        $panel.html(`
-        <div class="ow-row">
-          <button class="ow-btn ow-primary" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 拉取/刷新条目列表</button>
-          <button class="ow-btn" id="ow_wi_reset">全部恢复默认（跟随酒馆启用状态）</button>
-        </div>
-        <div class="ow-hint">来源：<span id="ow_wi_book_names">—</span><br>默认跟随条目在酒馆中的启用状态；此处改动只影响本扩展，不改酒馆世界书。需在「设置 → 上下文」勾选后生效。</div>
-        <div id="ow_wi_entry_list"></div>`);
-
-        $panel.find('#ow_wi_refresh').on('click', () => loadAndRenderWorldInfoEntries($panel));
-        $panel.find('#ow_wi_reset').on('click', () => {
-            if (!confirm('确定清空所有手动覆盖，恢复为"跟随酒馆启用状态"吗？')) return;
-            settings().worldInfoOverrides = {};
-            saveSettings();
-            log('info', 'ui', '已清空世界书发送覆盖设置');
-            loadAndRenderWorldInfoEntries($panel);
-        });
-
-        loadAndRenderWorldInfoEntries($panel);
-    }
-
-    async function loadAndRenderWorldInfoEntries($panel) {
-        const s = settings();
-        const $list = $panel.find('#ow_wi_entry_list');
-        $list.html('<div class="ow-empty">加载中…</div>');
-        const bookNames = getBoundWorldInfoBookNames();
-        $panel.find('#ow_wi_book_names').text(bookNames.length ? bookNames.join('、') : '（未识别到任何已激活的世界书/聊天书）');
-        if (!bookNames.length) {
-            $list.html('<div class="ow-empty">当前没有识别到激活的世界书，也没有绑定聊天书。请先在酒馆的"世界书"面板里勾选要启用的世界书，或为当前聊天绑定聊天书。</div>');
-            return;
-        }
-        const entries = await fetchWorldInfoEntriesForManagement();
-        log('debug', 'system', `世界书管理列表拉取到 ${entries.length} 条条目，来自 ${bookNames.length} 本书`, bookNames);
-        if (!entries.length) {
-            $list.html('<div class="ow-empty">识别到的世界书里没有任何条目。</div>');
-            return;
-        }
-        const byBook = {};
-        for (const e of entries) (byBook[e.book] = byBook[e.book] || []).push(e);
-
-        let html = '';
-        for (const [book, list] of Object.entries(byBook)) {
-            html += `<div class="ow-section-title">${escapeHtml(book)}</div>`;
-            for (const e of list) {
-                const checked = isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST);
-                html += `<div class="ow-preset-entry" style="padding:4px 0;">
-                    <input type="checkbox" class="ow-wi-entry-toggle" data-book="${escapeHtml(e.book)}" data-uid="${escapeHtml(e.uid)}" ${checked ? 'checked' : ''}>
-                    <label>${escapeHtml(e.label)}${e.disabledInST ? ' <span class="ow-muted">（在酒馆中已禁用）</span>' : ''}</label>
-                </div>`;
-            }
-        }
-        $list.html(html);
-        $list.off('change', '.ow-wi-entry-toggle').on('change', '.ow-wi-entry-toggle', function () {
-            const book = $(this).data('book');
-            const uidStr = String($(this).data('uid'));
-            s.worldInfoOverrides[`${book}::${uidStr}`] = $(this).is(':checked');
-            saveSettings();
-        });
-    }
-
-    // ---------------- 提示词面板 ----------------
-    function renderPromptsPanel($panel) {
-        const s = settings();
-        $panel.html(`
-        <div class="ow-hint">编辑即保存。</div>
-
-        <div class="ow-section-title">组件生成提示词</div>
-        <div class="ow-row"><button class="ow-btn" id="ow_prompt_widget_reset">恢复默认</button></div>
-        <textarea class="ow-textarea" id="ow_prompt_widget" style="min-height:220px;">${escapeHtml(s.prompts.widgetSystemPrompt)}</textarea>
-
-        <div class="ow-section-title">镜头之外 · 总则</div>
-        <div class="ow-hint">各表自己的规则写在「镜头之外 → 表格管理」里，这里只放总则；实际发送时会自动拼上启用表格的规则与 JSON 格式说明。</div>
-        <div class="ow-row"><button class="ow-btn" id="ow_prompt_offscreen_reset">恢复默认</button></div>
-        <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:240px;">${escapeHtml(s.prompts.offscreenPreamble)}</textarea>
-
-        <div class="ow-section-title">实际发送的完整提示词（预览）</div>
-        <div class="ow-row"><button class="ow-btn" id="ow_prompt_preview_btn">生成预览</button></div>
-        <pre id="ow_prompt_preview" class="ow-preview-box" style="display:none;"></pre>`);
-
-        $panel.find('#ow_prompt_widget').on('input', function () {
-            s.prompts.widgetSystemPrompt = $(this).val();
-            saveSettings();
-        });
-        $panel.find('#ow_prompt_widget_reset').on('click', function () {
-            if (!confirm('确定恢复"组件生成提示词"为默认内容吗？当前编辑内容会被覆盖。')) return;
-            s.prompts.widgetSystemPrompt = DEFAULT_WIDGET_SYSTEM_PROMPT;
-            saveSettings();
-            renderPromptsPanel($panel);
-        });
-
-        $panel.find('#ow_prompt_offscreen').on('input', function () {
-            s.prompts.offscreenPreamble = $(this).val();
-            saveSettings();
-        });
-        $panel.find('#ow_prompt_preview_btn').on('click', function () {
-            const $box = $panel.find('#ow_prompt_preview');
-            $box.text(buildOffscreenSystemPrompt()).toggle();
-        });
-        $panel.find('#ow_prompt_offscreen_reset').on('click', function () {
-            if (!confirm('确定恢复"镜头之外总则"为默认内容吗？当前编辑内容会被覆盖。')) return;
-            s.prompts.offscreenPreamble = DEFAULT_OFFSCREEN_PREAMBLE;
-            saveSettings();
-            renderPromptsPanel($panel);
-        });
-    }
-
     function renderSettingsPanel($panel) {
         const s = settings();
+        const follow = s.offscreen.followWidgets;
         const posOptions = (sel) => `
             <option value="IN_PROMPT" ${sel === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
             <option value="IN_CHAT" ${sel === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
             <option value="BEFORE_PROMPT" ${sel === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>`;
         const html = `
-        <div class="ow-section-title">触发</div>
-        <div class="ow-row">
-          <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动</label>
-          <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
-        </div>
-        <div class="ow-col" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'} padding-left:12px;">
-          <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
-          <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 组件每
-            <input type="number" class="ow-input" id="ow_auto_widget_floor_n" style="width:56px;margin:0 4px;" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成</label>
-          <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''}> 镜头之外每
-            <input type="number" class="ow-input" id="ow_auto_offscreen_floor_n" style="width:56px;margin:0 4px;" min="1" value="${s.autoTriggers.offscreenByFloor.interval}">楼层生成</label>
-        </div>
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-puzzle-piece"></i> 组件</div>
 
-        <div class="ow-section-title">上下文</div>
-        <div class="ow-row">
-          <label>随行发送最近
-            <input type="number" class="ow-input" id="ow_history_depth" style="width:60px;margin:0 6px;" min="0" value="${s.historyDepth}">条聊天记录</label>
-        </div>
-        <div class="ow-row">
-          <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 世界书条目（在「世界书」页选择）</label>
-          <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 角色卡内嵌世界书</label>
-        </div>
-
-        <div class="ow-section-title">注入正文</div>
-        <div class="ow-row">
-          <label style="min-width:80px;"><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 组件</label>
-          <select class="ow-select" id="ow_inject_pos">${posOptions(s.injectPosition)}</select>
-          深度<input type="number" class="ow-input" id="ow_inject_depth" style="width:56px;" min="0" value="${s.injectDepth}">
-        </div>
-        <div class="ow-row">
-          <label style="min-width:80px;"><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 表格</label>
-          <select class="ow-select" id="ow_off_inject_pos">${posOptions(s.offscreen.injectPosition)}</select>
-          深度<input type="number" class="ow-input" id="ow_off_inject_depth" style="width:56px;" min="0" value="${s.offscreen.injectDepth}">
-        </div>
-
-        <div class="ow-section-title">API</div>
-        <div class="ow-row">
-          <label><input type="radio" name="ow_api_mode" value="system" ${s.api.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
-          <label><input type="radio" name="ow_api_mode" value="custom" ${s.api.mode === 'custom' ? 'checked' : ''}> 独立 API</label>
-        </div>
-        <div class="ow-col" id="ow_custom_api_fields" style="${s.api.mode === 'custom' ? '' : 'display:none;'} padding-left:12px;">
-          <input type="text" class="ow-input" id="ow_api_url" placeholder="URL，如 https://api.openai.com/v1" value="${escapeHtml(s.api.url)}">
-          <input type="password" class="ow-input" id="ow_api_key" placeholder="API Key" value="${escapeHtml(s.api.key)}">
+          <div class="ow-field-label">生成方式</div>
           <div class="ow-row">
-            <select class="ow-select ow-grow" id="ow_api_model">
-              ${s.api.model ? `<option value="${escapeHtml(s.api.model)}" selected>${escapeHtml(s.api.model)}</option>` : ''}
-              ${(s.api.modelList || []).filter((m) => m !== s.api.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
-            </select>
-            <button class="ow-btn" id="ow_api_pull_models">拉取模型</button>
+            <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动</label>
+            <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
           </div>
-          <div class="ow-hint">填写即保存。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+          <div class="ow-sub-fields" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'}">
+            <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
+            <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 每
+              <input type="number" class="ow-input ow-num" id="ow_auto_widget_floor_n" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成一次</label>
+          </div>
+
+          <div class="ow-field-label">上下文</div>
+          <div class="ow-row">
+            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label>
+          </div>
+
+          <div class="ow-field-label">注入正文</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 注入组件结果</label>
+            <select class="ow-select" id="ow_inject_pos">${posOptions(s.injectPosition)}</select>
+            <label>深度 <input type="number" class="ow-input ow-num" id="ow_inject_depth" min="0" value="${s.injectDepth}"></label>
+          </div>
         </div>
 
-        <div class="ow-section-title">主题</div>
-        <div class="ow-row">
-          <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
-          <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
-        </div>
-        <div class="ow-col" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'} padding-left:12px;">
-          <textarea class="ow-textarea" id="ow_theme_css" style="min-height:90px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
-          <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-table-list"></i> 表格（镜头之外）</div>
+
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_off_enabled_set" ${s.offscreen.enabled ? 'checked' : ''}> 启用表格功能</label>
+          </div>
+
+          <div class="ow-field-label">生成方式</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_off_follow" ${follow ? 'checked' : ''}> 跟随组件一起生成</label>
+          </div>
+          <div class="ow-sub-fields ${follow ? 'ow-disabled' : ''}" id="ow_off_own_fields">
+            <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''} ${follow ? 'disabled' : ''}> 每
+              <input type="number" class="ow-input ow-num" id="ow_auto_offscreen_floor_n" min="1" value="${s.autoTriggers.offscreenByFloor.interval}" ${follow ? 'disabled' : ''}>楼层生成一次</label>
+            <label>获取最近
+              <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${s.offscreen.historyDepth}" ${follow ? 'disabled' : ''}> 楼聊天记录</label>
+            <div class="ow-muted ow-follow-note" style="${follow ? '' : 'display:none;'}">已跟随组件设置：楼层间隔与上下文楼层数与组件一致</div>
+          </div>
+
+          <div class="ow-field-label">注入正文</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 注入表格内容</label>
+            <select class="ow-select" id="ow_off_inject_pos">${posOptions(s.offscreen.injectPosition)}</select>
+            <label>深度 <input type="number" class="ow-input ow-num" id="ow_off_inject_depth" min="0" value="${s.offscreen.injectDepth}"></label>
+          </div>
         </div>
 
-        <div class="ow-section-title">关于 / 更新</div>
-        <div class="ow-row">
-          <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;">
-            <i class="fa-brands fa-github"></i> 仓库
-          </a>
-          <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-book"></i> 世界书</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书 / 聊天书条目</label>
+          </div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 随行发送角色卡内嵌世界书</label>
+          </div>
+          <div class="ow-hint">具体发送哪些书、哪些条目，在「世界书」标签页里逐条开关。</div>
         </div>
-        <div id="ow_update_status" class="ow-hint">尚未检查</div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-plug"></i> API</div>
+          <div class="ow-row">
+            <label><input type="radio" name="ow_api_mode" value="system" ${s.api.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
+            <label><input type="radio" name="ow_api_mode" value="custom" ${s.api.mode === 'custom' ? 'checked' : ''}> 独立 API</label>
+          </div>
+          <div class="ow-sub-fields" id="ow_custom_api_fields" style="${s.api.mode === 'custom' ? '' : 'display:none;'}">
+            <input type="text" class="ow-input" id="ow_api_url" placeholder="URL，如 https://api.openai.com/v1" value="${escapeHtml(s.api.url)}">
+            <input type="password" class="ow-input" id="ow_api_key" placeholder="API Key" value="${escapeHtml(s.api.key)}">
+            <div class="ow-row">
+              <select class="ow-select ow-grow" id="ow_api_model">
+                ${s.api.model ? `<option value="${escapeHtml(s.api.model)}" selected>${escapeHtml(s.api.model)}</option>` : ''}
+                ${(s.api.modelList || []).filter((m) => m !== s.api.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
+              </select>
+              <button class="ow-btn" id="ow_api_pull_models">拉取模型</button>
+            </div>
+            <div class="ow-muted">填写即保存。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+          </div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-palette"></i> 主题</div>
+          <div class="ow-row">
+            <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
+            <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
+          </div>
+          <div class="ow-sub-fields" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'}">
+            <textarea class="ow-textarea" id="ow_theme_css" style="min-height:90px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
+            <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
+          </div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-circle-info"></i> 关于 / 更新</div>
+          <div class="ow-row">
+            <span class="ow-muted">Ego 小助手 v${EXT_VERSION}</span>
+          </div>
+          <div class="ow-row">
+            <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;">
+              <i class="fa-brands fa-github"></i> 仓库
+            </a>
+            <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
+            <button class="ow-btn" id="ow_open_ext_manager"><i class="fa-solid fa-gear"></i> 打开扩展管理器</button>
+          </div>
+          <div id="ow_update_status" class="ow-hint">尚未检查</div>
+        </div>
         `;
         $panel.html(html);
         renderUpdateSection($panel);
@@ -2315,6 +2261,30 @@ ${innerHtml}
         $panel.find('#ow_auto_content_tag').on('change', function () { s.autoTriggers.onContentTag = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_auto_widget_floor').on('change', function () { s.autoTriggers.widgetsByFloor.enabled = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_auto_widget_floor_n').on('change', function () { s.autoTriggers.widgetsByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
+        $panel.find('#ow_off_enabled_set').on('change', function () {
+            s.offscreen.enabled = $(this).is(':checked');
+            saveSettings();
+            if ($modal) renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+        });
+        $panel.find('#ow_off_follow').on('change', function () {
+            s.offscreen.followWidgets = $(this).is(':checked');
+            saveSettings();
+            const on = s.offscreen.followWidgets;
+            const $f = $panel.find('#ow_off_own_fields');
+            $f.toggleClass('ow-disabled', on);
+            $f.find('input').prop('disabled', on);
+            $f.find('.ow-follow-note').toggle(on);
+        });
+        $panel.find('#ow_off_history_depth').on('change', function () { s.offscreen.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_open_ext_manager').on('click', function () {
+            // 尝试打开酒馆自带的扩展管理器（不同版本入口 id 略有差异，逐个尝试）
+            const candidates = ['#extensionsMenuButton', '#extensions_button', '#rm_extensions_block', '#extensions_details'];
+            for (const sel of candidates) {
+                const $el = $(sel);
+                if ($el.length) { $el.trigger('click'); toast('已尝试打开酒馆扩展管理器', 'info'); return; }
+            }
+            toast('没找到扩展管理器入口，请手动打开酒馆左侧「扩展」面板 → Manage extensions', 'warning');
+        });
         $panel.find('#ow_auto_offscreen_floor').on('change', function () { s.autoTriggers.offscreenByFloor.enabled = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_auto_offscreen_floor_n').on('change', function () { s.autoTriggers.offscreenByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
@@ -2375,7 +2345,7 @@ ${innerHtml}
         const $btn = $(`
           <div id="ow_menu_button" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
             <i class="fa-solid fa-clapperboard"></i>
-            <span>镜头之外 / 组件生成</span>
+            <span>Ego 小助手</span>
             <span id="ow_menu_update_badge" class="ow-log-badge" style="display:none;" title="有新版本可更新">NEW</span>
           </div>`);
         $('#extensionsMenu').append($btn);
@@ -2385,7 +2355,7 @@ ${innerHtml}
 
     function waitForMenu(retries = 30) {
         if ($('#extensionsMenu').length) { addMenuButton(); return; }
-        if (retries <= 0) { console.warn('[镜头之外] 未找到 #extensionsMenu，扩展入口未挂载'); return; }
+        if (retries <= 0) { console.warn('[Ego] 未找到 #extensionsMenu，扩展入口未挂载'); return; }
         setTimeout(() => waitForMenu(retries - 1), 500);
     }
 

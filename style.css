@@ -38,8 +38,13 @@
     backdrop-filter: blur(2px);
     z-index: 9998;
     display: flex;
-    align-items: center;
+    /* flex-start + overflow auto：窗口比视口高时从顶部开始排布，
+       不会像 center 那样把上半部分推到视口外导致标题栏/标签栏看不见 */
+    align-items: flex-start;
     justify-content: center;
+    padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0);
+    overflow: auto;
+    overscroll-behavior: contain;
     animation: ow-fade 0.16s ease;
 }
 .ow-sub-overlay { z-index: 10000; }
@@ -69,13 +74,23 @@
 
 .ow-modal {
     width: min(980px, 95vw);
-    height: min(760px, 90vh);
+    height: min(760px, 90dvh);
+    max-height: 100dvh;
+    margin: auto;              /* 空间够时仍然垂直居中，不够时贴顶 */
     backdrop-filter: blur(var(--SmartThemeBlurStrength, 6px));
 }
 
 .ow-sub-modal {
     width: min(780px, 93vw);
-    height: min(660px, 86vh);
+    height: min(660px, 86dvh);
+    max-height: 100dvh;
+    margin: auto;
+}
+
+/* dvh 不支持时回退到 vh */
+@supports not (height: 100dvh) {
+    .ow-modal { height: min(760px, 90vh); max-height: 100vh; }
+    .ow-sub-modal { height: min(660px, 86vh); max-height: 100vh; }
 }
 
 /* ------------------------------------------------------------------ 标题栏 */
@@ -609,7 +624,16 @@
 
 /* ------------------------------------------------------------ 窄屏适配 */
 @media (max-width: 620px) {
-    .ow-modal, .ow-sub-modal { width: 100vw; height: 100vh; border-radius: 0; border: none; }
+    .ow-modal, .ow-sub-modal {
+        width: 100vw;
+        height: 100dvh;
+        max-height: 100dvh;
+        border-radius: 0;
+        border: none;
+        margin: 0;
+    }
+    .ow-modal-header { padding: 10px 12px; }
+    .ow-modal-title { font-size: 14px; }
     .ow-panel { padding: 12px 12px 20px; }
     .ow-tab { padding: 10px 11px; font-size: 13px; }
     .ow-widget-name { max-width: 38%; }
@@ -646,3 +670,60 @@
 .ow-fav-meta .ow-btn { padding: 4px 9px; font-size: 11.5px; }
 
 .ow-fav-btn i.fa-solid.fa-star { color: #f0c14b; }
+
+
+/* ------------------------------------------------------------ 设置分组 */
+.ow-group {
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    padding: 12px 14px 14px;
+    margin-bottom: 14px;
+    background: var(--ow-surface);
+}
+
+.ow-group-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--ow-border);
+}
+.ow-group-title i { opacity: 0.55; font-size: 12px; }
+
+.ow-sub-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 8px 0 4px 14px;
+    margin-left: 3px;
+    border-left: 2px solid var(--ow-border);
+}
+
+/* 跟随组件时，表格自己的楼层/上下文设置整体变灰不可用 */
+.ow-sub-fields.ow-disabled {
+    opacity: 0.45;
+    pointer-events: none;
+}
+.ow-sub-fields.ow-disabled .ow-follow-note { opacity: 1; }
+
+.ow-follow-note {
+    font-size: 11.5px;
+    font-style: italic;
+    padding-top: 2px;
+}
+
+.ow-num {
+    width: 62px !important;
+    display: inline-block;
+    margin: 0 4px;
+    padding: 4px 7px;
+    text-align: center;
+}
+
+.ow-hint code {
+    font-family: var(--ow-mono);
+    font-size: 11px;
+}
