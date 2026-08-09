@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.1.0';
+    const EXT_VERSION = '2.1.1';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -736,6 +736,26 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
     // 获取当前"已绑定/已激活"的世界书清单：全局勾选激活的世界书（读取酒馆世界书面板的
     // 多选框 #world_info，因为该激活列表未通过 getContext() 暴露）、当前角色绑定的主世界书、
     // 当前聊天绑定的聊天书。三者取并集去重。
+    // 角色卡内嵌世界书（character_book）不是一本独立的世界书文件，
+    // loadWorldInfo 读不到它，所以在条目管理里用这个虚拟书名单独归组，
+    // 让它的每个条目也能像普通世界书条目一样被逐条开关。
+    const CHAR_BOOK_KEY = '__character_book__';
+    const CHAR_BOOK_LABEL = '角色卡内嵌世界书';
+
+    // 取出角色卡内嵌世界书的条目，统一成 {uid,label,content,disabledInST} 结构
+    function getCharBookEntries() {
+        const c = ctx();
+        const book = c.characters?.[c.characterId]?.data?.character_book;
+        if (!book?.entries?.length) return [];
+        return book.entries.map((e, i) => ({
+            uid: String(e.id ?? e.uid ?? i),
+            label: e.comment || (Array.isArray(e.keys) ? e.keys.join('，') : '') || `条目#${i + 1}`,
+            content: e.content || '',
+            // V2 角色卡规范用 enabled=false 表示禁用，部分卡沿用世界书的 disable=true
+            disabledInST: e.enabled === false || e.disable === true,
+        }));
+    }
+
     function getBoundWorldInfoBookNames() {
         const c = ctx();
         const names = new Set();
@@ -772,6 +792,10 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
                 log('warn', 'system', `读取世界书「${bookName}」失败：${err.message || err}`, err);
             }
         }
+        // 角色卡内嵌世界书单独归为一组，让它的条目也能逐条开关
+        for (const e of getCharBookEntries()) {
+            result.push({ book: CHAR_BOOK_KEY, uid: e.uid, label: e.label, disabledInST: e.disabledInST });
+        }
         return result;
     }
 
@@ -787,15 +811,22 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         let text = '';
         try {
             const bookNames = getBoundWorldInfoBookNames();
+            const sent = [];
+            const skipped = [];
             for (const bookName of bookNames) {
                 const book = await c.loadWorldInfo(bookName);
                 const entries = book?.entries ? Object.values(book.entries) : [];
                 for (const e of entries) {
-                    if (!isWorldInfoEntrySendEnabled(s, bookName, String(e.uid), !!e.disable)) continue;
                     const label = e.comment || (Array.isArray(e.key) ? e.key.join(',') : '条目');
+                    if (!isWorldInfoEntrySendEnabled(s, bookName, String(e.uid), !!e.disable)) {
+                        skipped.push(`${bookName}/${label}`);
+                        continue;
+                    }
+                    sent.push(`${bookName}/${label}`);
                     text += `【${bookName} - ${label}】\n${e.content}\n\n`;
                 }
             }
+            log('debug', 'system', `世界书条目筛选：发送 ${sent.length} 条，跳过 ${skipped.length} 条`, { 已发送: sent, 已跳过: skipped });
         } catch (err) {
             log('warn', 'system', `读取世界书失败：${err.message || err}`, err);
         }
@@ -803,13 +834,15 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
     }
 
     function gatherCharBook() {
-        const c = ctx();
-        const char = c.characters?.[c.characterId];
-        const book = char?.data?.character_book;
-        if (!book?.entries?.length) return '';
-        return book.entries
-            .map((e) => `【${e.comment || (e.keys || []).join(',') || '条目'}】\n${e.content}`)
-            .join('\n\n');
+        const s = settings();
+        const entries = getCharBookEntries();
+        if (!entries.length) return '';
+        const kept = entries.filter((e) => isWorldInfoEntrySendEnabled(s, CHAR_BOOK_KEY, e.uid, e.disabledInST));
+        const skipped = entries.length - kept.length;
+        if (skipped > 0) {
+            log('debug', 'system', `角色卡内嵌世界书：${entries.length} 条中发送 ${kept.length} 条，已按开关跳过 ${skipped} 条`);
+        }
+        return kept.map((e) => `【${e.label}】\n${e.content}`).join('\n\n');
     }
 
     async function gatherExtras({ historyDepth } = {}) {
@@ -2587,6 +2620,7 @@ ${innerHtml}
         const $list = $panel.find('#ow_wi_entry_list');
         $list.html('<div class="ow-empty">加载中…</div>');
         let bookNames = [];
+        const charBookCount = getCharBookEntries().length;
         try {
             bookNames = getBoundWorldInfoBookNames();
         } catch (err) {
@@ -2594,8 +2628,9 @@ ${innerHtml}
             $list.html('<div class="ow-empty">识别世界书时出错，详见日志标签页。</div>');
             return;
         }
-        $panel.find('#ow_wi_book_names').text(bookNames.length ? bookNames.join('、') : '（未识别到已激活的世界书/聊天书）');
-        if (!bookNames.length) {
+        const srcLabel = [...bookNames, ...(charBookCount ? [`${CHAR_BOOK_LABEL}(${charBookCount}条)`] : [])];
+        $panel.find('#ow_wi_book_names').text(srcLabel.length ? srcLabel.join('、') : '（未识别到已激活的世界书/聊天书）');
+        if (!bookNames.length && !charBookCount) {
             $list.html('<div class="ow-empty">没有识别到激活的世界书，也没有绑定聊天书。<br>请先在酒馆「世界书」面板勾选要启用的世界书，或为当前聊天绑定聊天书。</div>');
             return;
         }
@@ -2618,11 +2653,14 @@ ${innerHtml}
         let html = '';
         for (const [book, list] of Object.entries(byBook)) {
             const onCount = list.filter((e) => isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)).length;
+            const isCharBook = book === CHAR_BOOK_KEY;
+            const shownName = isCharBook ? CHAR_BOOK_LABEL : book;
             html += `
             <div class="ow-widget-card" data-book="${escapeHtml(book)}">
               <div class="ow-widget-card-head">
-                <i class="fa-solid fa-book" style="opacity:.55;"></i>
-                <span class="ow-widget-name">${escapeHtml(book)}</span>
+                <i class="fa-solid ${isCharBook ? 'fa-id-card' : 'fa-book'}" style="opacity:.55;"></i>
+                <span class="ow-widget-name">${escapeHtml(shownName)}</span>
+                ${isCharBook ? '<span class="ow-muted ow-widget-meta">受「设置→世界书→角色卡内嵌世界书」总开关控制</span>' : ''}
                 <span class="ow-muted ow-widget-meta">${onCount}/${list.length} 发送</span>
                 <span class="ow-spacer"></span>
                 <button class="ow-btn" data-action="wi-all" data-book="${escapeHtml(book)}">全选</button>
