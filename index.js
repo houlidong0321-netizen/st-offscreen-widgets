@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.2.0';
+    const EXT_VERSION = '2.2.1';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -613,13 +613,19 @@
 4. 严禁结构坍塌：每一个事件都必须写全分支，且每条分支都必须明确指向一个具体的事件编号，
    绝对禁止在后半段偷工减料省略分支。
 
-【关于"结局"的重要限制】
-- 本次生成的只是故事的一段推演，不等于故事就此完结。**绝对不要把最后几个事件当成大结局来写**，
-  也不要出现"至此尘埃落定""故事画上句号"这类收束性表述。
-- 默认情况下所有分支的 next 都必须指向一个具体的事件编号。矩阵末端的事件，其分支可以指向
-  **尚未展开的新事件编号**（即比当前已生成编号更大的号码，留作下次续写的接口），保持故事向前敞开。
-- 只有当【发展方向】中明确出现 HE 或 BE 时，才允许生成真正的结局节点，此时相应结局分支的
-  next 才可以填 "END"。没有指定 HE/BE 时，整张矩阵里不允许出现任何 "END"。
+【关于"结局"的规则（务必严格执行）】
+- 本次生成的是故事的**一个阶段**，不是整个故事的完结。
+- 每条分支线最终都必须收束到一个**阶段性开放结局**节点，绝不允许出现走不完、绕不出去的死循环。
+- "阶段性开放结局"的写法：该分支的 next 填 "OPEN"，并在 condition 里写清这一阶段收束在什么状态上。
+  它应当给人"一个段落告一段落，但两人的故事仍在继续"的感觉——留有余韵与新的悬念，
+  而不是"从此幸福/一切结束"式的彻底封盘。
+- 禁止悬空指向：每条分支的 next 只能是三种之一：
+  (a) 本次矩阵中**确实存在**的事件编号；
+  (b) "OPEN"（阶段性开放结局）；
+  (c) "END"（整个故事的最终结局）——仅在【发展方向】里明确出现 HE 或 BE 时才允许使用。
+  绝对不允许指向一个本次没有生成的编号，那会让剧情走进死路。
+- 允许事件之间回环跳转（如事件05的某分支回到事件02），但必须保证**从任何一个事件出发，
+  沿着任意分支走下去，都能在有限步内抵达 OPEN 或 END**，不能存在只在几个事件间无限打转的闭环。
 
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
@@ -627,7 +633,8 @@
 "trigger":"导火索(起)：如何在正文中自然触发","branches":[
 {"key":"A","condition":"若用户最终做出XX行为/决定","next":"02"},
 {"key":"B","condition":"若用户最终做出XX行为/决定","next":"03"}]}]}
-id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。next 必须是已存在或将要生成的事件 id，或 "END"。`;
+id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。
+next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开放结局）、或 "END"（仅在指定 HE/BE 时可用）。`;
 
     const DEFAULT_PLOT_INJECT_TEMPLATE = `[剧情推演·当前事件（隐藏指令，绝不可在正文中直接复述或提及本段存在）]
 当前所处事件：{{event_title}}
@@ -662,11 +669,11 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
             parts.push(`【发展方向】${dirs.join('、')}\n以下是每个方向的具体写作约束，必须严格遵守其中的"可以写/不可以写"：\n\n${detail}`);
             const hasEnding = active.some((d) => /^(he|be)$/i.test(d.name.trim()));
             parts.push(hasEnding
-                ? '【结局许可】本次已指定 HE/BE，允许在矩阵中生成真正的结局节点（对应分支 next 可填 "END"）。'
-                : '【结局限制】本次未指定 HE 或 BE，禁止生成任何结局节点，所有分支的 next 都必须指向具体事件编号，末端事件可指向尚未展开的新编号，保持故事敞开。');
+                ? '【结局许可】本次已指定 HE/BE，除了阶段性开放结局（next="OPEN"）外，也允许生成整个故事的最终结局节点（next="END"）。'
+                : '【结局许可】本次未指定 HE 或 BE，禁止使用 "END"。所有线路最终都收束到阶段性开放结局（next="OPEN"），给人"这一段落告一段落、故事仍在继续"的感觉。');
         } else {
             parts.push('【发展方向】（未指定，请根据现有剧情自行判断合适的走向）');
-            parts.push('【结局限制】未指定 HE 或 BE，禁止生成任何结局节点，所有分支的 next 都必须指向具体事件编号。');
+            parts.push('【结局许可】未指定 HE 或 BE，禁止使用 "END"。所有线路最终都收束到阶段性开放结局（next="OPEN"）。');
         }
         parts.push('【通用约束】所有事件必须基于正文与世界书中已经确立的人物、场所、关系推导，禁止凭空引入未出现过的重要角色或设定，禁止改变世界规则。');
         parts.push(`【要求生成的事件节点数量】至少 ${s.plot.minEvents} 个`);
@@ -675,11 +682,16 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
         const pl = chatData().plot;
         if (s.plot.sendCurrent && pl.events?.length) {
-            parts.push(`【已有事件矩阵（请在此基础上向后续写，保留已经走过的事件，扩展新的未来分支，不要重复已有内容）】\n${JSON.stringify({ events: pl.events, path: pl.path })}`);
-            parts.push('请基于以上信息续写并扩展网状事件矩阵。');
+            const cur = pl.currentId ? getPlotEvent(pl.currentId) : null;
+            const walked = pl.path.map((x) => `事件${x.eventId}→分支${x.branchKey}`).join('，') || '（尚未走过任何分支）';
+            parts.push(`【已有事件矩阵】\n${JSON.stringify({ events: pl.events, path: pl.path })}`);
+            parts.push(`【当前进度】已走过的路径：${walked}\n当前正处于：${cur ? `[事件${cur.id}] ${cur.title}` : '（上一阶段已收束于开放结局，尚未进入新事件）'}`);
+            parts.push(cur
+                ? `【续写要求】请以「当前正处于的事件」作为新矩阵的**第一个事件**（编号重新从 "01" 开始，内容沿用它的核心与导火索，可按最新剧情微调），然后从它往后续写全新的后续事件与分支。\n已经走过的旧事件不要再重复生成，只作为背景理解。`
+                : `【续写要求】上一阶段已收束，请从当前剧情状态出发，生成新一阶段的事件矩阵（编号重新从 "01" 开始），承接已走过的路径，不要重复旧事件。`);
         } else {
             if (pl.events?.length) log('debug', 'system', '已有推演未随本次请求发送（设置里「生成时发送当前推演」为关）——本次将重新生成一份全新矩阵。');
-            parts.push('请基于以上信息生成一份全新的网状事件矩阵。');
+            parts.push('【重写要求】请无视此前可能存在的任何推演，基于当前剧情重新生成一份全新的网状事件矩阵。');
         }
         return parts.join('\n\n');
     }
@@ -706,6 +718,48 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         return out;
     }
 
+    /**
+     * 校验事件矩阵：
+     *  1) 悬空指向——分支 next 指向了不存在的编号（模型最常犯的错，会让剧情走进死路）
+     *  2) 死循环——从某事件出发沿任意分支走都回不到 OPEN/END
+     * 悬空指向会被自动修正为 OPEN（阶段性开放结局），并写进日志。
+     */
+    function validateAndRepairPlot(events) {
+        const ids = new Set(events.map((e) => e.id));
+        const issues = { dangling: [], deadloop: [] };
+
+        for (const ev of events) {
+            for (const b of ev.branches) {
+                const nx = String(b.next || '').trim();
+                const up = nx.toUpperCase();
+                if (up === 'OPEN' || up === 'END') { b.next = up; continue; }
+                if (!nx || !ids.has(nx)) {
+                    issues.dangling.push(`事件${ev.id}/分支${b.key} → "${nx || '(空)'}"`);
+                    b.next = 'OPEN'; // 悬空一律收束为阶段性开放结局，避免走进死路
+                }
+            }
+        }
+
+        // 可达性：能在有限步内走到 OPEN/END 的事件集合
+        const canTerminate = new Set();
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const ev of events) {
+                if (canTerminate.has(ev.id)) continue;
+                const ok = ev.branches.some((b) => {
+                    const up = String(b.next).toUpperCase();
+                    return up === 'OPEN' || up === 'END' || canTerminate.has(b.next);
+                });
+                if (ok) { canTerminate.add(ev.id); changed = true; }
+            }
+        }
+        for (const ev of events) {
+            if (!canTerminate.has(ev.id)) issues.deadloop.push(ev.id);
+        }
+        return issues;
+    }
+
     async function generatePlot() {
         const s = settings();
         log('info', 'system', `开始生成剧情推演矩阵（方向：${plotDirections().join('、') || '未指定'}）`);
@@ -718,6 +772,19 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         if (!rows) throw new Error('响应 JSON 里没有找到 events 数组。');
         const events = normalizePlotEvents(rows);
         if (!events.length) throw new Error('解析出的事件列表为空。');
+
+        const issues = validateAndRepairPlot(events);
+        if (issues.dangling.length) {
+            log('warn', 'parse',
+                `模型生成了 ${issues.dangling.length} 条指向不存在事件的悬空分支，已自动改为"阶段性开放结局(OPEN)"，避免剧情走进死路。`,
+                issues.dangling);
+        }
+        if (issues.deadloop.length) {
+            log('warn', 'parse',
+                `这些事件沿任意分支走下去都无法抵达开放结局，可能形成死循环：${issues.deadloop.join('、')}。建议重新生成一次。`,
+                issues.deadloop);
+            toast(`推演里有 ${issues.deadloop.length} 个事件可能形成死循环，详见日志`, 'warning');
+        }
         const cd = chatData();
         cd.plot.events = events;
         if (!cd.plot.currentId || !events.some((e) => e.id === cd.plot.currentId)) {
@@ -759,13 +826,21 @@ id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分
         // 未走的分支置灰
         pl.deadBranches[eventId] = ev.branches.filter((b) => b.key !== branchKey).map((b) => b.key);
         pl.path.push({ eventId, branchKey, at: Date.now() });
-        const next = taken.next;
-        if (next && next.toUpperCase() !== 'END' && getPlotEvent(next)) {
+        const next = String(taken.next || '').trim();
+        const up = next.toUpperCase();
+        if (up === 'OPEN') {
+            pl.currentId = '';
+            log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 收束到「阶段性开放结局」。可在设置里打开「生成时发送当前推演」再点生成，从这里往后续写下一阶段。`);
+            toast('本阶段已收束于开放结局，可生成下一阶段推演', 'info');
+        } else if (up === 'END') {
+            pl.currentId = '';
+            log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 抵达故事最终结局（END）。`);
+        } else if (next && getPlotEvent(next)) {
             pl.currentId = next;
             log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 结束 → 进入事件 ${next}；分支 ${pl.deadBranches[eventId].join('/')} 已置灰`);
         } else {
             pl.currentId = '';
-            log('info', 'trigger', `剧情推进：事件 ${eventId} 经分支 ${branchKey} 结束 → 已抵达结局（next=${next || '空'}）`);
+            log('warn', 'trigger', `事件 ${eventId} 的分支 ${branchKey} 指向了不存在的 "${next}"，已按开放结局处理。`);
         }
         saveChatData();
         updateInjections();
@@ -2602,7 +2677,11 @@ ${innerHtml}
                     const bcls = ['ow-branch'];
                     if (isDead) bcls.push('ow-branch-dead');
                     if (wasTaken) bcls.push('ow-branch-taken');
-                    const nextLabel = !b.next ? '未指定' : (b.next.toUpperCase() === 'END' ? '结局' : `事件${b.next}`);
+                    const nx = String(b.next || '').toUpperCase();
+                    const nextLabel = !b.next ? '未指定'
+                        : nx === 'END' ? '最终结局'
+                        : nx === 'OPEN' ? '开放结局（可续写）'
+                        : `事件${b.next}`;
                     return `
                     <div class="${bcls.join(' ')}">
                       <span class="ow-branch-key">${escapeHtml(b.key)}</span>
