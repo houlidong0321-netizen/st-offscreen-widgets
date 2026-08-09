@@ -11,6 +11,126 @@
     const MODULE_NAME = 'offscreen_widgets';
     const ctx = () => SillyTavern.getContext();
 
+    // ------------------------------------------------------------------
+    // Git 仓库信息 / 更新检查
+    // 酒馆用 <script type="module"> 方式加载扩展入口文件（见酒馆源码 extensions.js 的
+    // addExtensionScript），module 脚本不会设置 document.currentScript（始终是 null），
+    // 但可以用 import.meta.url 可靠地拿到自己在磁盘上的安装路径，从而推导出调用酒馆内置的
+    // /api/extensions/version、/api/extensions/update 接口所需要的 extensionName 参数
+    // ——酒馆前端把这个参数拼成"third-party/<文件夹名>"后去掉字面量"third-party"这几个字符
+    // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
+    // ------------------------------------------------------------------
+    const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
+
+    function getExtensionIdParam() {
+        try {
+            const url = new URL(import.meta.url);
+            const match = url.pathname.match(/\/extensions\/(third-party\/[^/]+)\//);
+            if (match) return match[1].replace('third-party', '');
+        } catch (e) { /* 忽略，走回退值 */ }
+        return '/st-offscreen-widgets'; // 回退：按本仓库默认安装文件夹名推断
+    }
+    const EXTENSION_ID_PARAM = getExtensionIdParam();
+
+    // 更新状态缓存，供菜单角标 / 弹窗内横幅 / 设置页状态区共用，避免重复请求
+    const updateState = {
+        checked: false,
+        checking: false,
+        isUpToDate: true,
+        currentCommitHash: '',
+        currentBranchName: '',
+        remoteUrl: '',
+    };
+
+    async function checkExtensionUpdate({ quiet = false } = {}) {
+        if (updateState.checking) return updateState;
+        updateState.checking = true;
+        try {
+            const c = ctx();
+            const headers = c.getRequestHeaders ? c.getRequestHeaders() : { 'Content-Type': 'application/json' };
+            const res = await fetch('/api/extensions/version', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: false }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            updateState.checked = true;
+            updateState.isUpToDate = !!data.isUpToDate;
+            updateState.currentCommitHash = data.currentCommitHash || '';
+            updateState.currentBranchName = data.currentBranchName || '';
+            updateState.remoteUrl = data.remoteUrl || '';
+            if (!quiet) {
+                log('info', 'system', `扩展更新检查完成：${updateState.isUpToDate ? '已是最新版本' : '发现新版本'}（本地提交 ${updateState.currentCommitHash.slice(0, 7) || '未知'}）`, data);
+            }
+        } catch (err) {
+            log('warn', 'system', `检查扩展更新失败：${err.message || err}（extensionName=${EXTENSION_ID_PARAM}，若本扩展安装目录名与仓库名不同，可能需要在代码里调整回退值）`, err);
+        } finally {
+            updateState.checking = false;
+            updateMenuBadge();
+        }
+        return updateState;
+    }
+
+    async function performExtensionUpdate() {
+        const c = ctx();
+        log('info', 'system', `开始从仓库拉取扩展更新（extensionName=${EXTENSION_ID_PARAM}）…`);
+        const headers = c.getRequestHeaders ? c.getRequestHeaders() : { 'Content-Type': 'application/json' };
+        const res = await fetch('/api/extensions/update', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: false }),
+        });
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            throw new Error(`HTTP ${res.status} ${text.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        log('info', 'system', '扩展更新请求完成', data);
+        // 注意：/update 接口返回的 isUpToDate 表示"拉取前"是否已是最新（false = 刚刚真的拉取了新代码）
+        updateState.checked = true;
+        updateState.isUpToDate = true; // 拉取动作本身已让本地追平远端
+        if (data.shortCommitHash) updateState.currentCommitHash = data.shortCommitHash;
+        updateMenuBadge();
+        return data; // { isUpToDate, shortCommitHash, extensionPath, remoteUrl }
+    }
+
+    function updateMenuBadge() {
+        const $badge = $('#ow_menu_update_badge');
+        if (!$badge.length) return;
+        $badge.toggle(updateState.checked && !updateState.isUpToDate);
+    }
+
+    // 弹窗打开时，如果有更新，在标签页下方插入一条可操作的横幅（比设置页里的状态区更醒目）
+    function renderUpdateBanner($panelRoot) {
+        $panelRoot.find('#ow_update_banner').remove();
+        if (!updateState.checked || updateState.isUpToDate) return;
+        const $banner = $(`
+          <div id="ow_update_banner" class="ow-update-banner">
+            <span>🔔 检测到新版本（当前提交 ${escapeHtml((updateState.currentCommitHash || '').slice(0, 7) || '未知')}），可直接从仓库拉取更新。</span>
+            <span>
+              <button class="ow-btn ow-primary" id="ow_update_now_btn">立即更新</button>
+              <button class="ow-btn" id="ow_update_reload_btn" style="display:none;">刷新页面</button>
+            </span>
+          </div>`);
+        $panelRoot.find('.ow-tabs').after($banner);
+        $banner.find('#ow_update_now_btn').on('click', async function () {
+            const $btn = $(this);
+            $btn.prop('disabled', true).text('更新中…');
+            try {
+                const result = await performExtensionUpdate();
+                toast(`已更新到 ${result.shortCommitHash || '最新版本'}，需要刷新页面才能生效`, 'success');
+                $banner.find('span').first().text('✅ 已更新，刷新页面后生效。');
+                $btn.hide();
+                $banner.find('#ow_update_reload_btn').show();
+            } catch (err) {
+                toast(`更新失败：${err.message || err}，详见日志标签页`, 'error');
+                $btn.prop('disabled', false).text('立即更新');
+            }
+        });
+        $banner.find('#ow_update_reload_btn').on('click', () => location.reload());
+    }
+
     // 酒馆的 extension_prompt_types 枚举值（见 public/script.js），此处静态复制，
     // 避免额外导入。若未来酒馆更改枚举值，可在此处调整。
     const PROMPT_TYPES = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
@@ -83,6 +203,20 @@
         },
         api: { mode: 'system', url: '', key: '', model: '', modelList: [] },
         theme: { mode: 'system', customCss: '' },
+        prompts: {
+            widgetSystemPrompt: DEFAULT_WIDGET_SYSTEM_PROMPT,
+            offscreenSystemPrompt: DEFAULT_OFFSCREEN_SYSTEM_PROMPT,
+        },
+        // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
+        // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
+        worldInfoOverrides: {},
+        // 自动触发的细分开关：除了"检测到正文闭合标签"，还支持按楼层数（消息条数）独立触发
+        // 组件生成与镜头之外生成，两者的间隔互不影响。
+        autoTriggers: {
+            onContentTag: true,
+            widgetsByFloor: { enabled: false, interval: 5 },
+            offscreenByFloor: { enabled: false, interval: 10 },
+        },
     });
 
     function deepMergeDefaults(target, defaults) {
@@ -113,17 +247,25 @@
     // 每聊天数据（组件生成结果 / 镜头之外四张表）随存档保存
     function chatData() {
         const c = ctx();
-        const emptyOffscreen = () => ({ scheduleTable: [], characterTable: [], foreshadowTable: [], eventTable: [], updatedAt: null });
+        const emptyOffscreen = () => ({
+            scheduleTable: [], characterTable: [], sceneTable: [], itemAnchorTable: [],
+            timelineTable: [], foreshadowTable: [], updatedAt: null,
+        });
         if (!c.chatMetadata[MODULE_NAME]) {
-            c.chatMetadata[MODULE_NAME] = { widgetResults: {}, offscreen: emptyOffscreen() };
+            c.chatMetadata[MODULE_NAME] = { widgetResults: {}, offscreen: emptyOffscreen(), autoTriggerState: { lastWidgetFloor: 0, lastOffscreenFloor: 0 } };
         }
         if (!c.chatMetadata[MODULE_NAME].offscreen) {
             c.chatMetadata[MODULE_NAME].offscreen = emptyOffscreen();
         }
+        if (!c.chatMetadata[MODULE_NAME].autoTriggerState) {
+            c.chatMetadata[MODULE_NAME].autoTriggerState = { lastWidgetFloor: 0, lastOffscreenFloor: 0 };
+        }
         const off = c.chatMetadata[MODULE_NAME].offscreen;
-        // 兼容旧版本存档结构（曾经有 narrative 字段、缺少新表）
+        // 兼容旧版本存档结构（曾经有 narrative/event_table 字段，或缺少新表）
+        if (!Array.isArray(off.sceneTable)) off.sceneTable = [];
+        if (!Array.isArray(off.itemAnchorTable)) off.itemAnchorTable = [];
+        if (!Array.isArray(off.timelineTable)) off.timelineTable = [];
         if (!Array.isArray(off.foreshadowTable)) off.foreshadowTable = [];
-        if (!Array.isArray(off.eventTable)) off.eventTable = [];
         return c.chatMetadata[MODULE_NAME];
     }
 
@@ -144,7 +286,12 @@
     // ------------------------------------------------------------------
     // 框架提示词
     // ------------------------------------------------------------------
-    const WIDGET_SYSTEM_PROMPT =
+    // ------------------------------------------------------------------
+    // 提示词模块：把发送给模型的系统提示词做成可在设置里直接编辑的内容。
+    // 这里只保留"默认值"常量（用于首次初始化 / "恢复默认"按钮），
+    // 实际发送时一律从 settings().prompts 读取当前生效的文本。
+    // ------------------------------------------------------------------
+    const DEFAULT_WIDGET_SYSTEM_PROMPT =
         '你是一个为角色扮演聊天生成"侧边小组件"的助手。你的输出内容独立于正文剧情，' +
         '不会被写入正文，也不会推动主线，只是供用户把玩的附加视觉内容（例如虚构论坛帖子、' +
         '角色小传、番外短篇、状态面板等），因此可以自由发挥，但必须严格符合已建立的人设与世界观设定，' +
@@ -180,8 +327,21 @@
         return parts.join('\n\n');
     }
 
-    // 镜头之外：四张表的说明（不再使用"表X"编号标识，仅用表名）
-    const OFFSCREEN_TABLE_SPEC = `
+    // 镜头之外：六张表的说明（不使用"表X"编号标识，仅用表名）。
+    // 场景表 / 物品轨迹表严格遵循"正文触发原则"；角色表不受此原则约束；
+    // 日程表沿用自身原有的、允许合理推断的规则；核心待办事项表与伏笔表各自的
+    // 增删规则相互独立，不共用同一套清理标准。
+    const DEFAULT_OFFSCREEN_TABLE_SPEC = `
+# 总原则（务必先读）
+- "正文触发原则"仅适用于【场景表】与【物品轨迹表】：
+  · 正文中明确描写了变化 → 允许更新对应表格字段。
+  · 正文中未提及 → 必须原样保留上一版对应条目的所有字段，一字不改地照抄，不允许新增/删除/修改。
+  · 禁止基于逻辑推理、默认进程、或"应该发生了"而主动修改这两张表的状态。
+- 【角色表】不需要遵守"正文触发原则"，可以合理描写正文中不在场角色目前应该在做的事。
+- 【日程表】遵循自己小节内的规则（允许基于身份与时间点做合理推断/弹性填充），同样不受"正文触发原则"约束。
+- 六张表各自的生命周期（新增/更新/删除时机）互不相同、不共用一套标准，严格按各表小节内注明的规则执行，不要把某张表的清理逻辑套用到另一张表上。
+- 所有带编号的标签字段，输出时必须整体带上反引号"\`"符号，例如 \`[Scene_1]\`、\`[Item_Anchor_1]\`、\`[Chapter_1]\`、\`[Foreshadow_1]\`。
+
 ## 日程表
 列结构：角色 | 固定日程规律 | 时节性必然事件 | 弹性事务参考池
 本表只记录正文中尚未提及的角色日常生活信息。记录两类内容：因身份而必然存在的规律性/时节性事务，
@@ -198,34 +358,65 @@
 "对用户的态度"：用2-3个简写标签描述当前状态快照。
 不删除，永久保留，即使角色长期不出场也不清理；每次更新都应覆盖"当前位置与正在做的事"字段。
 
-## 伏笔与未来事件表
-列结构：事件内容 | 涉及角色 | 预计触发时间点/条件 | 铺垫说明
-记录正文中尚未描写、但基于已知信息合理推断"很可能在未来发生"的事件与伏笔想象，用于保持世界的连贯性与前瞻性，
-绝不能提前揭示正文中即将由用户或主角亲自经历、且会构成核心剧情转折的关键信息，只写背景性、氛围性的铺垫内容。
-"预计触发时间点/条件"：大致的时间窗口或触发条件描述，不要求精确。
-"铺垫说明"：为何据此推断该事件可能发生（例如伏笔线索、角色动机等）的简短说明。
-已经在正文中被实际触发/写明的事件应从本表中移除；仍未触发的可保留并随故事推进更新细节。
+## 场景表
+1. 收录标准：仅收录具备明确功能或剧情停留价值的室内/室外固定场所。不收录通道类，如马路、街道、走廊、过道、楼梯间。不收录建筑附属部件，如门、窗、墙（作为整体建筑的一部分即可，无需拆分"东门西门"）。不收录未发生任何剧情对话或动作的经过性地点。每次生成如发现之前收录过的条目不符合以上标准，请在此条中立即删除。
+2. 基本原则：做加法，不做覆盖。同一场景再次出现时，若正文补充了新细节，追加到对应字段。仅当同一特征出现前后矛盾的描写时，以最新描写为准，并删除旧内容。
+3. 失活清理规则（维护动作，不算脑补剧情变化，因此不受"正文触发原则"约束）：若某场景标签连续10章未在正文中出现，且当前"核心待办事项表"与"伏笔表"中均无条目指向该场景，下次生成场景表时直接删除该行，不需要正文给出"这个场景被放弃"的描写作为触发依据。若10章内再次出现或被其他表引用，则保留，计数清零重新计算。
+4. \`[Scene_X]\`：场景标签。X为阿拉伯数字，按场景首次出场顺序从1开始递增。
+5. 场景名称：只写一层整体空间，如"A的公寓""街角咖啡馆"。
+6. 地理位置/距离参照：参照物可用场景标签或通用地标。
+7. 建筑/环境构造细节：仅记录正文明确描写的客观物理存在。禁止写入依赖特定时间、天气、氛围的感官评价（如"灯光昏暗"）。当需要注明子空间时，在该字段内以"功能区：具体客观陈设"的格式追加，如："卧室：有一张双人床、嵌入式衣柜。"
+8. 用途：仅写正文中明确提及或被角色行为证实的绝对物理化用途（"A的住所""A常在此喝咖啡"）。禁止写功能性用途（"施压用场景"）。
+9. 未描写皆可为空，禁止想象、脑补。
 
-## 突发事件表
-列结构：事件内容 | 触发概率 | 影响范围/涉及角色 | 备注
-记录若干条"有一定概率会发生、但目前尚未发生"的突发事件清单，供世界保持鲜活感与不确定性。
-"触发概率"：填写"高/中/低"的大致概率描述即可，不需要给出具体数字。
-"影响范围/涉及角色"：说明该事件会波及哪些角色或场景范围。
-本表内容为参考池性质，允许定期整体刷新替换，不要求每条都真实发生。
+## 物品轨迹表
+1. 收录标准，仅收录满足以下任一条件的物品，其余物品一律不收录：
+   - 纪念意义：角色主动赠予、留存、珍藏的物品，或与角色重大过去强关联的信物。
+   - 剧情杠杆：对后文剧情发展可能产生关键影响的物品。
+   - 禁止收录手机，除非离开主人身边。如看到不合规的手机项，请在此条中立刻删掉。
+2. 终态判定（决定是否删除，两类物品判定标准不同）：
+   - 剧情杠杆类：该物品所关联的剧情段落明确结束后，下一轮删除该行。
+   - 纪念意义类：不因单段剧情结束而自动删除，仅当正文明确描写了不可逆的处置动作（被清走、被烧毁、被永久赠予且对方已带离场景、被明确证实无法找回）时，才视为终态，下一轮删除。若正文只描写了"扔进垃圾桶/藏起来/丢在某处"但未描写后续被清走或彻底销毁，视为"可逆位置"，继续保留追踪，位置字段照实填写当前所在处，不判定删除。
+3. \`[Item_Anchor_X]\`：物品编号标签。X为阿拉伯数字，按物品首次出场顺序从1开始递增。每个物品终身固定此标签，不可变更。
+4. 物品名称：必须包含可辨识的描述性特征，以便区分同类物品。当物品为虚拟物品，如照片、文件等，需要写清它的上一级物品，如"有着XX照片的XX的手机"，位置为手机的位置。
+5. 关联章节：该物品首次出现和移动的章节标签\`[Chapter_X]\`，可为多个（用顿号或逗号分隔）。
+6. 当前位置：记录物品此刻所在的绝对位置。角色持有写"A的口袋""B的手中"；场景内位置写"A书房抽屉\`[Scene_1]\`"。禁止自创场景标签，只能引用场景表中已存在的\`[Scene_X]\`标签。
+7. 状态：根据第2条终态判定，标注"留存"或"待删（下轮删除）"。
+
+## 核心待办事项表
+1. 收录范围：此表只追踪"尚未开始"的待办事项。一旦该事项在正文中开始发生（无论是持续几章还是持续几十章的长事件，如一场旅行），下一轮生成时立即将该行整行删除——事项进行中及之后的发展由正文本身、场景表、角色表自然承载，不再需要本表追踪，避免长事件反复累积关联章节标签。
+2. 更新原则：严格根据上一轮的待办表和本章新正文进行更新。若正文未推进任何待办进度，则完全继承旧表，不许妄动。
+3. 时间：必须对应到确切的日期与时间节点（例如：2023.11.06 14:00）。绝对禁止使用模糊表述（如"下周""明天""两个小时后"）。若无具体的时分刻度，必须填写"待定"或"全天"。
+4. 事项：简写清楚具体的任务或事件。
+5. 关联章节：只记录该事项**首次被提及/确立**的那一个章节标签\`[Chapter_X]\`，不随事项被反复提起而追加新标签——保留这一条是为了防止事项在很多章之前被提到过一次后就被遗忘，回看这一个标签即可定位起点。
+
+## 伏笔表
+1. 收录标准：正文中出现的、尚未解释清楚的异常细节、隐藏信息、角色未说明的反常举动或态度，均可收录。
+2. 更新原则：只在正文明确埋下新伏笔时新增，只在正文明确回收（谜底揭晓/信息被说明）时将状态改为"已回收"，已回收的伏笔在下一轮生成时整行删除。不因时间推移或长期未提及而清理——伏笔的价值就在于"很久不提也不能忘"，不受场景表那类失活清理规则约束。
+3. \`[Foreshadow_X]\`：伏笔标签。X为阿拉伯数字，按伏笔首次出现顺序从1开始递增。
+4. 内容：简要描述伏笔本身，需能让人一眼回忆起是什么事，不写"某某很奇怪"这类无信息量的记录。
+5. 埋设章节：该伏笔首次出现的章节标签\`[Chapter_X]\`。
+6. 状态：仅限"未回收""已回收"，已回收的行下一轮删除。
+
+## 关于"章节标签 \`[Chapter_X]\`"的说明
+若当前故事本身没有明确的"第X章"式章节划分，请你自行以连续递增的编号维护一套章节标签体系
+（例如可以按剧情自然段落划分），只要求前后编号保持一致、不重新编号已经分配过的章节即可，
+不强制要求与任何外部章节系统对齐。
 `.trim();
 
-    const OFFSCREEN_SYSTEM_PROMPT =
-        '你是一个为角色扮演故事维护"镜头之外"状态数据库的助手。正文没有描写、但此刻正在发生的各角色日常/工作/生活片段、' +
-        '对尚未发生的合理未来事件的想象与铺垫、以及若干条"有概率发生的突发事件"，都不再以自由叙述文字呈现，' +
-        '而是统一维护为下面四张结构化表格，方便用户直接查看与编辑。这些内容绝不能与正文已经确认的剧情冲突，' +
-        '也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折，只写背景性、氛围性的旁支内容。\n\n' +
-        '维护规则如下：\n' + OFFSCREEN_TABLE_SPEC + '\n\n' +
+    const DEFAULT_OFFSCREEN_SYSTEM_PROMPT =
+        '你是一个为角色扮演故事维护"镜头之外"状态数据库的助手。你需要维护六张结构化表格，方便用户直接查看与编辑。' +
+        '这些内容绝不能与正文已经确认的剧情冲突，也不能提前揭示正文尚未发生、但即将由用户或主角亲自经历的关键转折。\n\n' +
+        '维护规则如下：\n' + DEFAULT_OFFSCREEN_TABLE_SPEC + '\n\n' +
         '请仅输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：\n' +
         '{"schedule_table":[{"role":"","routine":"","seasonal":"","pool":""}],' +
         '"character_table":[{"name":"","alias":"","relation":"","location":"","attitude":""}],' +
-        '"foreshadow_table":[{"event":"","characters":"","timing":"","note":""}],' +
-        '"event_table":[{"event":"","probability":"","scope":"","note":""}]}\n' +
-        '四张表都需要在已有表格数据的基础上做增量更新（新增/修改/按规则删除过期条目），而不是每次全部推倒重写。';
+        '"scene_table":[{"tag":"`[Scene_1]`","name":"","location":"","structure":"","usage":""}],' +
+        '"item_anchor_table":[{"tag":"`[Item_Anchor_1]`","name":"","chapters":"","location":"","status":""}],' +
+        '"timeline_table":[{"time":"","task":"","chapter":"`[Chapter_1]`"}],' +
+        '"foreshadow_table":[{"tag":"`[Foreshadow_1]`","content":"","chapter":"`[Chapter_1]`","status":"未回收"}]}\n' +
+        '六张表都需要在已有表格数据的基础上按各自小节的规则更新（新增/修改/按规则删除），而不是每次全部推倒重写；' +
+        '未被规则要求变更的表格或行，请原样保留上一版数据。';
 
     function buildOffscreenUserPrompt(extras) {
         const parts = [];
@@ -233,15 +424,19 @@
         if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
         if (extras.charBook) parts.push(`【角色卡内嵌世界书参考】\n${extras.charBook}`);
         const existing = chatData().offscreen;
-        if (existing.scheduleTable?.length || existing.characterTable?.length || existing.foreshadowTable?.length || existing.eventTable?.length) {
-            parts.push(`【已有表格数据（请在此基础上增量更新，而不是从零重写）】\n${JSON.stringify({
+        const hasExisting = ['scheduleTable', 'characterTable', 'sceneTable', 'itemAnchorTable', 'timelineTable', 'foreshadowTable']
+            .some((k) => existing[k]?.length);
+        if (hasExisting) {
+            parts.push(`【已有表格数据（除"正文触发原则"要求变更的部分外，请原样保留，不要从零重写）】\n${JSON.stringify({
                 schedule_table: existing.scheduleTable,
                 character_table: existing.characterTable,
+                scene_table: existing.sceneTable,
+                item_anchor_table: existing.itemAnchorTable,
+                timeline_table: existing.timelineTable,
                 foreshadow_table: existing.foreshadowTable,
-                event_table: existing.eventTable,
             })}`);
         }
-        parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）生成或更新内容。');
+        parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成或更新以上六张表。');
         return parts.join('\n\n');
     }
 
@@ -257,28 +452,71 @@
             .join('\n');
     }
 
-    async function gatherWorldInfo() {
+    // 获取当前"已绑定/已激活"的世界书清单：全局勾选激活的世界书（读取酒馆世界书面板的
+    // 多选框 #world_info，因为该激活列表未通过 getContext() 暴露）、当前角色绑定的主世界书、
+    // 当前聊天绑定的聊天书。三者取并集去重。
+    function getBoundWorldInfoBookNames() {
         const c = ctx();
-        let text = '';
+        const names = new Set();
         try {
-            const names = new Set();
-            const chatBook = c.chatMetadata?.world_info;
-            if (chatBook) names.add(chatBook);
-            const char = c.characters?.[c.characterId];
-            const charBook = char?.data?.extensions?.world;
-            if (charBook) names.add(charBook);
-            for (const bookName of names) {
-                if (!bookName) continue;
+            const globalActive = $('#world_info').val();
+            if (Array.isArray(globalActive)) globalActive.forEach((n) => n && names.add(n));
+        } catch (e) { /* 面板可能尚未渲染，忽略 */ }
+        const chatBook = c.chatMetadata?.world_info;
+        if (chatBook) names.add(chatBook);
+        const char = c.characters?.[c.characterId];
+        const charBook = char?.data?.extensions?.world;
+        if (charBook) names.add(charBook);
+        return [...names].filter(Boolean);
+    }
+
+    // 拉取这些世界书里的全部条目，用于设置页里的"世界书/聊天书发送设置"管理列表
+    async function fetchWorldInfoEntriesForManagement() {
+        const c = ctx();
+        const bookNames = getBoundWorldInfoBookNames();
+        const result = [];
+        for (const bookName of bookNames) {
+            try {
                 const book = await c.loadWorldInfo(bookName);
                 const entries = book?.entries ? Object.values(book.entries) : [];
                 for (const e of entries) {
-                    if (e.disable) continue;
+                    result.push({
+                        book: bookName,
+                        uid: String(e.uid),
+                        label: e.comment || (Array.isArray(e.key) ? e.key.join('，') : '') || `条目#${e.uid}`,
+                        disabledInST: !!e.disable,
+                    });
+                }
+            } catch (err) {
+                log('warn', 'system', `读取世界书「${bookName}」失败：${err.message || err}`, err);
+            }
+        }
+        return result;
+    }
+
+    function isWorldInfoEntrySendEnabled(s, bookName, uidStr, disabledInST) {
+        const key = `${bookName}::${uidStr}`;
+        const override = s.worldInfoOverrides[key];
+        return override !== undefined ? override : !disabledInST;
+    }
+
+    async function gatherWorldInfo() {
+        const c = ctx();
+        const s = settings();
+        let text = '';
+        try {
+            const bookNames = getBoundWorldInfoBookNames();
+            for (const bookName of bookNames) {
+                const book = await c.loadWorldInfo(bookName);
+                const entries = book?.entries ? Object.values(book.entries) : [];
+                for (const e of entries) {
+                    if (!isWorldInfoEntrySendEnabled(s, bookName, String(e.uid), !!e.disable)) continue;
                     const label = e.comment || (Array.isArray(e.key) ? e.key.join(',') : '条目');
                     text += `【${bookName} - ${label}】\n${e.content}\n\n`;
                 }
             }
         } catch (err) {
-            console.warn('[镜头之外] 读取世界书失败', err);
+            log('warn', 'system', `读取世界书失败：${err.message || err}`, err);
         }
         return text.trim();
     }
@@ -423,7 +661,7 @@
         log('info', 'system', `开始生成组件「${widget.name}」`, { id: widget.id, prompt: widget.prompt });
         const extras = await gatherExtras();
         const userPrompt = buildWidgetUserPrompt(widget, extras);
-        const raw = await callModel(WIDGET_SYSTEM_PROMPT, userPrompt, `组件:${widget.name}`);
+        const raw = await callModel(settings().prompts.widgetSystemPrompt, userPrompt, `组件:${widget.name}`);
         const html = stripCodeFence(raw);
         const cd = chatData();
         cd.widgetResults[widget.id] = { html, updatedAt: Date.now() };
@@ -460,40 +698,30 @@
         const extras = await gatherExtras();
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
-            const raw = await callModel(OFFSCREEN_SYSTEM_PROMPT, userPrompt, '镜头之外');
+            const raw = await callModel(settings().prompts.offscreenSystemPrompt, userPrompt, '镜头之外');
             const parsed = tryParseJsonRobust(raw, '镜头之外');
             if (!parsed) {
-                throw new Error('未能从模型响应中解析出 JSON，两张表格因此没有更新。请在「日志」标签页查看完整响应内容，确认模型是否遵循了 JSON 格式要求。');
+                throw new Error('未能从模型响应中解析出 JSON，表格因此没有更新。请在「日志」标签页查看完整响应内容，确认模型是否遵循了 JSON 格式要求。');
             }
             if (typeof parsed !== 'object' || Array.isArray(parsed)) {
                 throw new Error(`解析出的内容不是预期的对象结构（实际类型：${Array.isArray(parsed) ? 'array' : typeof parsed}）`);
             }
             const cd = chatData();
             let changed = [];
-            if (Array.isArray(parsed.schedule_table)) {
-                cd.offscreen.scheduleTable = normalizeScheduleRows(parsed.schedule_table);
-                changed.push(`日程表(${cd.offscreen.scheduleTable.length}行)`);
-            } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 schedule_table 数组字段（日程表未更新）', parsed);
-            }
-            if (Array.isArray(parsed.character_table)) {
-                cd.offscreen.characterTable = normalizeCharacterRows(parsed.character_table);
-                changed.push(`角色表(${cd.offscreen.characterTable.length}行)`);
-            } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 character_table 数组字段（角色表未更新）', parsed);
-            }
-            if (Array.isArray(parsed.foreshadow_table)) {
-                cd.offscreen.foreshadowTable = normalizeForeshadowRows(parsed.foreshadow_table);
-                changed.push(`伏笔与未来事件表(${cd.offscreen.foreshadowTable.length}行)`);
-            } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 foreshadow_table 数组字段（伏笔与未来事件表未更新）', parsed);
-            }
-            if (Array.isArray(parsed.event_table)) {
-                cd.offscreen.eventTable = normalizeEventRows(parsed.event_table);
-                changed.push(`突发事件表(${cd.offscreen.eventTable.length}行)`);
-            } else {
-                log('warn', 'parse', '响应 JSON 中没有找到合法的 event_table 数组字段（突发事件表未更新）', parsed);
-            }
+            const applyTable = (jsonKey, storeKey, label, normalizeFn) => {
+                if (Array.isArray(parsed[jsonKey])) {
+                    cd.offscreen[storeKey] = normalizeFn(parsed[jsonKey]);
+                    changed.push(`${label}(${cd.offscreen[storeKey].length}行)`);
+                } else {
+                    log('warn', 'parse', `响应 JSON 中没有找到合法的 ${jsonKey} 数组字段（${label}未更新，本轮保留旧数据）`, parsed);
+                }
+            };
+            applyTable('schedule_table', 'scheduleTable', '日程表', normalizeScheduleRows);
+            applyTable('character_table', 'characterTable', '角色表', normalizeCharacterRows);
+            applyTable('scene_table', 'sceneTable', '场景表', normalizeSceneRows);
+            applyTable('item_anchor_table', 'itemAnchorTable', '物品轨迹表', normalizeItemAnchorRows);
+            applyTable('timeline_table', 'timelineTable', '核心待办事项表', normalizeTimelineRows);
+            applyTable('foreshadow_table', 'foreshadowTable', '伏笔表', normalizeForeshadowRows);
             cd.offscreen.updatedAt = Date.now();
             saveChatData();
             log('info', 'system', `「镜头之外」更新完成，已写入 chatMetadata.${MODULE_NAME}.offscreen：${changed.join('、') || '（无字段被更新，请检查上面的 parse 警告）'}`);
@@ -524,20 +752,37 @@
             attitude: r.attitude ?? r.态度 ?? r['对用户的态度'] ?? '',
         }));
     }
-    function normalizeForeshadowRows(rows) {
+    function normalizeSceneRows(rows) {
         return rows.map((r) => ({
-            event: r.event ?? r.事件 ?? r['事件内容'] ?? '',
-            characters: r.characters ?? r.涉及角色 ?? '',
-            timing: r.timing ?? r['预计触发时间点/条件'] ?? r.time ?? '',
-            note: r.note ?? r.铺垫说明 ?? r.说明 ?? '',
+            tag: r.tag ?? r.标签 ?? r['Scene标签'] ?? '',
+            name: r.name ?? r.场景名称 ?? '',
+            location: r.location ?? r['地理位置/距离参照'] ?? r.地理位置 ?? '',
+            structure: r.structure ?? r['建筑/环境构造细节'] ?? r.构造细节 ?? '',
+            usage: r.usage ?? r.用途 ?? '',
         }));
     }
-    function normalizeEventRows(rows) {
+    function normalizeItemAnchorRows(rows) {
         return rows.map((r) => ({
-            event: r.event ?? r.事件 ?? r['事件内容'] ?? '',
-            probability: r.probability ?? r.触发概率 ?? r.概率 ?? '',
-            scope: r.scope ?? r['影响范围/涉及角色'] ?? r.影响范围 ?? '',
-            note: r.note ?? r.备注 ?? '',
+            tag: r.tag ?? r.标签 ?? '',
+            name: r.name ?? r.物品名称 ?? '',
+            chapters: r.chapters ?? r.关联章节 ?? '',
+            location: r.location ?? r.当前位置 ?? '',
+            status: r.status ?? r.状态 ?? '',
+        }));
+    }
+    function normalizeTimelineRows(rows) {
+        return rows.map((r) => ({
+            time: r.time ?? r.时间 ?? '',
+            task: r.task ?? r.事项 ?? '',
+            chapter: r.chapter ?? r.关联章节 ?? '',
+        }));
+    }
+    function normalizeForeshadowRows(rows) {
+        return rows.map((r) => ({
+            tag: r.tag ?? r.标签 ?? '',
+            content: r.content ?? r.内容 ?? '',
+            chapter: r.chapter ?? r.埋设章节 ?? '',
+            status: r.status ?? r.状态 ?? '未回收',
         }));
     }
 
@@ -576,19 +821,72 @@
             log('debug', 'trigger', `消息#${messageId} 不是角色回复（is_user/is_system），跳过`);
             return;
         }
-        const matched = messageHasClosedContentTag(mes.mes);
-        log(matched ? 'info' : 'debug', 'trigger',
-            `消息#${messageId} <content> 标签检测：${matched ? '匹配成功，准备自动生成' : '未匹配到闭合标签，跳过'}`,
-            { mesPreview: String(mes.mes || '').slice(0, 500) });
-        if (!matched) return;
-        toast('检测到新正文，正在后台生成组件…', 'info');
-        try {
-            await runGenerationPipeline();
-            toast('自动生成流程结束（详情见日志标签页）', 'success');
-            refreshOpenPanels();
-        } catch (err) {
-            log('error', 'trigger', '自动生成流程抛出未捕获异常', err);
-            toast('组件生成出现错误，详见日志标签页', 'error');
+
+        const cd = chatData();
+        const at = cd.autoTriggerState;
+        const currentFloor = c.chat.length; // 以当前聊天总消息条数作为"楼层数"
+        let ranFullPipeline = false;
+
+        // 触发方式一：检测正文闭合标签（命中则组件与镜头之外一起触发，行为与之前一致）
+        if (s.autoTriggers.onContentTag) {
+            const matched = messageHasClosedContentTag(mes.mes);
+            log(matched ? 'info' : 'debug', 'trigger',
+                `[标签触发] 消息#${messageId}（当前楼层${currentFloor}）<content> 标签检测：${matched ? '匹配成功，准备自动生成' : '未匹配到闭合标签'}`,
+                { mesPreview: String(mes.mes || '').slice(0, 500) });
+            if (matched) {
+                toast('检测到新正文，正在后台生成…', 'info');
+                try {
+                    await runGenerationPipeline();
+                    ranFullPipeline = true;
+                    at.lastWidgetFloor = currentFloor;
+                    at.lastOffscreenFloor = currentFloor;
+                    saveChatData();
+                    toast('自动生成流程结束（详情见日志标签页）', 'success');
+                    refreshOpenPanels();
+                } catch (err) {
+                    log('error', 'trigger', '[标签触发] 自动生成流程抛出未捕获异常', err);
+                    toast('组件生成出现错误，详见日志标签页', 'error');
+                }
+            }
+        }
+
+        // 触发方式二/三：按楼层数独立触发（标签触发已经跑过完整流程时，本轮不再重复触发，
+        // 并顺带把楼层计数对齐到当前楼层，避免紧接着又立刻因楼层到量而重复生成一次）
+        if (!ranFullPipeline) {
+            if (s.autoTriggers.widgetsByFloor?.enabled) {
+                const interval = Math.max(1, Number(s.autoTriggers.widgetsByFloor.interval) || 1);
+                const delta = currentFloor - (at.lastWidgetFloor || 0);
+                log('debug', 'trigger', `[组件楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta}层，间隔设置${interval}层`);
+                if (delta >= interval) {
+                    log('info', 'trigger', `[组件楼层触发] 达到间隔，自动生成组件`);
+                    try {
+                        await generateAllWidgets();
+                        at.lastWidgetFloor = currentFloor;
+                        saveChatData();
+                        refreshOpenPanels();
+                    } catch (err) {
+                        log('error', 'trigger', '[组件楼层触发] 生成失败', err);
+                        toast('按楼层自动生成组件时出错，详见日志标签页', 'error');
+                    }
+                }
+            }
+            if (s.offscreen.enabled && s.autoTriggers.offscreenByFloor?.enabled) {
+                const interval2 = Math.max(1, Number(s.autoTriggers.offscreenByFloor.interval) || 1);
+                const delta2 = currentFloor - (at.lastOffscreenFloor || 0);
+                log('debug', 'trigger', `[镜头之外楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta2}层，间隔设置${interval2}层`);
+                if (delta2 >= interval2) {
+                    log('info', 'trigger', `[镜头之外楼层触发] 达到间隔，自动生成镜头之外`);
+                    try {
+                        await generateOffscreen();
+                        at.lastOffscreenFloor = currentFloor;
+                        saveChatData();
+                        refreshOpenPanels();
+                    } catch (err) {
+                        log('error', 'trigger', '[镜头之外楼层触发] 生成失败', err);
+                        toast('按楼层自动生成镜头之外时出错，详见日志标签页', 'error');
+                    }
+                }
+            }
         }
     }
 
@@ -642,11 +940,17 @@
         if (off.characterTable?.length) {
             parts.push('角色表：\n' + off.characterTable.map((r) => `- ${r.name}（${r.alias || '—'}）｜关系:${r.relation || '—'}｜${r.location || '—'}｜态度:${r.attitude || '—'}`).join('\n'));
         }
-        if (off.foreshadowTable?.length) {
-            parts.push('伏笔与未来事件表：\n' + off.foreshadowTable.map((r) => `- ${r.event}｜涉及:${r.characters || '—'}｜时机:${r.timing || '—'}｜${r.note || ''}`).join('\n'));
+        if (off.sceneTable?.length) {
+            parts.push('场景表：\n' + off.sceneTable.map((r) => `- ${r.tag} ${r.name}｜${r.location || '—'}｜${r.structure || '—'}｜${r.usage || '—'}`).join('\n'));
         }
-        if (off.eventTable?.length) {
-            parts.push('突发事件表：\n' + off.eventTable.map((r) => `- ${r.event}｜概率:${r.probability || '—'}｜范围:${r.scope || '—'}｜${r.note || ''}`).join('\n'));
+        if (off.itemAnchorTable?.length) {
+            parts.push('物品轨迹表：\n' + off.itemAnchorTable.map((r) => `- ${r.tag} ${r.name}｜${r.chapters || '—'}｜${r.location || '—'}｜${r.status || '—'}`).join('\n'));
+        }
+        if (off.timelineTable?.length) {
+            parts.push('核心待办事项表：\n' + off.timelineTable.map((r) => `- ${r.time}｜${r.task}｜${r.chapter || '—'}`).join('\n'));
+        }
+        if (off.foreshadowTable?.length) {
+            parts.push('伏笔表：\n' + off.foreshadowTable.map((r) => `- ${r.tag} ${r.content}｜${r.chapter || '—'}｜${r.status || '未回收'}`).join('\n'));
         }
         return parts.join('\n\n');
     }
@@ -708,11 +1012,15 @@
             <div class="ow-tabs">
               <div class="ow-tab active" data-tab="widgets">组件生成</div>
               <div class="ow-tab" data-tab="offscreen">镜头之外</div>
+              <div class="ow-tab" data-tab="worldinfo">世界书</div>
+              <div class="ow-tab" data-tab="prompts">提示词</div>
               <div class="ow-tab" data-tab="settings">设置</div>
               <div class="ow-tab" data-tab="log">日志<span class="ow-log-badge" id="ow_log_badge" style="display:none;"></span></div>
             </div>
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
+            <div class="ow-panel" data-panel="worldinfo"></div>
+            <div class="ow-panel" data-panel="prompts"></div>
             <div class="ow-panel" data-panel="settings"></div>
             <div class="ow-panel" data-panel="log"></div>
           </div>
@@ -732,10 +1040,20 @@
         applyTheme();
         renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
+        renderWorldInfoPanel($modal.find('.ow-panel[data-panel="worldinfo"]'));
+        renderPromptsPanel($modal.find('.ow-panel[data-panel="prompts"]'));
         renderSettingsPanel($modal.find('.ow-panel[data-panel="settings"]'));
         $logPanel = $modal.find('.ow-panel[data-panel="log"]');
         renderLogEntries($logPanel);
         log('info', 'ui', '主界面已打开');
+
+        // 每次打开都重新检查一次更新（有缓存也无妨，请求很轻量），完成后刷新横幅/设置页状态/菜单角标
+        checkExtensionUpdate().then(() => {
+            if (!$modal) return;
+            renderUpdateBanner($modal);
+            const $panel = $modal.find('.ow-panel[data-panel="settings"]');
+            if ($panel.find('#ow_update_status').length) renderUpdateSection($panel);
+        });
     }
 
     function closeModal() {
@@ -1097,25 +1415,48 @@
             ],
         },
         {
-            key: 'foreshadowTable',
-            title: '伏笔与未来事件表',
-            rowFactory: () => ({ event: '', characters: '', timing: '', note: '' }),
+            key: 'sceneTable',
+            title: '场景表',
+            rowFactory: () => ({ tag: '', name: '', location: '', structure: '', usage: '' }),
             columns: [
-                { field: 'event', label: '事件内容' },
-                { field: 'characters', label: '涉及角色' },
-                { field: 'timing', label: '预计触发时间点/条件' },
-                { field: 'note', label: '铺垫说明' },
+                { field: 'tag', label: '标签' },
+                { field: 'name', label: '场景名称' },
+                { field: 'location', label: '地理位置/距离参照' },
+                { field: 'structure', label: '建筑/环境构造细节' },
+                { field: 'usage', label: '用途' },
             ],
         },
         {
-            key: 'eventTable',
-            title: '突发事件表',
-            rowFactory: () => ({ event: '', probability: '', scope: '', note: '' }),
+            key: 'itemAnchorTable',
+            title: '物品轨迹表',
+            rowFactory: () => ({ tag: '', name: '', chapters: '', location: '', status: '' }),
             columns: [
-                { field: 'event', label: '事件内容' },
-                { field: 'probability', label: '触发概率' },
-                { field: 'scope', label: '影响范围/涉及角色' },
-                { field: 'note', label: '备注' },
+                { field: 'tag', label: '标签' },
+                { field: 'name', label: '物品名称' },
+                { field: 'chapters', label: '关联章节' },
+                { field: 'location', label: '当前位置' },
+                { field: 'status', label: '状态' },
+            ],
+        },
+        {
+            key: 'timelineTable',
+            title: '核心待办事项表',
+            rowFactory: () => ({ time: '', task: '', chapter: '' }),
+            columns: [
+                { field: 'time', label: '时间' },
+                { field: 'task', label: '事项' },
+                { field: 'chapter', label: '关联章节' },
+            ],
+        },
+        {
+            key: 'foreshadowTable',
+            title: '伏笔表',
+            rowFactory: () => ({ tag: '', content: '', chapter: '', status: '未回收' }),
+            columns: [
+                { field: 'tag', label: '标签' },
+                { field: 'content', label: '内容' },
+                { field: 'chapter', label: '埋设章节' },
+                { field: 'status', label: '状态' },
             ],
         },
     ];
@@ -1202,13 +1543,170 @@
     }
 
     // ---------------- 设置面板 ----------------
+    // ---------------- 关于/更新区块 ----------------
+    function renderUpdateSection($panel) {
+        const $status = $panel.find('#ow_update_status');
+        if (!$status.length) return;
+        if (!updateState.checked) {
+            $status.html('尚未检查，或检查失败——详情见"日志"标签页。可能是网络问题，或本扩展安装方式不是通过 Git 地址（无法使用酒馆内置的自动更新接口）。');
+            return;
+        }
+        const shortHash = (updateState.currentCommitHash || '').slice(0, 7);
+        if (!shortHash) {
+            $status.html('未能识别为 Git 仓库（可能不是通过 Git 地址安装的，或安装目录被移动过），无法自动检查/更新，请通过酒馆「扩展」面板手动管理，或重新用仓库地址安装。');
+            return;
+        }
+        if (updateState.isUpToDate) {
+            $status.html(`✅ 已是最新版本（当前提交 ${escapeHtml(shortHash)}${updateState.currentBranchName ? `，分支 ${escapeHtml(updateState.currentBranchName)}` : ''}）`);
+            updateMenuBadge();
+        } else {
+            $status.html(`⚠️ 发现新版本可更新（当前提交 ${escapeHtml(shortHash)}） <button class="ow-btn ow-primary" id="ow_do_update" style="margin-left:6px;">立即更新</button>`);
+            $panel.find('#ow_do_update').on('click', async function () {
+                const $btn = $(this);
+                $btn.prop('disabled', true).text('更新中…');
+                try {
+                    const result = await performExtensionUpdate();
+                    toast(`已更新到 ${result.shortCommitHash || '最新版本'}，需要刷新页面才能生效`, 'success');
+                    if (confirm('扩展已更新完成，是否立即刷新页面以应用更新？')) {
+                        location.reload();
+                    } else {
+                        $status.html(`✅ 已更新到 ${escapeHtml(result.shortCommitHash || '')}，请记得手动刷新页面`);
+                        updateMenuBadge();
+                        if ($modal) renderUpdateBanner($modal);
+                    }
+                } catch (err) {
+                    toast(`更新失败：${err.message || err}，详见日志标签页`, 'error');
+                    $btn.prop('disabled', false).text('立即更新');
+                }
+            });
+            updateMenuBadge();
+        }
+    }
+
+    // ---------------- 世界书 / 聊天书发送设置面板 ----------------
+    function renderWorldInfoPanel($panel) {
+        $panel.html(`
+        <div class="ow-row">
+          <button class="ow-btn ow-primary" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 拉取/刷新条目列表</button>
+          <button class="ow-btn" id="ow_wi_reset">全部恢复默认（跟随酒馆启用状态）</button>
+        </div>
+        <div class="ow-hint">
+          当前识别到的世界书/聊天书：<span id="ow_wi_book_names">（点击上方按钮拉取）</span><br>
+          默认发送"当前处于启用状态"的条目（即该条目在酒馆世界书编辑器里没有被禁用）。你可以在下面为每个条目
+          单独覆盖是否要在生成组件/镜头之外时随行发送——覆盖只影响本扩展的发送行为，不会改变酒馆世界书本身的启用状态。
+          识别范围包括：酒馆世界书面板里当前勾选激活的全局世界书、当前角色绑定的主世界书、当前聊天绑定的聊天书。
+        </div>
+        <div id="ow_wi_entry_list"></div>`);
+
+        $panel.find('#ow_wi_refresh').on('click', () => loadAndRenderWorldInfoEntries($panel));
+        $panel.find('#ow_wi_reset').on('click', () => {
+            if (!confirm('确定清空所有手动覆盖，恢复为"跟随酒馆启用状态"吗？')) return;
+            settings().worldInfoOverrides = {};
+            saveSettings();
+            log('info', 'ui', '已清空世界书发送覆盖设置');
+            loadAndRenderWorldInfoEntries($panel);
+        });
+
+        loadAndRenderWorldInfoEntries($panel);
+    }
+
+    async function loadAndRenderWorldInfoEntries($panel) {
+        const s = settings();
+        const $list = $panel.find('#ow_wi_entry_list');
+        $list.html('<div class="ow-empty">加载中…</div>');
+        const bookNames = getBoundWorldInfoBookNames();
+        $panel.find('#ow_wi_book_names').text(bookNames.length ? bookNames.join('、') : '（未识别到任何已激活的世界书/聊天书）');
+        if (!bookNames.length) {
+            $list.html('<div class="ow-empty">当前没有识别到激活的世界书，也没有绑定聊天书。请先在酒馆的"世界书"面板里勾选要启用的世界书，或为当前聊天绑定聊天书。</div>');
+            return;
+        }
+        const entries = await fetchWorldInfoEntriesForManagement();
+        log('debug', 'system', `世界书管理列表拉取到 ${entries.length} 条条目，来自 ${bookNames.length} 本书`, bookNames);
+        if (!entries.length) {
+            $list.html('<div class="ow-empty">识别到的世界书里没有任何条目。</div>');
+            return;
+        }
+        const byBook = {};
+        for (const e of entries) (byBook[e.book] = byBook[e.book] || []).push(e);
+
+        let html = '';
+        for (const [book, list] of Object.entries(byBook)) {
+            html += `<div class="ow-section-title">${escapeHtml(book)}</div>`;
+            for (const e of list) {
+                const checked = isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST);
+                html += `<div class="ow-preset-entry" style="padding:4px 0;">
+                    <input type="checkbox" class="ow-wi-entry-toggle" data-book="${escapeHtml(e.book)}" data-uid="${escapeHtml(e.uid)}" ${checked ? 'checked' : ''}>
+                    <label>${escapeHtml(e.label)}${e.disabledInST ? ' <span class="ow-muted">（在酒馆中已禁用）</span>' : ''}</label>
+                </div>`;
+            }
+        }
+        $list.html(html);
+        $list.off('change', '.ow-wi-entry-toggle').on('change', '.ow-wi-entry-toggle', function () {
+            const book = $(this).data('book');
+            const uidStr = String($(this).data('uid'));
+            s.worldInfoOverrides[`${book}::${uidStr}`] = $(this).is(':checked');
+            saveSettings();
+        });
+    }
+
+    // ---------------- 提示词面板 ----------------
+    function renderPromptsPanel($panel) {
+        const s = settings();
+        $panel.html(`
+        <div class="ow-hint">这里是实际发送给模型的系统提示词原文，直接编辑即可自动保存生效，不需要修改扩展代码就能微调措辞。</div>
+
+        <div class="ow-section-title">组件生成提示词</div>
+        <div class="ow-row"><button class="ow-btn" id="ow_prompt_widget_reset">恢复默认</button></div>
+        <textarea class="ow-textarea" id="ow_prompt_widget" style="min-height:220px;">${escapeHtml(s.prompts.widgetSystemPrompt)}</textarea>
+
+        <div class="ow-section-title">镜头之外 / 表格生成提示词</div>
+        <div class="ow-row"><button class="ow-btn" id="ow_prompt_offscreen_reset">恢复默认</button></div>
+        <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:360px;">${escapeHtml(s.prompts.offscreenSystemPrompt)}</textarea>`);
+
+        $panel.find('#ow_prompt_widget').on('input', function () {
+            s.prompts.widgetSystemPrompt = $(this).val();
+            saveSettings();
+        });
+        $panel.find('#ow_prompt_widget_reset').on('click', function () {
+            if (!confirm('确定恢复"组件生成提示词"为默认内容吗？当前编辑内容会被覆盖。')) return;
+            s.prompts.widgetSystemPrompt = DEFAULT_WIDGET_SYSTEM_PROMPT;
+            saveSettings();
+            renderPromptsPanel($panel);
+        });
+
+        $panel.find('#ow_prompt_offscreen').on('input', function () {
+            s.prompts.offscreenSystemPrompt = $(this).val();
+            saveSettings();
+        });
+        $panel.find('#ow_prompt_offscreen_reset').on('click', function () {
+            if (!confirm('确定恢复"镜头之外/表格生成提示词"为默认内容吗？当前编辑内容会被覆盖。')) return;
+            s.prompts.offscreenSystemPrompt = DEFAULT_OFFSCREEN_SYSTEM_PROMPT;
+            saveSettings();
+            renderPromptsPanel($panel);
+        });
+    }
+
     function renderSettingsPanel($panel) {
         const s = settings();
         const html = `
         <div class="ow-section-title">触发方式</div>
         <div class="ow-row">
           <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动（点击生成按钮）</label>
-          <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动（检测到新回复中出现完整 &lt;content&gt;…&lt;/content&gt; 时触发）</label>
+          <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
+        </div>
+        <div class="ow-col" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'} padding-left:4px;">
+          <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到新回复中出现完整 &lt;content&gt;…&lt;/content&gt; 时触发（同时生成组件与镜头之外）</label>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 组件每
+              <input type="number" class="ow-input" id="ow_auto_widget_floor_n" style="width:60px;margin:0 4px;" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">
+            楼层自动生成一次</label>
+          </div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''}> 镜头之外每
+              <input type="number" class="ow-input" id="ow_auto_offscreen_floor_n" style="width:60px;margin:0 4px;" min="1" value="${s.autoTriggers.offscreenByFloor.interval}">
+            楼层自动生成一次（需先在"镜头之外"标签页里启用该功能）</label>
+          </div>
+          <div class="ow-hint">"楼层"按当前聊天的总消息条数计算，三种触发方式可以同时开启、互不冲突；标签触发命中的那一轮不会与楼层触发重复生成。</div>
         </div>
 
         <div class="ow-section-title">发送时携带的上下文</div>
@@ -1219,7 +1717,7 @@
           </label>
         </div>
         <div class="ow-row">
-          <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送当前角色/聊天绑定的世界书全文</label>
+          <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书/聊天书条目（具体收发哪些书、哪些条目，去"世界书"标签页管理）</label>
           <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 随行发送角色卡内嵌世界书全文</label>
         </div>
 
@@ -1279,10 +1777,39 @@
           <textarea class="ow-textarea" id="ow_theme_css" style="min-height:100px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
           <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
         </div>
+
+        <div class="ow-section-title">关于 / 更新</div>
+        <div class="ow-row">
+          <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;">
+            <i class="fa-brands fa-github"></i> 在 GitHub 上查看仓库
+          </a>
+          <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
+        </div>
+        <div id="ow_update_status" class="ow-hint">尚未检查</div>
         `;
         $panel.html(html);
+        renderUpdateSection($panel);
 
-        $panel.find('input[name="ow_trigger"]').on('change', function () { s.triggerMode = $(this).val(); saveSettings(); });
+        $panel.find('#ow_check_update').on('click', async function () {
+            const $btn = $(this);
+            $btn.prop('disabled', true);
+            $panel.find('#ow_update_status').text('检查中…');
+            await checkExtensionUpdate();
+            $btn.prop('disabled', false);
+            renderUpdateSection($panel);
+            if ($modal) renderUpdateBanner($modal);
+        });
+
+        $panel.find('input[name="ow_trigger"]').on('change', function () {
+            s.triggerMode = $(this).val();
+            saveSettings();
+            $panel.find('#ow_auto_trigger_fields').toggle(s.triggerMode === 'auto');
+        });
+        $panel.find('#ow_auto_content_tag').on('change', function () { s.autoTriggers.onContentTag = $(this).is(':checked'); saveSettings(); });
+        $panel.find('#ow_auto_widget_floor').on('change', function () { s.autoTriggers.widgetsByFloor.enabled = $(this).is(':checked'); saveSettings(); });
+        $panel.find('#ow_auto_widget_floor_n').on('change', function () { s.autoTriggers.widgetsByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
+        $panel.find('#ow_auto_offscreen_floor').on('change', function () { s.autoTriggers.offscreenByFloor.enabled = $(this).is(':checked'); saveSettings(); });
+        $panel.find('#ow_auto_offscreen_floor_n').on('change', function () { s.autoTriggers.offscreenByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_include_wi').on('change', function () { s.includeWorldInfo = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_include_cb').on('change', function () { s.includeCharBook = $(this).is(':checked'); saveSettings(); });
@@ -1342,9 +1869,11 @@
           <div id="ow_menu_button" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
             <i class="fa-solid fa-clapperboard"></i>
             <span>镜头之外 / 组件生成</span>
+            <span id="ow_menu_update_badge" class="ow-log-badge" style="display:none;" title="有新版本可更新">NEW</span>
           </div>`);
         $('#extensionsMenu').append($btn);
         $btn.on('click', openModal);
+        updateMenuBadge();
     }
 
     function waitForMenu(retries = 30) {
@@ -1367,6 +1896,7 @@
                 refreshOpenPanels();
             });
             log('info', 'system', '扩展初始化完成');
+            checkExtensionUpdate({ quiet: true }); // 静默检查一次，让菜单角标能在不打开弹窗时也生效
         } catch (err) {
             log('error', 'system', '初始化失败', err);
         }

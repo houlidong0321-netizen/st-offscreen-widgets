@@ -225,6 +225,18 @@
     margin-left: 4px;
 }
 
+.ow-update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 14px;
+    background: rgba(58, 110, 165, 0.18);
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    font-size: 0.86em;
+    flex: 0 0 auto;
+}
+
 .ow-spin {
     display: inline-block;
     animation: ow-spin 1s linear infinite;
