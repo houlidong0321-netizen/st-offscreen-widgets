@@ -1349,12 +1349,26 @@
         });
 
         applyTheme();
-        renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
-        renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
-        renderFavoritesPanel($modal.find('.ow-panel[data-panel="favorites"]'));
-        renderWorldInfoPanel($modal.find('.ow-panel[data-panel="worldinfo"]'));
-        renderPromptsPanel($modal.find('.ow-panel[data-panel="prompts"]'));
-        renderSettingsPanel($modal.find('.ow-panel[data-panel="settings"]'));
+        // 每个面板单独 try/catch：任何一个面板出错都不能连累后面的面板变成空白
+        // （曾经因为一个 ReferenceError，导致它之后的四个标签页全是空的）
+        const panels = [
+            ['widgets', renderWidgetsPanel],
+            ['offscreen', renderOffscreenPanel],
+            ['favorites', renderFavoritesPanel],
+            ['worldinfo', renderWorldInfoPanel],
+            ['prompts', renderPromptsPanel],
+            ['settings', renderSettingsPanel],
+        ];
+        for (const [name, fn] of panels) {
+            const $p = $modal.find(`.ow-panel[data-panel="${name}"]`);
+            try {
+                fn($p);
+            } catch (err) {
+                log('error', 'ui', `渲染「${name}」面板失败：${err.message || err}`, err);
+                $p.html(`<div class="ow-empty">这个面板渲染出错了：<br><code>${escapeHtml(String(err.message || err))}</code><br>
+                    <span class="ow-muted">其他面板不受影响。详细堆栈见「日志」标签页。</span></div>`);
+            }
+        }
         $logPanel = $modal.find('.ow-panel[data-panel="log"]');
         renderLogEntries($logPanel);
         refreshGeneratingIndicator();
@@ -2118,6 +2132,163 @@ ${innerHtml}
             });
             updateMenuBadge();
         }
+    }
+
+    // ---------------- 世界书 / 聊天书发送设置面板 ----------------
+    function renderWorldInfoPanel($panel) {
+        $panel.html(`
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <button class="ow-btn ow-primary" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 刷新条目</button>
+            <span class="ow-muted">来源：<span id="ow_wi_book_names">—</span></span>
+          </div>
+          <button class="ow-btn" id="ow_wi_reset">恢复默认</button>
+        </div>
+        <div class="ow-hint">默认跟随条目在酒馆中的启用状态；此处改动只影响本扩展，不改酒馆世界书。需在「设置 → 世界书」勾选后才会实际发送。</div>
+        <div id="ow_wi_entry_list"></div>`);
+
+        $panel.find('#ow_wi_refresh').on('click', () => loadAndRenderWorldInfoEntries($panel));
+        $panel.find('#ow_wi_reset').on('click', () => {
+            if (!confirm('确定清空所有手动覆盖，恢复为“跟随酒馆启用状态”吗？')) return;
+            settings().worldInfoOverrides = {};
+            saveSettings();
+            log('info', 'ui', '已清空世界书发送覆盖设置');
+            loadAndRenderWorldInfoEntries($panel);
+        });
+
+        loadAndRenderWorldInfoEntries($panel);
+    }
+
+    async function loadAndRenderWorldInfoEntries($panel) {
+        const s = settings();
+        const $list = $panel.find('#ow_wi_entry_list');
+        $list.html('<div class="ow-empty">加载中…</div>');
+        let bookNames = [];
+        try {
+            bookNames = getBoundWorldInfoBookNames();
+        } catch (err) {
+            log('error', 'system', `识别世界书失败：${err.message || err}`, err);
+            $list.html('<div class="ow-empty">识别世界书时出错，详见日志标签页。</div>');
+            return;
+        }
+        $panel.find('#ow_wi_book_names').text(bookNames.length ? bookNames.join('、') : '（未识别到已激活的世界书/聊天书）');
+        if (!bookNames.length) {
+            $list.html('<div class="ow-empty">没有识别到激活的世界书，也没有绑定聊天书。<br>请先在酒馆「世界书」面板勾选要启用的世界书，或为当前聊天绑定聊天书。</div>');
+            return;
+        }
+        let entries = [];
+        try {
+            entries = await fetchWorldInfoEntriesForManagement();
+        } catch (err) {
+            log('error', 'system', `读取世界书条目失败：${err.message || err}`, err);
+            $list.html('<div class="ow-empty">读取条目失败，详见日志标签页。</div>');
+            return;
+        }
+        log('debug', 'system', `世界书管理列表拉取到 ${entries.length} 条条目，来自 ${bookNames.length} 本书`, bookNames);
+        if (!entries.length) {
+            $list.html('<div class="ow-empty">识别到的世界书里没有任何条目。</div>');
+            return;
+        }
+        const byBook = {};
+        for (const e of entries) (byBook[e.book] = byBook[e.book] || []).push(e);
+
+        let html = '';
+        for (const [book, list] of Object.entries(byBook)) {
+            const onCount = list.filter((e) => isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)).length;
+            html += `
+            <div class="ow-widget-card" data-book="${escapeHtml(book)}">
+              <div class="ow-widget-card-head">
+                <i class="fa-solid fa-book" style="opacity:.55;"></i>
+                <span class="ow-widget-name">${escapeHtml(book)}</span>
+                <span class="ow-muted ow-widget-meta">${onCount}/${list.length} 发送</span>
+                <span class="ow-spacer"></span>
+                <button class="ow-btn" data-action="wi-all" data-book="${escapeHtml(book)}">全选</button>
+                <button class="ow-btn" data-action="wi-none" data-book="${escapeHtml(book)}">全不选</button>
+              </div>
+              <div class="ow-widget-card-body">
+                ${list.map((e) => `
+                  <div class="ow-preset-entry">
+                    <input type="checkbox" class="ow-wi-entry-toggle" data-book="${escapeHtml(e.book)}" data-uid="${escapeHtml(e.uid)}"
+                      ${isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST) ? 'checked' : ''}>
+                    <label>${escapeHtml(e.label)}${e.disabledInST ? ' <span class="ow-muted">（酒馆中已禁用）</span>' : ''}</label>
+                  </div>`).join('')}
+              </div>
+            </div>`;
+        }
+        $list.html(html);
+
+        $list.off('change', '.ow-wi-entry-toggle').on('change', '.ow-wi-entry-toggle', function () {
+            const book = $(this).data('book');
+            const uidStr = String($(this).data('uid'));
+            s.worldInfoOverrides[`${book}::${uidStr}`] = $(this).is(':checked');
+            saveSettings();
+            const $card = $(this).closest('.ow-widget-card');
+            const total = $card.find('.ow-wi-entry-toggle').length;
+            const on = $card.find('.ow-wi-entry-toggle:checked').length;
+            $card.find('.ow-widget-meta').text(`${on}/${total} 发送`);
+        });
+        $list.off('click', '[data-action="wi-all"], [data-action="wi-none"]').on('click', '[data-action="wi-all"], [data-action="wi-none"]', function () {
+            const want = $(this).data('action') === 'wi-all';
+            const $card = $(this).closest('.ow-widget-card');
+            $card.find('.ow-wi-entry-toggle').each(function () {
+                const book = $(this).data('book');
+                const uidStr = String($(this).data('uid'));
+                s.worldInfoOverrides[`${book}::${uidStr}`] = want;
+                $(this).prop('checked', want);
+            });
+            saveSettings();
+            const total = $card.find('.ow-wi-entry-toggle').length;
+            $card.find('.ow-widget-meta').text(`${want ? total : 0}/${total} 发送`);
+        });
+    }
+
+    // ---------------- 提示词面板 ----------------
+    function renderPromptsPanel($panel) {
+        const s = settings();
+        $panel.html(`
+        <div class="ow-hint">编辑即保存。各表自己的规则写在「镜头之外 → 表格管理」里，这里只放组件提示词与表格总则。</div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-puzzle-piece"></i> 组件生成提示词</div>
+          <div class="ow-row"><button class="ow-btn" id="ow_prompt_widget_reset">恢复默认</button></div>
+          <textarea class="ow-textarea" id="ow_prompt_widget" style="min-height:200px;">${escapeHtml(s.prompts.widgetSystemPrompt)}</textarea>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-table-list"></i> 表格总则</div>
+          <div class="ow-row">
+            <button class="ow-btn" id="ow_prompt_offscreen_reset">恢复默认</button>
+            <button class="ow-btn" id="ow_prompt_preview_btn">预览完整提示词</button>
+          </div>
+          <textarea class="ow-textarea" id="ow_prompt_offscreen" style="min-height:220px;">${escapeHtml(s.prompts.offscreenPreamble)}</textarea>
+          <pre id="ow_prompt_preview" class="ow-preview-box" style="display:none;"></pre>
+        </div>`);
+
+        $panel.find('#ow_prompt_widget').on('input', function () {
+            s.prompts.widgetSystemPrompt = $(this).val();
+            saveSettings();
+        });
+        $panel.find('#ow_prompt_widget_reset').on('click', function () {
+            if (!confirm('确定恢复“组件生成提示词”为默认内容吗？当前编辑内容会被覆盖。')) return;
+            s.prompts.widgetSystemPrompt = DEFAULT_WIDGET_SYSTEM_PROMPT;
+            saveSettings();
+            renderPromptsPanel($panel);
+        });
+        $panel.find('#ow_prompt_offscreen').on('input', function () {
+            s.prompts.offscreenPreamble = $(this).val();
+            saveSettings();
+        });
+        $panel.find('#ow_prompt_offscreen_reset').on('click', function () {
+            if (!confirm('确定恢复“表格总则”为默认内容吗？当前编辑内容会被覆盖。')) return;
+            s.prompts.offscreenPreamble = DEFAULT_OFFSCREEN_PREAMBLE;
+            saveSettings();
+            renderPromptsPanel($panel);
+        });
+        $panel.find('#ow_prompt_preview_btn').on('click', function () {
+            const $box = $panel.find('#ow_prompt_preview');
+            if ($box.is(':visible')) { $box.hide(); return; }
+            $box.text(buildOffscreenSystemPrompt()).show();
+        });
     }
 
     function renderSettingsPanel($panel) {
