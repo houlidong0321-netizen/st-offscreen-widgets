@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.3.1';
+    const EXT_VERSION = '2.3.2';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -1823,7 +1823,20 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             $(this).addClass('active');
             $modal.find('.ow-panel').removeClass('active');
             $modal.find(`.ow-panel[data-panel="${tab}"]`).addClass('active');
+            // 窄屏时被点中的标签可能只露出一半，滚动让它完整可见
+            try { this.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' }); } catch (e) { /* 忽略 */ }
         });
+
+        // 标签栏滑到最右端时去掉右侧渐隐
+        const $tabs = $modal.find('.ow-tabs');
+        const syncTabsFade = () => {
+            const el = $tabs[0];
+            if (!el) return;
+            const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 2;
+            $tabs.toggleClass('ow-tabs-end', atEnd);
+        };
+        $tabs.on('scroll', syncTabsFade);
+        setTimeout(syncTabsFade, 80);
 
         applyTheme();
         // 每个面板单独 try/catch：任何一个面板出错都不能连累后面的面板变成空白

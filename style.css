@@ -79,6 +79,15 @@
     animation: ow-rise 0.2s cubic-bezier(0.2, 0.8, 0.3, 1);
 }
 
+/* 酒馆主题会给全局文字加 text-shadow（--SmartThemeShadowColor），
+   在密集的表格/列表里会糊成一片，这里在扩展内部一律关掉。 */
+.ow-modal,
+.ow-modal *,
+.ow-sub-modal,
+.ow-sub-modal * {
+    text-shadow: none !important;
+}
+
 .ow-modal {
     width: min(980px, 95vw);
     height: min(760px, 90dvh);
@@ -154,10 +163,24 @@
     padding: 0 10px;
     flex: 0 0 auto;
     border-bottom: 1px solid var(--ow-border);
+    /* 窄屏时标签放不下：允许横向滑动，且不许换行/压缩 */
+    flex-wrap: nowrap;
     overflow-x: auto;
+    overflow-y: hidden;
     scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    /* 右侧渐隐，暗示后面还有内容 */
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
 }
 .ow-tabs::-webkit-scrollbar { display: none; }
+/* 滑到最右端时取消渐隐，避免最后一个标签一直看着是灰的 */
+.ow-tabs.ow-tabs-end {
+    -webkit-mask-image: none;
+    mask-image: none;
+}
 
 .ow-tab {
     position: relative;
@@ -167,6 +190,9 @@
     color: var(--ow-text-dim);
     white-space: nowrap;
     transition: color 0.15s;
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+    user-select: none;
 }
 .ow-tab:hover { color: var(--SmartThemeBodyColor, #ddd); }
 .ow-tab.active { color: var(--SmartThemeBodyColor, #ddd); font-weight: 600; }
