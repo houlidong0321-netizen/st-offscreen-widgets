@@ -897,3 +897,32 @@
 .ow-dir-item input { accent-color: var(--ow-accent); margin: 0; }
 .ow-dir-del { opacity: 0.35; font-size: 10px; margin-left: 2px; }
 .ow-dir-del:hover { opacity: 1; color: #e5787d; }
+
+/* ---- 组件预览：折叠 + 头部常驻 ---- */
+.ow-result-head {
+    /* 滚动查看长预览时标题与按钮保持可见 */
+    position: sticky;
+    top: 42px;
+    z-index: 4;
+    background: var(--SmartThemeBlurTintColor, #1e1e1e);
+    backdrop-filter: blur(6px);
+}
+
+.ow-result-title {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    overflow: hidden;
+}
+.ow-result-title b {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ow-result-title .ow-muted { white-space: nowrap; font-size: 11.5px; }
+
+.ow-result-caret { font-size: 11px; }
+
+.ow-preview-collapsed .ow-result-frame { display: none; }
+.ow-preview-collapsed .ow-result-head { position: static; }

@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.4.1';
+    const EXT_VERSION = '2.6.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -154,6 +154,8 @@
     const INJECT_KEY_WIDGETS = `${MODULE_NAME}_widgets`;
     const INJECT_KEY_OFFSCREEN = `${MODULE_NAME}_offscreen`;
     const INJECT_KEY_PLOT = `${MODULE_NAME}_plot`;
+    const INJECT_KEY_SUMMARY = `${MODULE_NAME}_summary`;
+    const INJECT_KEY_LORE = `${MODULE_NAME}_lore`;
 
     // ------------------------------------------------------------------
     // 日志诊断模块：记录每一步关键动作（发送了什么/收到了什么/解析是否成功），
@@ -223,17 +225,51 @@
             injectPosition: 'IN_CHAT',
             injectDepth: 0,
         },
-        api: { mode: 'system', url: '', key: '', model: '', modelList: [] },
+        api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '' },
+        // 各模块用哪套 API：'system'=跟随酒馆，'preset'=指定预设
+        moduleApi: {
+            widgets: { mode: 'system', presetId: '' },
+            tables:  { mode: 'system', presetId: '' },
+            plot:    { mode: 'system', presetId: '' },
+            summary: { mode: 'system', presetId: '' },
+        },
         theme: { mode: 'system', customCss: '' },
         prompts: {
             widgetSystemPrompt: DEFAULT_WIDGET_SYSTEM_PROMPT,
             offscreenPreamble: DEFAULT_OFFSCREEN_PREAMBLE,
             plotSystemPrompt: DEFAULT_PLOT_SYSTEM_PROMPT,
             plotInjectTemplate: DEFAULT_PLOT_INJECT_TEMPLATE,
+            summarySystemPrompt: DEFAULT_SUMMARY_SYSTEM_PROMPT,
+            summaryCompressPrompt: DEFAULT_SUMMARY_COMPRESS_PROMPT,
         },
         offscreenTables: defaultOffscreenTables(),
         // 收藏夹：跨聊天全局保存，folders 为文件夹，items 为收藏的组件快照
         favorites: { folders: [{ id: 'default', name: '默认收藏夹', createdAt: Date.now() }], items: [] },
+        // 本聊天专属设定（只在当前聊天生效，不会污染角色卡世界书）
+        lore: {
+            injectEnabled: true,
+            injectPosition: 'IN_PROMPT',
+            injectDepth: 0,
+            scanDepth: 10,   // 关键词触发时向前扫描多少层聊天
+        },
+        // 总结
+        summary: {
+            enabled: false,
+            // 识别正文里"现成摘要"的规则（可自行增删/改写正则）
+            detectPatterns: [
+                { id: 'abstract', name: '<abstract_format>…</abstract_format>', pattern: '<abstract_format>([\\s\\S]*?)</abstract_format>', enabled: true },
+                { id: 'chapterline', name: '以 `[Chapter_X]` 开头的整行/整段', pattern: '(`\\[Chapter_\\d+\\]`[\\s\\S]*?)(?:\\n\\s*\\n|$)', enabled: true },
+                { id: 'details', name: '<details><summary>摘要</summary>…</details>', pattern: '<details>\\s*<summary>\\s*(?:摘要|总结|Summary)\\s*</summary>([\\s\\S]*?)</details>', enabled: true },
+                { id: 'tag', name: '<摘要>…</摘要>', pattern: '<\\s*(?:摘要|summary)\\s*>([\\s\\S]*?)<\\s*/\\s*(?:摘要|summary)\\s*>', enabled: true },
+                { id: 'bracket', name: '【摘要】…（到段落末）', pattern: '【\\s*(?:摘要|总结)\\s*】\\s*([\\s\\S]*?)(?:\\n\\s*\\n|$)', enabled: true },
+            ],
+            onMissing: 'generate',   // 'generate' = 让模型补写并标记⚠️ | 'skip' = 跳过并列出章号
+            compressMode: 'manual',  // 'manual' | 'auto'
+            compressLag: 5,          // 自动：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…
+            injectEnabled: false,
+            injectPosition: 'IN_CHAT',
+            injectDepth: 2,
+        },
         // 剧情推演
         plot: {
             customEvents: '',
@@ -279,6 +315,18 @@
         if (!es[MODULE_NAME]) es[MODULE_NAME] = {};
         deepMergeDefaults(es[MODULE_NAME], defaultSettings());
         const st = es[MODULE_NAME];
+        // 迁移：旧版只有一套独立 API，转成预设列表里的第一条
+        if (st.api && !Array.isArray(st.api.presets)) st.api.presets = [];
+        if (st.api && st.api.url && !st.api.presets.length) {
+            const id = `api_${Date.now().toString(36)}`;
+            st.api.presets.push({ id, name: '默认 API', url: st.api.url, key: st.api.key || '', model: st.api.model || '', modelList: st.api.modelList || [] });
+            st.api.activePresetId = id;
+            if (st.api.mode === 'custom') {
+                for (const k of ['widgets', 'tables', 'plot', 'summary']) {
+                    if (st.moduleApi?.[k]) { st.moduleApi[k].mode = 'preset'; st.moduleApi[k].presetId = id; }
+                }
+            }
+        }
         // 迁移：表格触发从 followWidgets + autoTriggers.offscreenByFloor 改为独立的 triggerMode/autoMode
         if (st.offscreen && st.offscreen.followWidgets !== undefined) {
             const oldFloor = st.autoTriggers?.offscreenByFloor;
@@ -335,6 +383,19 @@
                 delete off[legacyKey];
             }
         }
+        // 本聊天专属设定
+        if (!c.chatMetadata[MODULE_NAME].lore) {
+            c.chatMetadata[MODULE_NAME].lore = { entries: [] };
+        }
+        if (!Array.isArray(c.chatMetadata[MODULE_NAME].lore.entries)) c.chatMetadata[MODULE_NAME].lore.entries = [];
+        // 总结状态
+        if (!c.chatMetadata[MODULE_NAME].summary) {
+            c.chatMetadata[MODULE_NAME].summary = { index: [], bigSummaries: [], hidden: [], scannedAt: null };
+        }
+        const sm = c.chatMetadata[MODULE_NAME].summary;
+        if (!Array.isArray(sm.index)) sm.index = [];
+        if (!Array.isArray(sm.bigSummaries)) sm.bigSummaries = [];
+        if (!Array.isArray(sm.hidden)) sm.hidden = [];
         // 剧情推演状态
         if (!c.chatMetadata[MODULE_NAME].plot) {
             c.chatMetadata[MODULE_NAME].plot = { events: [], currentId: '', deadBranches: {}, path: [], updatedAt: null };
@@ -569,6 +630,490 @@
             ? '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容，在已有表格基础上做增量更新，输出包含全部保留行的完整表格。'
             : '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成以上表格。');
         return parts.join('\n\n');
+    }
+
+    // ------------------------------------------------------------------
+    // 本聊天专属设定
+    // 存在 chatMetadata 里 —— 只有当前这个聊天看得到，换个聊天/换个角色都不会串，
+    // 也不会像写进角色卡世界书那样让所有聊天都受影响。
+    // ------------------------------------------------------------------
+    const LORE_TYPES = [
+        { id: 'setting', name: '世界设定' },
+        { id: 'npc', name: 'NPC' },
+        { id: 'persona', name: '用户人设' },
+        { id: 'other', name: '其他' },
+    ];
+
+    function loreTypeName(id) {
+        return LORE_TYPES.find((t) => t.id === id)?.name || '其他';
+    }
+
+    function loreEntries() {
+        return chatData().lore.entries;
+    }
+
+    /** 关键词触发：留空=常驻注入；填了=最近若干层聊天里出现才注入 */
+    function isLoreEntryActive(entry, recentText) {
+        if (entry.enabled === false) return false;
+        const kws = String(entry.keywords || '').split(/[,，;；\n]/).map((x) => x.trim()).filter(Boolean);
+        if (!kws.length) return true;
+        return kws.some((k) => recentText.includes(k));
+    }
+
+    function buildLoreInjectionText() {
+        const s = settings();
+        const list = loreEntries();
+        if (!list.length) return '';
+        const chat = ctx().chat || [];
+        const depth = Math.max(1, Number(s.lore.scanDepth) || 10);
+        const recentText = chat.slice(-depth).map((m) => String(m.mes || '')).join('\n');
+
+        const active = list.filter((e) => isLoreEntryActive(e, recentText));
+        if (!active.length) return '';
+        const byType = {};
+        for (const e of active) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
+
+        const parts = [];
+        for (const t of LORE_TYPES) {
+            const arr = byType[t.id];
+            if (!arr?.length) continue;
+            parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
+        }
+        const skipped = list.length - active.length;
+        if (skipped > 0) log('debug', 'inject', `本聊天设定：注入 ${active.length} 条，${skipped} 条因关键词未命中而跳过`);
+        return parts.join('\n\n');
+    }
+
+    // ------------------------------------------------------------------
+    // 总结模块
+    // 设计要点：正文里"现成的每章摘要"由扩展用正则抠出来存档，模型**不负责搬运摘要正文**，
+    // 只负责输出结构（转场怎么分、高光挑哪段、有哪些物理锚点、锚点绑到哪几章）。
+    // 最终文档由扩展按模板拼装，摘要正文直接取自存档——这样"无损搬运"是代码保证的，
+    // 而不是靠提示词去请求模型别改写。
+    // ------------------------------------------------------------------
+
+    /** 章 = 一次 AI 回复。返回 [{chapter, msgId, mes}]（chapter 从 1 递增） */
+    function listChapters() {
+        const chat = ctx().chat || [];
+        const out = [];
+        let n = 0;
+        chat.forEach((m, i) => {
+            if (m.is_user || m.is_system) return;
+            n += 1;
+            out.push({ chapter: n, msgId: i, mes: String(m.mes || '') });
+        });
+        return out;
+    }
+
+    /** 从摘要文本里读出 `[Chapter_X]` 标签中的章号；没有返回 null */
+    function parseChapterTag(text) {
+        const m = /`?\[\s*Chapter[_\s]*(\d+)\s*\]`?/i.exec(String(text || ''));
+        return m ? Number(m[1]) : null;
+    }
+
+    /** 用配置的规则从一条回复里抠出现成摘要，抠不到返回 null */
+    function extractSummaryFrom(mes) {
+        const s = settings();
+        for (const rule of (s.summary.detectPatterns || [])) {
+            if (rule.enabled === false || !rule.pattern) continue;
+            try {
+                const re = new RegExp(rule.pattern, 'i');
+                const m = re.exec(mes);
+                if (m && m[1] && m[1].trim()) {
+                    return { text: m[1].trim(), rule: rule.name || rule.id };
+                }
+            } catch (err) {
+                log('warn', 'parse', `摘要识别规则「${rule.name || rule.id}」正则有误：${err.message}`);
+            }
+        }
+        return null;
+    }
+
+    /** 扫描全部章节，重建摘要索引（纯代码，不经模型） */
+    function rescanSummaryIndex() {
+        const cd = chatData();
+        const chapters = listChapters();
+        const prevByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
+        // 导入的历史记录不依附于当前消息，必须原样保留
+        const imported = cd.summary.index.filter((x) => x.source === 'imported');
+        const byCh = new Map(imported.map((x) => [x.chapter, x]));
+
+        const missing = [];
+        let pos = 0;
+        for (const ch of chapters) {
+            pos += 1;
+            const found = extractSummaryFrom(ch.mes);
+            // 章号优先取摘要里写明的 `[Chapter_X]`；没有才按出场顺序推算。
+            // 这样重 roll、删楼、导入旧记录都不会让章号错位。
+            const tagged = found ? parseChapterTag(found.text) : null;
+            const chapter = tagged || pos;
+            if (found) {
+                byCh.set(chapter, { chapter, msgId: ch.msgId, text: found.text.trim(), source: 'native', rule: found.rule, tagged: !!tagged });
+            } else {
+                const prev = prevByCh.get(chapter);
+                if (prev && (prev.source === 'generated' || prev.source === 'imported') ) {
+                    byCh.set(chapter, { ...prev, msgId: ch.msgId });
+                } else if (!byCh.has(chapter)) {
+                    byCh.set(chapter, { chapter, msgId: ch.msgId, text: '', source: 'missing' });
+                    missing.push(chapter);
+                }
+            }
+        }
+        const index = [...byCh.values()].sort((a, b) => a.chapter - b.chapter);
+        cd.summary.index = index;
+        cd.summary.scannedAt = Date.now();
+        saveChatData();
+        const nat = index.filter((x) => x.source === 'native').length;
+        const imp = index.filter((x) => x.source === 'imported').length;
+        const taggedN = index.filter((x) => x.tagged).length;
+        log('info', 'system',
+            `摘要索引已重建：当前 ${chapters.length} 条回复，索引 ${index.length} 章（现成 ${nat}${imp ? ` · 导入 ${imp}` : ''}${taggedN ? ` · 其中 ${taggedN} 章章号取自 [Chapter_X] 标签` : ''}）` +
+            (missing.length ? `，缺失 ${missing.length} 章：${missing.join('、')}` : '，无缺失'),
+            { missing });
+        return { total: chapters.length, indexed: index.length, missing };
+    }
+
+    /**
+     * 导入历史总结：把以前手动存在世界书里的摘要粘进来。
+     * 按 `[Chapter_X]` 标签切分；没有标签的整段算作一条，由调用方指定起始章号。
+     */
+    function parseImportedSummaries(raw, startChapter = 1) {
+        const text = String(raw || '').replace(/\r\n/g, '\n').trim();
+        if (!text) return [];
+        const out = [];
+        // 用 [Chapter_X] 作为切分锚点
+        const re = /`?\[\s*Chapter[_\s]*(\d+)\s*\]`?/gi;
+        const hits = [];
+        let m;
+        while ((m = re.exec(text))) hits.push({ idx: m.index, ch: Number(m[1]) });
+        if (hits.length) {
+            hits.forEach((h, i) => {
+                const end = i + 1 < hits.length ? hits[i + 1].idx : text.length;
+                const seg = text.slice(h.idx, end).trim();
+                if (seg) out.push({ chapter: h.ch, text: seg });
+            });
+        } else {
+            // 没有标签：按空行分段，依次编号
+            const paras = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
+            paras.forEach((pTxt, i) => out.push({ chapter: startChapter + i, text: pTxt }));
+        }
+        return out;
+    }
+
+    function importSummaries(raw, { startChapter = 1, overwrite = true } = {}) {
+        const cd = chatData();
+        const parsed = parseImportedSummaries(raw, startChapter);
+        if (!parsed.length) return { added: 0, skipped: 0, total: 0 };
+        const byCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
+        let added = 0, skipped = 0;
+        for (const item of parsed) {
+            const exist = byCh.get(item.chapter);
+            if (exist && exist.source !== 'missing' && !overwrite) { skipped += 1; continue; }
+            byCh.set(item.chapter, { chapter: item.chapter, msgId: exist?.msgId ?? null, text: item.text, source: 'imported' });
+            added += 1;
+        }
+        cd.summary.index = [...byCh.values()].sort((a, b) => a.chapter - b.chapter);
+        saveChatData();
+        log('info', 'system', `导入历史摘要：解析出 ${parsed.length} 条，写入 ${added} 条${skipped ? `，跳过已存在 ${skipped} 条` : ''}（章号范围 ${parsed[0].chapter}–${parsed[parsed.length - 1].chapter}）`);
+        return { added, skipped, total: parsed.length };
+    }
+
+    /** 已被大总结覆盖到的最大章号 */
+    /** 已被大总结覆盖到的最大章号 */
+    function lastSummarizedChapter() {
+        const cd = chatData();
+        return cd.summary.bigSummaries.reduce((mx, b) => Math.max(mx, Number(b.toCh) || 0), 0);
+    }
+
+    const DEFAULT_SUMMARY_SYSTEM_PROMPT = `你是一个剧情档案编排器。你的任务**不是撰写摘要**，而是为已有的章节摘要做结构化编排。
+
+【最重要的约束】
+- 每一章的摘要正文**已经存在**，由程序保管，会在最终文档里自动填入。你**绝对不要复述、改写或输出任何章节摘要的正文**。
+- 你只输出"结构"：怎么分转场、每个转场区间挑哪一段高光对话、有哪些物理锚点、锚点绑定到哪几章。
+- 章节顺序由程序按章号排列，你不需要也不允许改变顺序。
+
+【第一步：转场划分】
+- 只有剧情发生**物理空间转移**时（如从A房间到B房间）才划分新的转场区间。同一地点内的多章归入同一区间。
+- 每个区间要写：场景名称、时间（尽量对应到具体日期与时段）、覆盖的章号范围。
+- 下方会给出【已有场景标签】。若该地点已经存在，**必须复用其 \`[Scene_X]\` 标签**，不要另起名字；确实是新地点才留空由程序分配。
+
+【第二步：高光对话提取】
+- 针对每个转场区间，回到正文原文中寻找最具张力或推动力的**连续互动**。
+- 以剧本格式提取**连续 3-5 个回合**的原文：角色名、对白、动作描写。
+- **对白与动作必须 100% 逐字摘抄正文原文，一个字都不许改写、删减或润色**。程序会把你摘录的每一句拿回原文里做匹配校验，对不上会被标红。
+- 一个区间**只准一段**。剧情必须连续。
+- 若该区间确实没有值得记录的高光互动，填 null——**宁缺毋滥，不要为了填满而硬凑**。
+- 必须注明这段对话出自第几章。
+
+【第三步：物理锚点】
+- 记录该区间产生的、对后续有影响的【不可忽略物理因素】（信物、伤口、证据、遗留物等），过于日常的省略。
+- 必须是正文明确提到的，禁止想象。写清：名称、来源、当前位置；若为伤情注明预计好转/消失的时间节点。
+- 下方会给出【已有物品标签】，同一物品必须复用其 \`[Item_Anchor_X]\` 标签。
+- 没有就填空数组。
+
+【第四步：锚点关联】
+- 指明每个高光对话、每个物理锚点分别关联到哪几个章号，便于日后回溯它发生在什么情境里。
+
+【输出格式】
+只输出一个 JSON 对象，不要输出 Markdown 代码块围栏或解释文字：
+{"sections":[{
+  "sceneTag":"\`[Scene_1]\` 或留空",
+  "sceneName":"地点名称",
+  "time":"具体日期与时段",
+  "chapters":[1,2,3],
+  "dialogue":{"fromChapter":2,"lines":[{"speaker":"角色名","quote":"逐字原文对白","action":"逐字原文动作描写"}]},
+  "itemAnchors":[{"tag":"\`[Item_Anchor_1]\` 或留空","name":"物品名","origin":"来源","location":"当前位置","note":"伤情时间节点等","chapters":[2]}]
+}]}
+dialogue 没有时填 null。`;
+
+    const DEFAULT_SUMMARY_COMPRESS_PROMPT = `你要压缩一份剧情档案里的**叙述部分**。
+
+【绝对禁止触碰的内容】
+- 高光对话（逐字原文）与物理锚点：**一个字都不许改**。它们不在你的输入里，也不需要你处理。
+【你要做的】
+- 下面给出同一个转场区间内的多条章节摘要。把它们合并压缩成**一段连贯叙述**。
+- 保留：人物动机的转折、关系变化、做出的决定与承诺、造成后续影响的事件。
+- 可以舍弃：环境描写、重复的情绪铺陈、无后续影响的日常细节。
+- 长度控制在原文的三分之一以内，但宁可长一点也不要丢掉上面要求保留的内容。
+只输出压缩后的叙述文字本身，不要加标题、不要解释、不要用代码块包裹。`;
+
+    function buildSummaryUserPrompt(fromCh, toCh) {
+        const cd = chatData();
+        const chapters = listChapters();
+        const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
+        // 用索引里的 msgId 回原文，这样章号即使不等于出场顺序也能对上
+        const chat = ctx().chat || [];
+        const inRange = cd.summary.index
+            .filter((x) => x.chapter >= fromCh && x.chapter <= toCh)
+            .map((x) => ({ chapter: x.chapter, mes: x.msgId != null ? String(chat[x.msgId]?.mes || '') : '' }));
+        const parts = [];
+
+        const scenes = (chatData().offscreen.tables?.sceneTable || [])
+            .map((r) => `${r.tag} ${r.name}`).filter((x) => x.trim());
+        const items = (chatData().offscreen.tables?.itemAnchorTable || [])
+            .map((r) => `${r.tag} ${r.name}`).filter((x) => x.trim());
+        if (scenes.length) parts.push(`【已有场景标签（同一地点必须复用）】\n${scenes.join('\n')}`);
+        if (items.length) parts.push(`【已有物品标签（同一物品必须复用）】\n${items.join('\n')}`);
+
+        parts.push(`【本次编排范围】第 ${fromCh} 章 至 第 ${toCh} 章`);
+        const sumList = inRange.map((c) => {
+            const rec = idxByCh.get(c.chapter);
+            const tag = rec?.source === 'native' ? '' : (rec?.source === 'generated' ? '（补写）' : '（缺失）');
+            return `第${c.chapter}章${tag}：${rec?.text ? rec.text.slice(0, 300) : '（无摘要）'}`;
+        }).join('\n');
+        parts.push(`【各章摘要一览（仅供你理解剧情走向，不要复述、不要输出它们）】\n${sumList}`);
+
+        const raw = inRange.map((c) => `===== 第${c.chapter}章 正文 =====\n${c.mes.slice(0, 6000)}`).join('\n\n');
+        parts.push(`【正文原文（用于提取高光对话，必须逐字摘抄）】\n${raw}`);
+        return parts.join('\n\n');
+    }
+
+    /** 校验模型摘录的台词是否真的在原文里 */
+    function verifyDialogue(section, chaptersMap) {
+        if (!section.dialogue || !Array.isArray(section.dialogue.lines)) return;
+        const norm = (t) => String(t || '').replace(/[\s\u3000]/g, '')
+            .replace(/["""']/g, '"').replace(/[，,]/g, ',').replace(/[。．.]/g, '.');
+        const chIds = section.dialogue.fromChapter ? [section.dialogue.fromChapter] : (section.chapters || []);
+        const pool = chIds.map((n) => norm(chaptersMap.get(Number(n)) || '')).join('||');
+        for (const line of section.dialogue.lines) {
+            const q = norm(line.quote);
+            line.verified = !!(q && pool.includes(q));
+        }
+        const bad = section.dialogue.lines.filter((l) => !l.verified).length;
+        if (bad) {
+            log('warn', 'parse',
+                `高光对话校验：有 ${bad} 句在原文中找不到，可能被模型改写或杜撰（已在界面标红，可点"重挑"重新生成该区间）`,
+                section.dialogue.lines.filter((l) => !l.verified).map((l) => l.quote));
+        }
+    }
+
+    async function generateBigSummary() {
+        const s = settings();
+        const cd = chatData();
+        const scan = rescanSummaryIndex();
+
+        const from = lastSummarizedChapter() + 1;
+        const to = cd.summary.index.reduce((mx, x) => Math.max(mx, x.chapter), 0);
+        if (to < from) throw new Error(`没有新章节可总结（已总结到第 ${from - 1} 章，当前共 ${to} 章）`);
+
+        // 缺摘要的章节：按设置补写或跳过
+        const missingInRange = cd.summary.index.filter((x) => x.chapter >= from && x.chapter <= to && x.source === 'missing');
+        if (missingInRange.length) {
+            if (s.summary.onMissing === 'generate') {
+                log('info', 'system', `第 ${missingInRange.map((x) => x.chapter).join('、')} 章没有现成摘要，将由模型补写并标记 ⚠️`);
+                const chat0 = ctx().chat || [];
+                const chMap = new Map(cd.summary.index.map((x) => [x.chapter, x.msgId != null ? String(chat0[x.msgId]?.mes || '') : '']));
+                for (const rec of missingInRange) {
+                    try {
+                        const txt = await callModel(
+                            '你是剧情摘要助手。只输出这一章的简明摘要正文本身，不要标题、不要解释、不要代码块。控制在 150 字以内。',
+                            `【本章正文】\n${String(chMap.get(rec.chapter) || '').slice(0, 8000)}`,
+                            `补写摘要:第${rec.chapter}章`, 'summary');
+                        rec.text = stripCodeFence(txt).trim();
+                        rec.source = 'generated';
+                    } catch (err) {
+                        log('warn', 'system', `第 ${rec.chapter} 章摘要补写失败：${err.message || err}`);
+                    }
+                }
+                saveChatData();
+            } else {
+                log('warn', 'system', `第 ${missingInRange.map((x) => x.chapter).join('、')} 章没有现成摘要，按设置已跳过（可到设置里改为自动补写）`);
+            }
+        }
+
+        log('info', 'system', `开始编排大总结：第 ${from}–${to} 章`);
+        const raw = await callModel(s.prompts.summarySystemPrompt, buildSummaryUserPrompt(from, to), `大总结 ${from}-${to}`, 'summary');
+        const parsed = tryParseJsonRobust(raw, '大总结');
+        if (!parsed || !Array.isArray(parsed.sections)) {
+            throw new Error('未能从模型响应中解析出 sections 数组，本次未写入。详见日志。');
+        }
+
+        const chatA = ctx().chat || [];
+        const chMap = new Map(cd.summary.index.map((x) => [x.chapter, x.msgId != null ? String(chatA[x.msgId]?.mes || '') : '']));
+        const sections = parsed.sections.map((sec) => {
+            const out = {
+                sceneTag: String(sec.sceneTag || '').trim(),
+                sceneName: String(sec.sceneName || '').trim(),
+                time: String(sec.time || '').trim(),
+                chapters: (Array.isArray(sec.chapters) ? sec.chapters : []).map(Number).filter((n) => n >= from && n <= to).sort((a, b) => a - b),
+                dialogue: sec.dialogue && Array.isArray(sec.dialogue.lines) && sec.dialogue.lines.length ? {
+                    fromChapter: Number(sec.dialogue.fromChapter) || null,
+                    lines: sec.dialogue.lines.map((l) => ({
+                        speaker: String(l.speaker || '').trim(),
+                        quote: String(l.quote || '').trim(),
+                        action: String(l.action || '').trim(),
+                        verified: false,
+                    })),
+                } : null,
+                itemAnchors: (Array.isArray(sec.itemAnchors) ? sec.itemAnchors : []).map((it) => ({
+                    tag: String(it.tag || '').trim(),
+                    name: String(it.name || '').trim(),
+                    origin: String(it.origin || '').trim(),
+                    location: String(it.location || '').trim(),
+                    note: String(it.note || '').trim(),
+                    chapters: (Array.isArray(it.chapters) ? it.chapters : []).map(Number).filter(Boolean),
+                })),
+            };
+            verifyDialogue(out, chMap);
+            return out;
+        }).filter((x) => x.chapters.length);
+
+        // 自动补全缺失的锚点编号
+        let dlgN = cd.summary.bigSummaries.reduce((n, b) => n + b.sections.filter((x) => x.dialogue).length, 0);
+        sections.forEach((sec) => { if (sec.dialogue) { dlgN += 1; sec.dialogue.tag = `\`[Dialogue_Anchor_${dlgN}]\``; } });
+
+        const big = {
+            id: `sum_${Date.now().toString(36)}`,
+            fromCh: from, toCh: to,
+            createdAt: Date.now(),
+            sections,
+            level: 1,          // 1=原始；2=已单条压缩
+            compressedAt: null,
+        };
+        cd.summary.bigSummaries.push(big);
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `大总结完成：第 ${from}–${to} 章，${sections.length} 个转场区间`);
+
+        if (s.summary.compressMode === 'auto') maybeAutoCompress();
+        return big;
+    }
+
+    /** 自动压缩：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…（滑窗差值） */
+    function maybeAutoCompress() {
+        const s = settings();
+        const cd = chatData();
+        const lag = Math.max(1, Number(s.summary.compressLag) || 5);
+        const total = cd.summary.bigSummaries.length;
+        const targetIdx = total - lag; // 0 起算
+        if (targetIdx < 0) return;
+        const target = cd.summary.bigSummaries[targetIdx];
+        if (!target || target.level >= 2) return;
+        log('info', 'system', `自动压缩触发：当前共 ${total} 次总结，差值 ${lag} → 压缩第 ${targetIdx + 1} 次（第 ${target.fromCh}–${target.toCh} 章）`);
+        startBackgroundTask(`压缩总结 ${target.fromCh}-${target.toCh}`, () => compressBigSummary(target.id));
+    }
+
+    /** 单条压缩：只压该次总结里各区间的叙述，高光与物理锚点原样不动 */
+    async function compressBigSummary(bigId) {
+        const s = settings();
+        const cd = chatData();
+        const big = cd.summary.bigSummaries.find((b) => b.id === bigId);
+        if (!big) throw new Error('找不到这条总结');
+        if (big.level >= 2) { toast('这条已经压缩过了', 'info'); return; }
+        const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
+
+        for (const sec of big.sections) {
+            const texts = sec.chapters.map((n) => {
+                const r = idxByCh.get(n);
+                return r?.text ? `第${n}章：${r.text}` : null;
+            }).filter(Boolean);
+            if (texts.length <= 1) { sec.compressed = texts[0] || ''; continue; }
+            try {
+                const out = await callModel(s.prompts.summaryCompressPrompt,
+                    `【转场区间】${sec.sceneName}（第 ${sec.chapters[0]}–${sec.chapters[sec.chapters.length - 1]} 章）\n\n【待压缩的章节摘要】\n${texts.join('\n')}`,
+                    `压缩:${sec.sceneName}`, 'summary');
+                sec.compressed = stripCodeFence(out).trim();
+            } catch (err) {
+                log('warn', 'system', `区间「${sec.sceneName}」压缩失败，保留原文：${err.message || err}`);
+            }
+        }
+        big.level = 2;
+        big.compressedAt = Date.now();
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `已压缩第 ${big.fromCh}–${big.toCh} 章的总结（高光对话与物理锚点未改动，原始摘要索引也完整保留）`);
+    }
+
+    /** 按你的模板把一条大总结渲染成文本；摘要正文直接取自扩展存档 */
+    function renderBigSummary(big, { compressed = null } = {}) {
+        const cd = chatData();
+        const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
+        const useCompressed = compressed === null ? (big.level >= 2) : compressed;
+        const L = [`<大总结(第${big.fromCh}-${big.toCh}章)>`];
+        big.sections.forEach((sec, i) => {
+            L.push('');
+            L.push(`- 【转场标题${i + 1}】：${sec.sceneName}${sec.sceneTag ? ` ${sec.sceneTag}` : ''} - 时间：${sec.time || '—'}`);
+            L.push('  - 核心锚点：');
+            if (sec.dialogue) {
+                L.push(`    - 高光对话 ${sec.dialogue.tag || ''}${sec.dialogue.fromChapter ? `（出自第${sec.dialogue.fromChapter}章 \`[Chapter_${sec.dialogue.fromChapter}]\`）` : ''}：`);
+                for (const ln of sec.dialogue.lines) {
+                    const mark = ln.verified === false ? ' ⚠️原文未匹配' : '';
+                    L.push(`        ${ln.speaker}："${ln.quote}"${ln.action ? ` (${ln.action})` : ''}${mark}`);
+                }
+            } else {
+                L.push('    - 高光对话：无');
+            }
+            if (sec.itemAnchors.length) {
+                sec.itemAnchors.forEach((it, k) => {
+                    L.push(`    - 不可忽略物理因素 ${it.tag || ''}：${k + 1}. ${it.name}（${it.origin}，置于${it.location}${it.note ? `，${it.note}` : ''}）${it.chapters?.length ? ` 关联：${it.chapters.map((n) => `\`[Chapter_${n}]\``).join('、')}` : ''}`);
+                });
+            } else {
+                L.push('    - 不可忽略物理因素：无');
+            }
+            L.push('  - 线性摘要搬运记录：');
+            if (useCompressed && sec.compressed) {
+                L.push(`    - \`[Chapter_${sec.chapters[0]}-${sec.chapters[sec.chapters.length - 1]}]\`（已压缩）：${sec.compressed}`);
+            } else {
+                for (const n of sec.chapters) {
+                    const r = idxByCh.get(n);
+                    const flag = r?.source === 'generated' ? ' ⚠️扩展补写'
+                        : r?.source === 'missing' ? ' ⚠️缺失'
+                        : r?.source === 'imported' ? ' （导入）' : '';
+                    const anchors = [];
+                    if (sec.dialogue && sec.dialogue.fromChapter === n && sec.dialogue.tag) anchors.push(sec.dialogue.tag);
+                    for (const it of sec.itemAnchors) if (it.chapters?.includes(n) && it.tag) anchors.push(it.tag);
+                    L.push(`    - \`[Chapter_${n}]\`${flag}：${r?.text || '（无摘要）'}${anchors.length ? ` (关联锚点：${anchors.join('、')})` : ''}`);
+                }
+            }
+        });
+        L.push('');
+        L.push(`</大总结(第${big.fromCh}-${big.toCh}章)>`);
+        return L.join('\n');
+    }
+
+    function renderAllSummariesText() {
+        const cd = chatData();
+        return cd.summary.bigSummaries.map((b) => renderBigSummary(b)).join('\n\n');
     }
 
     // ------------------------------------------------------------------
@@ -815,7 +1360,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         log('info', 'system', `开始生成剧情推演矩阵（方向：${plotDirections().join('、') || '未指定'}）`);
         const extras = await gatherExtras({ historyDepth: s.plot.historyDepth });
         const userPrompt = buildPlotUserPrompt(extras);
-        const raw = await callModel(s.prompts.plotSystemPrompt, userPrompt, '剧情推演');
+        const raw = await callModel(s.prompts.plotSystemPrompt, userPrompt, '剧情推演', 'plot');
         const parsed = tryParseJsonRobust(raw, '剧情推演');
         if (!parsed) throw new Error('未能从模型响应中解析出 JSON，剧情矩阵未更新。请在「日志」标签页查看完整响应。');
         const rows = Array.isArray(parsed.events) ? parsed.events : (Array.isArray(parsed) ? parsed : null);
@@ -1098,16 +1643,33 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // ------------------------------------------------------------------
     // 模型调用（跟随酒馆当前 API，或使用独立 API）
     // ------------------------------------------------------------------
-    async function callModel(systemPrompt, userPrompt, label = '') {
+    /** 取某模块实际要用的 API 配置；返回 null 表示跟随酒馆 */
+    function resolveModuleApi(moduleKey) {
         const s = settings();
-        log('info', 'request', `[${label}] 发起请求（模式：${s.api.mode === 'custom' ? '独立API' : '跟随酒馆'}）`, {
+        // 表格跟随组件时，API 也跟随组件的设置
+        if (moduleKey === 'tables' && s.offscreen.triggerMode === 'auto' && s.offscreen.autoMode === 'follow') {
+            moduleKey = 'widgets';
+        }
+        const conf = s.moduleApi?.[moduleKey];
+        if (!conf || conf.mode !== 'preset') return null;
+        const preset = (s.api.presets || []).find((x) => x.id === conf.presetId);
+        if (!preset || !preset.url) {
+            log('warn', 'request', `模块「${moduleKey}」指定了 API 预设但没找到有效配置，已回退为跟随酒馆`);
+            return null;
+        }
+        return preset;
+    }
+
+    async function callModel(systemPrompt, userPrompt, label = '', moduleKey = '') {
+        const preset = resolveModuleApi(moduleKey);
+        log('info', 'request', `[${label}] 发起请求（${preset ? `独立API：${preset.name}` : '跟随酒馆'}）`, {
             systemPrompt,
             userPrompt,
         });
         let raw;
         try {
-            if (s.api.mode === 'custom' && s.api.url) {
-                raw = await callCustomApi(systemPrompt, userPrompt);
+            if (preset) {
+                raw = await callCustomApi(systemPrompt, userPrompt, preset);
             } else {
                 // 跟随酒馆当前正文所用的 API/连接配置，走原生 generateRaw（不经过 WI/AN 自动扫描，
                 // 上下文素材由本扩展自行拼接到 userPrompt 中）。
@@ -1126,20 +1688,19 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return raw;
     }
 
-    async function callCustomApi(systemPrompt, userPrompt) {
-        const s = settings();
-        const base = s.api.url.replace(/\/+$/, '');
+    async function callCustomApi(systemPrompt, userPrompt, preset) {
+        const base = preset.url.replace(/\/+$/, '');
         const headers = { 'Content-Type': 'application/json' };
-        if (s.api.key) headers['Authorization'] = `Bearer ${s.api.key}`;
+        if (preset.key) headers['Authorization'] = `Bearer ${preset.key}`;
         const body = JSON.stringify({
-            model: s.api.model || undefined,
+            model: preset.model || undefined,
             messages: [
                 ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
                 { role: 'user', content: userPrompt },
             ],
             stream: false,
         });
-        log('debug', 'request', `独立 API 请求：POST ${base}/chat/completions`, { model: s.api.model, hasKey: !!s.api.key });
+        log('debug', 'request', `独立 API 请求：POST ${base}/chat/completions`, { preset: preset.name, model: preset.model, hasKey: !!preset.key });
         const res = await fetch(`${base}/chat/completions`, { method: 'POST', headers, body });
         if (!res.ok) {
             const text = await res.text().catch(() => '');
@@ -1150,16 +1711,15 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return data?.choices?.[0]?.message?.content ?? '';
     }
 
-    async function fetchCustomModelList() {
-        const s = settings();
-        const base = s.api.url.replace(/\/+$/, '');
+    async function fetchCustomModelList(preset) {
+        const base = preset.url.replace(/\/+$/, '');
         const headers = {};
-        if (s.api.key) headers['Authorization'] = `Bearer ${s.api.key}`;
+        if (preset.key) headers['Authorization'] = `Bearer ${preset.key}`;
         const res = await fetch(`${base}/models`, { headers });
         if (!res.ok) throw new Error(`拉取模型列表失败：HTTP ${res.status}`);
         const data = await res.json();
         const list = Array.isArray(data?.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
-        s.api.modelList = list;
+        preset.modelList = list;
         saveSettings();
         return list;
     }
@@ -1216,7 +1776,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         log('info', 'system', `开始生成组件「${widget.name}」`, { id: widget.id, prompt: widget.prompt });
         const extras = await gatherExtras({ floorOffset });
         const userPrompt = buildWidgetUserPrompt(widget, extras);
-        const raw = await callModel(settings().prompts.widgetSystemPrompt, userPrompt, `组件:${widget.name}`);
+        const raw = await callModel(settings().prompts.widgetSystemPrompt, userPrompt, `组件:${widget.name}`, 'widgets');
         const html = stripCodeFence(raw);
         const cd = chatData();
         cd.widgetResults[widget.id] = { html, updatedAt: Date.now(), floorRange: extras.floorRange };
@@ -1255,7 +1815,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const extras = await gatherExtras({ historyDepth: depth, floorOffset });
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
-            const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '表格生成');
+            const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '表格生成', 'tables');
             const parsed = tryParseJsonRobust(raw, '表格生成');
             if (!parsed) {
                 throw new Error('未能从模型响应中解析出 JSON，表格因此没有更新。请在「日志」标签页查看完整响应内容。');
@@ -1519,6 +2079,24 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             }
         } else {
             c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
+        }
+
+        // 本聊天设定注入
+        if (s.lore.injectEnabled) {
+            const txt = buildLoreInjectionText();
+            if (txt) c.setExtensionPrompt(INJECT_KEY_LORE, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${txt}]`, positionKeyToEnum(s.lore.injectPosition), Number(s.lore.injectDepth) || 0);
+            else c.setExtensionPrompt(INJECT_KEY_LORE, '', PROMPT_TYPES.IN_PROMPT, 0);
+        } else {
+            c.setExtensionPrompt(INJECT_KEY_LORE, '', PROMPT_TYPES.IN_PROMPT, 0);
+        }
+
+        // 总结注入
+        if (s.summary.injectEnabled) {
+            const txt = renderAllSummariesText();
+            if (txt) c.setExtensionPrompt(INJECT_KEY_SUMMARY, `[剧情档案（历史总结，供你保持连贯性，不要在正文中直接复述本段）：\n${txt}]`, positionKeyToEnum(s.summary.injectPosition), Number(s.summary.injectDepth) || 0);
+            else c.setExtensionPrompt(INJECT_KEY_SUMMARY, '', PROMPT_TYPES.IN_PROMPT, 0);
+        } else {
+            c.setExtensionPrompt(INJECT_KEY_SUMMARY, '', PROMPT_TYPES.IN_PROMPT, 0);
         }
 
         // 剧情推演注入
@@ -1849,6 +2427,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-tab active" data-tab="widgets">组件生成</div>
               <div class="ow-tab" data-tab="offscreen">表格生成</div>
               <div class="ow-tab" data-tab="plot">剧情推演</div>
+              <div class="ow-tab" data-tab="summary">总结</div>
+              <div class="ow-tab" data-tab="lore">设定</div>
               <div class="ow-tab" data-tab="favorites">收藏夹</div>
               <div class="ow-tab" data-tab="worldinfo">世界书</div>
               <div class="ow-tab" data-tab="prompts">提示词</div>
@@ -1858,6 +2438,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
             <div class="ow-panel" data-panel="plot"></div>
+            <div class="ow-panel" data-panel="summary"></div>
+            <div class="ow-panel" data-panel="lore"></div>
             <div class="ow-panel" data-panel="favorites"></div>
             <div class="ow-panel" data-panel="worldinfo"></div>
             <div class="ow-panel" data-panel="prompts"></div>
@@ -1902,6 +2484,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             ['widgets', renderWidgetsPanel],
             ['offscreen', renderOffscreenPanel],
             ['plot', renderPlotPanel],
+            ['summary', renderSummaryPanel],
+            ['lore', renderLorePanel],
             ['favorites', renderFavoritesPanel],
             ['worldinfo', renderWorldInfoPanel],
             ['prompts', renderPromptsPanel],
@@ -2101,24 +2685,30 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     function buildPreviewSrcdoc(innerHtml, frameId) {
         return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
-  html,body{margin:0;padding:0;background:#fff;}
-  body{padding:12px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.6;}
-  img,video,canvas,table{max-width:100%;}
+  html,body{margin:0;padding:0;background:#fff;height:auto;}
+  #__ow_root{padding:12px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.6;}
+  #__ow_root img,#__ow_root video,#__ow_root canvas,#__ow_root table{max-width:100%;}
 </style></head><body>
-${innerHtml}
+<div id="__ow_root">${innerHtml}</div>
 <script>
 (function(){
   var id=${JSON.stringify(frameId)};
+  var root=document.getElementById('__ow_root');
+  var last=-1;
   function send(){
-    try{
-      var h=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);
-      parent.postMessage({__owFrame:id,height:h},'*');
-    }catch(e){}
+    if(!root) return;
+    // 只量内容容器的高度，绝不能量 documentElement/body 的 scrollHeight：
+    // html 会撑满 iframe 视口，父页面设完高度后它又变成新的测量值，
+    // 于是每轮都比上轮更高，形成"一行一行不断变高"的反馈循环。
+    var h=Math.ceil(root.getBoundingClientRect().height);
+    if(h===last) return;
+    last=h;
+    try{ parent.postMessage({__owFrame:id,height:h},'*'); }catch(e){}
   }
   window.addEventListener('load',send);
   document.addEventListener('DOMContentLoaded',send);
   [50,200,600,1200,2000].forEach(function(t){setTimeout(send,t);});
-  try{ new ResizeObserver(send).observe(document.documentElement); }catch(e){}
+  try{ new ResizeObserver(send).observe(root); }catch(e){}
   window.addEventListener('resize',send);
 })();
 <\/script>
@@ -2135,8 +2725,11 @@ ${innerHtml}
             if (!d || !d.__owFrame || typeof d.height !== 'number') return;
             const el = document.querySelector(`iframe[data-frame-id="${d.__owFrame}"]`);
             if (!el) return;
-            const h = Math.min(Math.max(d.height + 8, 120), 5000);
-            if (Math.abs(parseInt(el.style.height || '0', 10) - h) > 2) el.style.height = h + 'px';
+            // 不再额外 +padding：srcdoc 里量的就是含内边距的内容高度。
+            // 再加保护：与当前高度相差不足 4px 时忽略，避免亚像素抖动来回触发。
+            const h = Math.min(Math.max(d.height, 80), 20000);
+            const cur = parseInt(el.style.height || '0', 10);
+            if (Math.abs(cur - h) >= 4) el.style.height = h + 'px';
         });
     }
 
@@ -2158,7 +2751,11 @@ ${innerHtml}
             $results.append(`
               <div class="ow-result-frame-wrap" data-id="${w.id}">
                 <div class="ow-result-head">
-                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}${result.floorRange?.count ? ` · 读至${escapeHtml(formatFloorRange(result.floorRange))}` : ''}</span>
+                  <span class="ow-result-title">
+                    <span class="ow-caret ow-result-caret" data-action="toggle-preview" title="收起/展开"><i class="fa-solid fa-chevron-down"></i></span>
+                    <b>${escapeHtml(w.name)}</b>
+                    <span class="ow-muted">${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}${result.floorRange?.count ? ` · 读至${escapeHtml(formatFloorRange(result.floorRange))}` : ''}</span>
+                  </span>
                   <span>
                     <button class="ow-btn ow-fav-btn" data-action="favorite" data-id="${w.id}" title="收藏到收藏夹">
                       <i class="${isFavorited(w.id) ? 'fa-solid' : 'fa-regular'} fa-star"></i>
@@ -2171,6 +2768,13 @@ ${innerHtml}
                 <iframe class="ow-result-frame" data-frame-id="${w.id}" sandbox="allow-scripts" allowfullscreen srcdoc="${escapeHtml(buildPreviewSrcdoc(result.html, w.id))}"></iframe>
               </div>`);
         }
+
+        $results.off('click', '[data-action="toggle-preview"]').on('click', '[data-action="toggle-preview"]', function () {
+            const $wrap = $(this).closest('.ow-result-frame-wrap');
+            $wrap.toggleClass('ow-preview-collapsed');
+            const collapsed = $wrap.hasClass('ow-preview-collapsed');
+            $(this).find('i').attr('class', collapsed ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
+        });
 
         $results.off('click', '[data-action="view-raw"]').on('click', '[data-action="view-raw"]', function () {
             const res = chatData().widgetResults[$(this).data('id')];
@@ -2801,6 +3405,10 @@ ${innerHtml}
             renderPlotPanel($panel);
         });
 
+        $tree.on('click', '[data-action="plot-edit"]', function () {
+            openPlotEventEditor($(this).data('event'), $panel);
+        });
+
         $tree.on('click', '[data-action="plot-goto"]', function () {
             const evId = $(this).data('event');
             if (!getPlotEvent(evId)) return;
@@ -2847,6 +3455,7 @@ ${innerHtml}
                 ${isCurrent ? '<span class="ow-node-badge ow-badge-current">进行中</span>' : ''}
                 ${isDone ? '<span class="ow-node-badge ow-badge-done">已经历</span>' : ''}
                 <span class="ow-spacer"></span>
+                <button class="ow-btn" data-action="plot-edit" data-event="${escapeHtml(ev.id)}" title="编辑此事件"><i class="fa-solid fa-pen"></i></button>
                 ${!isCurrent ? `<button class="ow-btn" data-action="plot-goto" data-event="${escapeHtml(ev.id)}" title="设为当前事件"><i class="fa-solid fa-location-crosshairs"></i></button>` : ''}
               </div>
               ${ev.core ? `<div class="ow-node-line"><span class="ow-node-label">核心</span>${escapeHtml(ev.core)}</div>` : ''}
@@ -2877,6 +3486,106 @@ ${innerHtml}
         }
         html += '</div>';
         return html;
+    }
+
+    // ---------------- 事件编辑子弹窗 ----------------
+    function openPlotEventEditor(eventId, $plotPanel) {
+        const pl = chatData().plot;
+        const ev = getPlotEvent(eventId);
+        if (!ev) return;
+        const allIds = pl.events.map((e) => e.id);
+        const nextOptions = (sel) => {
+            const opts = allIds.map((id) => `<option value="${escapeHtml(id)}" ${sel === id ? 'selected' : ''}>事件${escapeHtml(id)}</option>`).join('');
+            const up = String(sel || '').toUpperCase();
+            return `${opts}
+                <option value="OPEN" ${up === 'OPEN' ? 'selected' : ''}>开放结局（可续写）</option>
+                <option value="END" ${up === 'END' ? 'selected' : ''}>最终结局</option>`;
+        };
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:85vh;width:min(640px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">编辑 [事件${escapeHtml(ev.id)}]</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-field-label">事件代号</div>
+              <input type="text" class="ow-input" id="ow_pe_title" value="${escapeHtml(ev.title)}">
+              <div class="ow-field-label">戏剧核心</div>
+              <textarea class="ow-textarea" id="ow_pe_core" style="min-height:60px;">${escapeHtml(ev.core)}</textarea>
+              <div class="ow-field-label">导火索</div>
+              <textarea class="ow-textarea" id="ow_pe_trigger" style="min-height:60px;">${escapeHtml(ev.trigger)}</textarea>
+              <div class="ow-field-label">终局分支（条件写情感倾向，不要写具体动作）</div>
+              <div id="ow_pe_branches">
+                ${ev.branches.map((b, i) => `
+                  <div class="ow-widget-card" data-idx="${i}" style="margin-bottom:6px;">
+                    <div class="ow-widget-card-head">
+                      <span class="ow-branch-key">${escapeHtml(b.key)}</span>
+                      <span class="ow-muted">指向</span>
+                      <select class="ow-select ow-pe-next">${nextOptions(b.next)}</select>
+                      <span class="ow-spacer"></span>
+                      <button class="ow-btn ow-danger" data-action="pe-del-branch" title="删除分支">✕</button>
+                    </div>
+                    <textarea class="ow-textarea ow-pe-cond" style="min-height:56px;" placeholder="若用户表现出……类情感倾向（无论以何种方式表达）">${escapeHtml(b.condition)}</textarea>
+                  </div>`).join('')}
+              </div>
+              <div class="ow-row"><button class="ow-btn" id="ow_pe_add_branch">+ 添加分支</button></div>
+              <div class="ow-row" style="margin-top:14px;justify-content:flex-end;">
+                <button class="ow-btn ow-sub-close">取消</button>
+                <button class="ow-btn ow-primary" id="ow_pe_save">保存</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+
+        const close = () => $ov.remove();
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        $ov.on('click', '[data-action="pe-del-branch"]', function () {
+            if ($ov.find('#ow_pe_branches .ow-widget-card').length <= 1) { toast('至少要保留一条分支', 'warning'); return; }
+            $(this).closest('.ow-widget-card').remove();
+        });
+        $ov.find('#ow_pe_add_branch').on('click', function () {
+            const used = $ov.find('#ow_pe_branches .ow-widget-card').map(function () { return $(this).find('.ow-branch-key').text(); }).get();
+            let key = 'A';
+            for (let i = 0; i < 26; i++) { const k = String.fromCharCode(65 + i); if (!used.includes(k)) { key = k; break; } }
+            $ov.find('#ow_pe_branches').append(`
+              <div class="ow-widget-card" style="margin-bottom:6px;">
+                <div class="ow-widget-card-head">
+                  <span class="ow-branch-key">${key}</span>
+                  <span class="ow-muted">指向</span>
+                  <select class="ow-select ow-pe-next">${nextOptions('OPEN')}</select>
+                  <span class="ow-spacer"></span>
+                  <button class="ow-btn ow-danger" data-action="pe-del-branch">✕</button>
+                </div>
+                <textarea class="ow-textarea ow-pe-cond" style="min-height:56px;" placeholder="若用户表现出……类情感倾向（无论以何种方式表达）"></textarea>
+              </div>`);
+        });
+
+        $ov.find('#ow_pe_save').on('click', function () {
+            ev.title = String($ov.find('#ow_pe_title').val() || '').trim() || ev.title;
+            ev.core = String($ov.find('#ow_pe_core').val() || '').trim();
+            ev.trigger = String($ov.find('#ow_pe_trigger').val() || '').trim();
+            const branches = [];
+            $ov.find('#ow_pe_branches .ow-widget-card').each(function () {
+                branches.push({
+                    key: $(this).find('.ow-branch-key').text().trim().toUpperCase().slice(0, 1),
+                    condition: String($(this).find('.ow-pe-cond').val() || '').trim(),
+                    next: String($(this).find('.ow-pe-next').val() || 'OPEN').trim(),
+                });
+            });
+            if (branches.length) ev.branches = branches;
+            const issues = validateAndRepairPlot(pl.events);
+            if (issues.deadloop.length) {
+                toast(`注意：事件 ${issues.deadloop.join('、')} 现在走不到结局了`, 'warning');
+            }
+            saveChatData();
+            updateInjections();
+            log('info', 'ui', `手动编辑了事件 ${ev.id}`);
+            close();
+            renderPlotPanel($plotPanel);
+        });
     }
 
     // ---------------- 自定义事件子弹窗 ----------------
@@ -3021,6 +3730,308 @@ ${innerHtml}
             s.plot.directions = defaultPlotDirections();
             saveSettings();
             renderList();
+        });
+    }
+
+    // ---------------- 本聊天设定面板 ----------------
+    function renderLorePanel($panel) {
+        const s = settings();
+        const list = loreEntries();
+        const chat = ctx().chat || [];
+        const recentText = chat.slice(-Math.max(1, Number(s.lore.scanDepth) || 10)).map((m) => String(m.mes || '')).join('\n');
+        const activeN = list.filter((e) => isLoreEntryActive(e, recentText)).length;
+
+        $panel.html(`
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <button class="ow-btn ow-primary" id="ow_lore_add"><i class="fa-solid fa-plus"></i> 新建设定</button>
+            <span class="ow-muted">${list.length} 条 · 当前生效 ${activeN} 条${s.lore.injectEnabled ? '' : ' · <b>注入已关闭</b>'}</span>
+          </div>
+          <span class="ow-muted">只属于当前聊天</span>
+        </div>
+        <div class="ow-hint">这些设定只存在这个聊天里，换聊天/换角色都看不到，也不会写进角色卡世界书。<br>
+        关键词留空＝常驻注入；填了关键词＝最近若干层聊天里出现该词才注入（省 token）。</div>
+        <div id="ow_lore_list"></div>`);
+
+        const $list = $panel.find('#ow_lore_list');
+        if (!list.length) {
+            $list.html('<div class="ow-empty">还没有设定。点上方「新建设定」，可以写只属于这个聊天的世界设定、NPC 或用户人设。</div>');
+        } else {
+            const byType = {};
+            for (const e of list) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
+            let html = '';
+            for (const t of LORE_TYPES) {
+                const arr = byType[t.id];
+                if (!arr?.length) continue;
+                html += `<div class="ow-section-title">${t.name}（${arr.length}）</div>`;
+                html += arr.map((e) => {
+                    const active = isLoreEntryActive(e, recentText);
+                    return `
+                  <div class="ow-widget-card ow-collapsed" data-lid="${escapeHtml(e.id)}">
+                    <div class="ow-widget-card-head">
+                      <span class="ow-caret" data-action="lore-toggle"><i class="fa-solid fa-chevron-right"></i></span>
+                      <label class="ow-switch" title="启用/停用">
+                        <input type="checkbox" class="ow-lore-on" ${e.enabled !== false ? 'checked' : ''}><span class="ow-switch-track"></span>
+                      </label>
+                      <span class="ow-widget-name" data-action="lore-toggle">${escapeHtml(e.name || '未命名')}</span>
+                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 20))}` : '常驻'}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
+                      <span class="ow-spacer"></span>
+                      <button class="ow-btn ow-danger" data-action="lore-del"><i class="fa-solid fa-trash"></i></button>
+                    </div>
+                    <div class="ow-widget-card-body">
+                      <div class="ow-field-label">名称</div>
+                      <input type="text" class="ow-input ow-lore-name" value="${escapeHtml(e.name || '')}">
+                      <div class="ow-field-label">分类</div>
+                      <select class="ow-select ow-lore-type">
+                        ${LORE_TYPES.map((t2) => `<option value="${t2.id}" ${((e.type || 'other') === t2.id) ? 'selected' : ''}>${t2.name}</option>`).join('')}
+                      </select>
+                      <div class="ow-field-label">内容</div>
+                      <textarea class="ow-textarea ow-lore-content" style="min-height:120px;">${escapeHtml(e.content || '')}</textarea>
+                      <div class="ow-field-label">关键词（可选，逗号分隔；留空＝常驻注入）</div>
+                      <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
+                    </div>
+                  </div>`;
+                }).join('');
+            }
+            $list.html(html);
+        }
+
+        $panel.find('#ow_lore_add').on('click', function () {
+            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true });
+            saveChatData(); updateInjections(); renderLorePanel($panel);
+        });
+
+        const find = (el) => loreEntries().find((x) => x.id === $(el).closest('.ow-widget-card').data('lid'));
+        $list.on('click', '[data-action="lore-toggle"]', function () {
+            const $c = $(this).closest('.ow-widget-card');
+            $c.toggleClass('ow-collapsed');
+            $c.find('.ow-caret i').attr('class', $c.hasClass('ow-collapsed') ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
+        });
+        $list.on('change', '.ow-lore-on', function () { const e = find(this); if (e) { e.enabled = $(this).is(':checked'); saveChatData(); updateInjections(); } });
+        $list.on('input', '.ow-lore-name', function () {
+            const e = find(this); if (!e) return; e.name = $(this).val(); saveChatData();
+            $(this).closest('.ow-widget-card').find('.ow-widget-name').text(e.name || '未命名');
+        });
+        $list.on('input', '.ow-lore-content', function () { const e = find(this); if (e) { e.content = $(this).val(); saveChatData(); updateInjections(); } });
+        $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
+        $list.on('change', '.ow-lore-type', function () { const e = find(this); if (e) { e.type = $(this).val(); saveChatData(); renderLorePanel($panel); } });
+        $list.on('click', '[data-action="lore-del"]', function () {
+            const e = find(this);
+            if (!e || !confirm(`删除设定「${e.name}」？`)) return;
+            chatData().lore.entries = loreEntries().filter((x) => x.id !== e.id);
+            saveChatData(); updateInjections(); renderLorePanel($panel);
+        });
+    }
+
+    // ---------------- 总结面板 ----------------
+    function renderSummaryPanel($panel) {
+        const s = settings();
+        const cd = chatData();
+        const sm = cd.summary;
+        const chapters = listChapters();
+        const done = lastSummarizedChapter();
+        const nativeN = sm.index.filter((x) => x.source === 'native').length;
+        const missN = sm.index.filter((x) => x.source === 'missing').length;
+
+        $panel.html(`
+        <div class="ow-panel-bar">
+          <div class="ow-row" style="margin:0;">
+            <button class="ow-btn ow-primary ow-gen-btn" id="ow_sum_gen"><i class="fa-solid fa-layer-group"></i> 大总结</button>
+            <button class="ow-btn" id="ow_sum_rescan"><i class="fa-solid fa-magnifying-glass"></i> 重新扫描摘要</button>
+            <span class="ow-muted">共 ${chapters.length} 章 · 已总结至第 ${done} 章 · 识别摘要 ${nativeN}${missN ? ` · 缺失 ${missN}` : ''}</span>
+          </div>
+          <span>
+            <button class="ow-btn" id="ow_sum_import_btn"><i class="fa-solid fa-file-import"></i> 导入历史总结</button>
+            <button class="ow-btn" id="ow_sum_hide_btn"><i class="fa-solid fa-eye-slash"></i> 隐藏楼层</button>
+          </span>
+        </div>
+        <div id="ow_sum_list"></div>`);
+
+        const $list = $panel.find('#ow_sum_list');
+        if (!sm.bigSummaries.length) {
+            $list.html(`<div class="ow-empty">还没有大总结。<br><span class="ow-muted">扩展会先用正则把正文里现成的每章摘要抠出来存档，模型只负责编排结构（转场/高光/物品锚点），摘要正文由扩展原样填入，不经模型改写。</span></div>`);
+        } else {
+            $list.html(sm.bigSummaries.map((b, i) => {
+                const badDlg = b.sections.reduce((n, sec) => n + (sec.dialogue?.lines.filter((l) => l.verified === false).length || 0), 0);
+                return `
+              <div class="ow-widget-card ow-collapsed" data-sid="${escapeHtml(b.id)}">
+                <div class="ow-widget-card-head">
+                  <span class="ow-caret" data-action="sum-toggle"><i class="fa-solid fa-chevron-right"></i></span>
+                  <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} 章</span>
+                  <span class="ow-muted ow-widget-meta">${b.sections.length} 区间 · ${b.level >= 2 ? '已压缩' : '原始'}${badDlg ? ` · <span style="color:#e5787d;">${badDlg} 句待核</span>` : ''}</span>
+                  <span class="ow-spacer"></span>
+                  ${b.level < 2 ? `<button class="ow-btn" data-action="sum-compress" title="压缩叙述（不动高光与物品锚点）"><i class="fa-solid fa-compress"></i></button>` : ''}
+                  <button class="ow-btn" data-action="sum-copy" title="复制文本"><i class="fa-regular fa-copy"></i></button>
+                  <button class="ow-btn ow-danger" data-action="sum-del" title="删除"><i class="fa-solid fa-trash"></i></button>
+                </div>
+                <div class="ow-widget-card-body">
+                  <pre class="ow-preview-box" style="max-height:420px;">${escapeHtml(renderBigSummary(b))}</pre>
+                </div>
+              </div>`;
+            }).join(''));
+        }
+
+        $panel.find('#ow_sum_gen').on('click', () => startBackgroundTask('大总结', () => generateBigSummary()));
+        $panel.find('#ow_sum_rescan').on('click', function () {
+            const r = rescanSummaryIndex();
+            toast(`扫描完成：${r.total} 章，缺失 ${r.missing.length} 章`, r.missing.length ? 'warning' : 'success');
+            renderSummaryPanel($panel);
+        });
+        $panel.find('#ow_sum_hide_btn').on('click', () => openHideDialog($panel));
+        $panel.find('#ow_sum_import_btn').on('click', () => openImportDialog($panel));
+
+        $list.on('click', '[data-action="sum-toggle"]', function () {
+            const $c = $(this).closest('.ow-widget-card');
+            $c.toggleClass('ow-collapsed');
+            $c.find('.ow-caret i').attr('class', $c.hasClass('ow-collapsed') ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
+        });
+        $list.on('click', '[data-action="sum-compress"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('sid');
+            if (!confirm('压缩这条总结的叙述部分？高光对话与物理锚点不会被改动，原始每章摘要也完整保留。')) return;
+            startBackgroundTask('压缩总结', async () => { await compressBigSummary(id); });
+        });
+        $list.on('click', '[data-action="sum-copy"]', async function () {
+            const id = $(this).closest('.ow-widget-card').data('sid');
+            const b = sm.bigSummaries.find((x) => x.id === id);
+            if (!b) return;
+            try { await navigator.clipboard.writeText(renderBigSummary(b)); toast('已复制', 'success'); }
+            catch (e) { toast('复制失败，可从下方文本框手动选取', 'warning'); }
+        });
+        $list.on('click', '[data-action="sum-del"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('sid');
+            const b = sm.bigSummaries.find((x) => x.id === id);
+            if (!b || !confirm(`删除第 ${b.fromCh}–${b.toCh} 章的总结？（每章原始摘要索引不受影响）`)) return;
+            sm.bigSummaries = sm.bigSummaries.filter((x) => x.id !== id);
+            saveChatData(); updateInjections(); renderSummaryPanel($panel);
+        });
+        refreshGeneratingIndicator();
+    }
+
+    // ---------------- 导入历史总结子弹窗 ----------------
+    function openImportDialog($sumPanel) {
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:88vh;width:min(680px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">导入历史总结</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">把你以前存在世界书里的摘要整段粘进来即可。<br>
+              带 <code>\`[Chapter_X]\`</code> 标签的会**按标签自动分章**，章号以标签为准；没有标签的按空行分段，从下面指定的起始章号依次编号。</div>
+              <textarea class="ow-textarea" id="ow_imp_text" style="min-height:240px;" placeholder="\`[Chapter_1]\`2024.10.24 20:00-21:00 玄关 两人重逢，气氛紧绷。&#10;&#10;\`[Chapter_2]\`2024.10.24 21:00-21:40 车厢 两人前往医院，一路无话。"></textarea>
+              <div class="ow-row" style="margin-top:8px;">
+                <label>无标签时起始章号 <input type="number" class="ow-input ow-num" id="ow_imp_start" min="1" value="1"></label>
+                <label><input type="checkbox" id="ow_imp_overwrite" checked> 覆盖同章号的已有摘要</label>
+              </div>
+              <div class="ow-row">
+                <button class="ow-btn" id="ow_imp_preview">预览解析结果</button>
+                <span class="ow-spacer"></span>
+                <button class="ow-btn ow-primary" id="ow_imp_do">确认导入</button>
+              </div>
+              <div id="ow_imp_result"></div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+
+        const close = () => { $ov.remove(); renderSummaryPanel($sumPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        const getOpts = () => ({
+            startChapter: Math.max(1, Number($ov.find('#ow_imp_start').val()) || 1),
+            overwrite: $ov.find('#ow_imp_overwrite').is(':checked'),
+        });
+
+        $ov.find('#ow_imp_preview').on('click', function () {
+            const parsed = parseImportedSummaries($ov.find('#ow_imp_text').val(), getOpts().startChapter);
+            const $r = $ov.find('#ow_imp_result');
+            if (!parsed.length) { $r.html('<div class="ow-empty">没解析出任何条目，检查一下粘贴内容。</div>'); return; }
+            $r.html(`<div class="ow-section-title">解析出 ${parsed.length} 条（第 ${parsed[0].chapter}–${parsed[parsed.length - 1].chapter} 章）</div>
+              <pre class="ow-preview-box">${escapeHtml(parsed.map((x) => `[第${x.chapter}章] ${x.text.slice(0, 120)}${x.text.length > 120 ? '…' : ''}`).join('\n'))}</pre>`);
+        });
+
+        $ov.find('#ow_imp_do').on('click', function () {
+            const raw = $ov.find('#ow_imp_text').val();
+            if (!String(raw || '').trim()) { toast('请先粘贴内容', 'warning'); return; }
+            const r = importSummaries(raw, getOpts());
+            if (!r.total) { toast('没解析出任何条目', 'warning'); return; }
+            toast(`已导入 ${r.added} 条${r.skipped ? `，跳过 ${r.skipped} 条` : ''}`, 'success');
+            close();
+        });
+    }
+
+    // ---------------- 隐藏楼层子弹窗 ----------------
+    function openHideDialog($sumPanel) {
+        const cd = chatData();
+        const total = (ctx().chat || []).length;
+        const suggest = Math.max(0, total - 20);
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:80vh;width:min(560px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">隐藏 / 恢复楼层</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">手动指定区间，不会自动隐藏任何东西。隐藏只是把消息标记为不参与上下文，随时可以恢复。<br>
+              当前共 ${total} 层${suggest > 1 ? `，建议可隐藏至第 ${suggest} 层（保留最近 20 层）` : ''}。</div>
+              <div class="ow-row">
+                <label>从第 <input type="number" class="ow-input ow-num" id="ow_hide_from" min="1" value="1"> 层</label>
+                <label>到第 <input type="number" class="ow-input ow-num" id="ow_hide_to" min="1" value="${suggest > 1 ? suggest : 1}"> 层</label>
+              </div>
+              <div class="ow-row">
+                <button class="ow-btn ow-primary" id="ow_hide_do"><i class="fa-solid fa-eye-slash"></i> 隐藏该区间</button>
+                <button class="ow-btn" id="ow_unhide_do"><i class="fa-solid fa-eye"></i> 恢复该区间</button>
+              </div>
+              <div class="ow-section-title">已隐藏记录</div>
+              <div id="ow_hide_list"></div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+
+        const close = () => { $ov.remove(); renderSummaryPanel($sumPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        const renderHidden = () => {
+            const $l = $ov.find('#ow_hide_list');
+            if (!cd.summary.hidden.length) { $l.html('<div class="ow-muted">暂无</div>'); return; }
+            $l.html(cd.summary.hidden.map((h, i) => `
+              <div class="ow-row" data-idx="${i}">
+                <span>第 ${h.from}–${h.to} 层 <span class="ow-muted">${new Date(h.at).toLocaleString()}</span></span>
+                <span class="ow-spacer"></span>
+                <button class="ow-btn" data-action="unhide-one">恢复</button>
+              </div>`).join(''));
+        };
+        renderHidden();
+
+        const applyHide = async (hide) => {
+            const from = Math.max(1, Number($ov.find('#ow_hide_from').val()) || 1);
+            const to = Math.min(total, Number($ov.find('#ow_hide_to').val()) || 1);
+            if (to < from) { toast('结束楼层不能小于起始楼层', 'warning'); return; }
+            const c = ctx();
+            let n = 0;
+            for (let i = from - 1; i <= to - 1; i++) {
+                if (c.chat[i]) { c.chat[i].is_system = hide; n++; }
+            }
+            // 让酒馆重绘消息列表
+            try { await c.reloadCurrentChat?.(); } catch (e) { /* 部分版本没有此方法 */ }
+            if (hide) cd.summary.hidden.push({ from, to, at: Date.now() });
+            else cd.summary.hidden = cd.summary.hidden.filter((h) => !(h.from === from && h.to === to));
+            saveChatData();
+            log('info', 'system', `${hide ? '隐藏' : '恢复'}了第 ${from}–${to} 层，共 ${n} 条消息`);
+            toast(`${hide ? '已隐藏' : '已恢复'} ${n} 条消息${hide ? '（可随时恢复）' : ''}`, 'success');
+            renderHidden();
+        };
+        $ov.find('#ow_hide_do').on('click', () => applyHide(true));
+        $ov.find('#ow_unhide_do').on('click', () => applyHide(false));
+        $ov.on('click', '[data-action="unhide-one"]', function () {
+            const h = cd.summary.hidden[$(this).closest('.ow-row').data('idx')];
+            if (!h) return;
+            $ov.find('#ow_hide_from').val(h.from);
+            $ov.find('#ow_hide_to').val(h.to);
+            applyHide(false);
         });
     }
 
@@ -3171,6 +4182,20 @@ ${innerHtml}
           其中 <code>{{marker_example}}</code> 会替换成当前事件的隐藏标记样例，扩展就是靠扫描这个标记来自动置灰分支并推进的，删掉它自动推进就会失效。</div>
           <div class="ow-row"><button class="ow-btn" id="ow_prompt_plotinj_reset">恢复默认</button></div>
           <textarea class="ow-textarea" id="ow_prompt_plotinj" style="min-height:200px;">${escapeHtml(s.prompts.plotInjectTemplate)}</textarea>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-layer-group"></i> 总结 · 编排提示词</div>
+          <div class="ow-hint">模型只输出结构（转场/高光/物品锚点），摘要正文由扩展从存档原样填入，不经模型改写。</div>
+          <div class="ow-row"><button class="ow-btn" id="ow_prompt_sum_reset">恢复默认</button></div>
+          <textarea class="ow-textarea" id="ow_prompt_sum" style="min-height:240px;">${escapeHtml(s.prompts.summarySystemPrompt)}</textarea>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-compress"></i> 总结 · 压缩提示词</div>
+          <div class="ow-hint">只压缩叙述部分；高光对话与物理锚点不会进入这个请求，因此不可能被改写。</div>
+          <div class="ow-row"><button class="ow-btn" id="ow_prompt_sumc_reset">恢复默认</button></div>
+          <textarea class="ow-textarea" id="ow_prompt_sumc" style="min-height:160px;">${escapeHtml(s.prompts.summaryCompressPrompt)}</textarea>
         </div>`);
 
         $panel.find('#ow_prompt_widget').on('input', function () {
@@ -3205,11 +4230,162 @@ ${innerHtml}
             s.prompts.plotInjectTemplate = DEFAULT_PLOT_INJECT_TEMPLATE;
             saveSettings(); updateInjections(); renderPromptsPanel($panel);
         });
+        $panel.find('#ow_prompt_sum').on('input', function () { s.prompts.summarySystemPrompt = $(this).val(); saveSettings(); });
+        $panel.find('#ow_prompt_sum_reset').on('click', function () {
+            if (!confirm('恢复默认？')) return;
+            s.prompts.summarySystemPrompt = DEFAULT_SUMMARY_SYSTEM_PROMPT; saveSettings(); renderPromptsPanel($panel);
+        });
+        $panel.find('#ow_prompt_sumc').on('input', function () { s.prompts.summaryCompressPrompt = $(this).val(); saveSettings(); });
+        $panel.find('#ow_prompt_sumc_reset').on('click', function () {
+            if (!confirm('恢复默认？')) return;
+            s.prompts.summaryCompressPrompt = DEFAULT_SUMMARY_COMPRESS_PROMPT; saveSettings(); renderPromptsPanel($panel);
+        });
         $panel.find('#ow_prompt_preview_btn').on('click', function () {
             const $box = $panel.find('#ow_prompt_preview');
             if ($box.is(':visible')) { $box.hide(); return; }
             $box.text(buildOffscreenSystemPrompt()).show();
         });
+    }
+
+    /** 生成"跟随酒馆 / 独立API预设"的选择行 */
+    function moduleApiRow(moduleKey, label, disabled = false, note = '') {
+        const s = settings();
+        const conf = s.moduleApi[moduleKey] || { mode: 'system', presetId: '' };
+        const presets = s.api.presets || [];
+        const dis = disabled ? 'disabled' : '';
+        return `
+        <div class="ow-field-label">${label}</div>
+        <div class="ow-row ${disabled ? 'ow-disabled' : ''}" data-api-module="${moduleKey}">
+          <label><input type="radio" name="ow_mapi_${moduleKey}" value="system" ${conf.mode !== 'preset' ? 'checked' : ''} ${dis}> 跟随酒馆</label>
+          <label><input type="radio" name="ow_mapi_${moduleKey}" value="preset" ${conf.mode === 'preset' ? 'checked' : ''} ${dis}> 独立 API</label>
+          <select class="ow-select ow-mapi-preset" data-module="${moduleKey}" ${conf.mode === 'preset' && !disabled ? '' : 'disabled'}>
+            ${presets.length ? presets.map((p) => `<option value="${escapeHtml(p.id)}" ${conf.presetId === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('') : '<option value="">（还没有预设）</option>'}
+          </select>
+          ${note ? `<span class="ow-muted">${note}</span>` : ''}
+        </div>`;
+    }
+
+    function bindModuleApiRows($panel) {
+        const s = settings();
+        $panel.off('change', '[name^="ow_mapi_"]').on('change', '[name^="ow_mapi_"]', function () {
+            const mk = $(this).attr('name').replace('ow_mapi_', '');
+            s.moduleApi[mk] = s.moduleApi[mk] || { mode: 'system', presetId: '' };
+            s.moduleApi[mk].mode = $(this).val();
+            if (s.moduleApi[mk].mode === 'preset' && !s.moduleApi[mk].presetId) {
+                s.moduleApi[mk].presetId = s.api.presets?.[0]?.id || '';
+            }
+            saveSettings();
+            renderSettingsPanel($panel);
+        });
+        $panel.off('change', '.ow-mapi-preset').on('change', '.ow-mapi-preset', function () {
+            const mk = $(this).data('module');
+            s.moduleApi[mk] = s.moduleApi[mk] || { mode: 'preset', presetId: '' };
+            s.moduleApi[mk].presetId = $(this).val();
+            saveSettings();
+        });
+    }
+
+    function renderApiPresets($panel) {
+        const s = settings();
+        const $box = $panel.find('#ow_api_presets');
+        if (!$box.length) return;
+        const list = s.api.presets || [];
+        if (!list.length) { $box.html('<div class="ow-muted">还没有预设，点下方新建。</div>'); }
+        else {
+            $box.html(list.map((p) => `
+              <div class="ow-widget-card ow-collapsed" data-pid="${escapeHtml(p.id)}">
+                <div class="ow-widget-card-head">
+                  <span class="ow-caret" data-action="api-toggle"><i class="fa-solid fa-chevron-right"></i></span>
+                  <span class="ow-widget-name" data-action="api-toggle">${escapeHtml(p.name || '未命名')}</span>
+                  <span class="ow-muted ow-widget-meta">${escapeHtml(p.model || '未选模型')}</span>
+                  <span class="ow-spacer"></span>
+                  <button class="ow-btn ow-danger" data-action="api-del"><i class="fa-solid fa-trash"></i></button>
+                </div>
+                <div class="ow-widget-card-body">
+                  <div class="ow-field-label">名称</div>
+                  <input type="text" class="ow-input ow-api-name" value="${escapeHtml(p.name || '')}">
+                  <div class="ow-field-label">URL</div>
+                  <input type="text" class="ow-input ow-api-url" value="${escapeHtml(p.url || '')}" placeholder="https://api.openai.com/v1">
+                  <div class="ow-field-label">Key</div>
+                  <input type="password" class="ow-input ow-api-key" value="${escapeHtml(p.key || '')}">
+                  <div class="ow-field-label">模型</div>
+                  <div class="ow-row">
+                    <select class="ow-select ow-grow ow-api-model">
+                      ${p.model ? `<option value="${escapeHtml(p.model)}" selected>${escapeHtml(p.model)}</option>` : '<option value="">（未选择）</option>'}
+                      ${(p.modelList || []).filter((m) => m !== p.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
+                    </select>
+                    <button class="ow-btn" data-action="api-pull">拉取模型</button>
+                  </div>
+                </div>
+              </div>`).join(''));
+        }
+        const find = (el) => (s.api.presets || []).find((x) => x.id === $(el).closest('.ow-widget-card').data('pid'));
+        $box.off('click', '[data-action="api-toggle"]').on('click', '[data-action="api-toggle"]', function () {
+            const $c = $(this).closest('.ow-widget-card');
+            $c.toggleClass('ow-collapsed');
+            $c.find('.ow-caret i').attr('class', $c.hasClass('ow-collapsed') ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
+        });
+        $box.off('input', '.ow-api-name').on('input', '.ow-api-name', function () {
+            const p = find(this); if (!p) return; p.name = $(this).val(); saveSettings();
+            $(this).closest('.ow-widget-card').find('.ow-widget-name').text(p.name || '未命名');
+        });
+        $box.off('input', '.ow-api-url').on('input', '.ow-api-url', function () { const p = find(this); if (p) { p.url = $(this).val().trim(); saveSettings(); } });
+        $box.off('input', '.ow-api-key').on('input', '.ow-api-key', function () { const p = find(this); if (p) { p.key = $(this).val(); saveSettings(); } });
+        $box.off('change', '.ow-api-model').on('change', '.ow-api-model', function () { const p = find(this); if (p) { p.model = $(this).val(); saveSettings(); } });
+        $box.off('click', '[data-action="api-del"]').on('click', '[data-action="api-del"]', function () {
+            const p = find(this);
+            if (!p || !confirm(`删除预设「${p.name}」？正在使用它的模块会回退为跟随酒馆。`)) return;
+            s.api.presets = s.api.presets.filter((x) => x.id !== p.id);
+            for (const k of Object.keys(s.moduleApi || {})) {
+                if (s.moduleApi[k].presetId === p.id) { s.moduleApi[k].mode = 'system'; s.moduleApi[k].presetId = ''; }
+            }
+            saveSettings(); renderSettingsPanel($panel);
+        });
+        $box.off('click', '[data-action="api-pull"]').on('click', '[data-action="api-pull"]', async function () {
+            const p = find(this);
+            if (!p?.url) { toast('请先填写 URL', 'warning'); return; }
+            const $b = $(this); $b.prop('disabled', true).text('拉取中…');
+            try { const l = await fetchCustomModelList(p); toast(`拉取到 ${l.length} 个模型`, 'success'); renderApiPresets($panel); }
+            catch (err) { toast(`拉取失败：${err.message || err}`, 'error'); }
+            finally { $b.prop('disabled', false).text('拉取模型'); }
+        });
+        $panel.find('#ow_api_add').off('click').on('click', function () {
+            s.api.presets = s.api.presets || [];
+            s.api.presets.push({ id: `api_${Date.now().toString(36)}`, name: `预设 ${s.api.presets.length + 1}`, url: '', key: '', model: '', modelList: [] });
+            saveSettings(); renderSettingsPanel($panel);
+        });
+    }
+
+    /** 估算各模块当前的注入体量，帮用户判断有没有吃爆上下文 */
+    function collectInjectionStats() {
+        const s = settings();
+        const rows = [];
+        const add = (name, on, text) => rows.push({ name, on, chars: on ? String(text || '').length : 0 });
+        try { add('本聊天设定', s.lore.injectEnabled, buildLoreInjectionText()); } catch (e) { /* ignore */ }
+        try { add('组件结果', s.injectWidgets, s.widgets.filter((w) => w.enabled).map((w) => chatData().widgetResults[w.id]?.html).filter(Boolean).join('')); } catch (e) { /* ignore */ }
+        try { add('表格', s.offscreen.enabled && s.offscreen.injectTables, renderOffscreenAsPlainText(chatData().offscreen)); } catch (e) { /* ignore */ }
+        try { add('剧情推演', s.plot.injectEnabled, buildPlotInjectionText()); } catch (e) { /* ignore */ }
+        try { add('历史总结', s.summary.injectEnabled, renderAllSummariesText()); } catch (e) { /* ignore */ }
+        const total = rows.reduce((n, r) => n + r.chars, 0);
+        return { rows, total };
+    }
+
+    function renderInjectionOverview($panel) {
+        const $box = $panel.find('#ow_inject_overview');
+        if (!$box.length) return;
+        const { rows, total } = collectInjectionStats();
+        // 粗估：中文约 1 字 ≈ 1 token，英文更省；这里只做量级参考
+        const est = Math.round(total);
+        const level = est > 8000 ? '#e5787d' : est > 4000 ? '#e0a458' : 'inherit';
+        $box.html(`
+          <table class="ow-table" style="margin-top:4px;">
+            <thead><tr><th>模块</th><th>状态</th><th>字符数</th></tr></thead>
+            <tbody>
+              ${rows.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${r.on ? '注入中' : '<span class="ow-muted">未注入</span>'}</td><td>${r.chars ? r.chars.toLocaleString() : '—'}</td></tr>`).join('')}
+              <tr><td><b>合计</b></td><td></td><td style="color:${level};"><b>${est.toLocaleString()}</b></td></tr>
+            </tbody>
+          </table>
+          <div class="ow-muted" style="font-size:11.5px;margin-top:4px;">中文约 1 字 ≈ 1 token，仅供量级参考。超过 4000 会标黄、8000 标红——那时建议关掉几项注入，或把总结压缩一轮。</div>`);
     }
 
     function renderSettingsPanel($panel) {
@@ -3244,6 +4420,8 @@ ${innerHtml}
             <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label>
           </div>
 
+          ${moduleApiRow('widgets', '使用的 API')}
+
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 注入组件结果</label>
@@ -3277,6 +4455,8 @@ ${innerHtml}
             ${tblFollow ? '<span class="ow-muted ow-follow-note">已跟随组件设置</span>' : ''}
           </div>
 
+          ${moduleApiRow('tables', '使用的 API', tblFollow, tblFollow ? '已跟随组件设置' : '')}
+
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 注入表格内容</label>
@@ -3300,6 +4480,8 @@ ${innerHtml}
           </div>
           <div class="ow-muted" style="padding-left:2px;">关：重新生成一份全新矩阵（对当前不满意时用）。开：把现有矩阵发给模型续写（剧情已走完、想接着往下推时用）。</div>
 
+          ${moduleApiRow('plot', '使用的 API')}
+
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
@@ -3307,6 +4489,53 @@ ${innerHtml}
             <label>深度 <input type="number" class="ow-input ow-num" id="ow_plot_inject_depth" min="0" value="${s.plot.injectDepth}"></label>
           </div>
           <div class="ow-muted">世界书发送范围跟随下方「世界书」模块的设定。</div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-scroll"></i> 本聊天设定</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label>
+            <select class="ow-select" id="ow_lore_pos">${posOptions(s.lore.injectPosition)}</select>
+            <label>深度 <input type="number" class="ow-input ow-num" id="ow_lore_depth" min="0" value="${s.lore.injectDepth}"></label>
+          </div>
+          <div class="ow-row">
+            <label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label>
+          </div>
+          <div class="ow-muted" style="font-size:11.5px;">条目在「设定」标签页里管理。内容只存在当前聊天，不会影响其他聊天或角色卡。</div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-gauge-high"></i> 注入总览</div>
+          <div id="ow_inject_overview"></div>
+          <div class="ow-row"><button class="ow-btn" id="ow_inject_refresh"><i class="fa-solid fa-rotate"></i> 刷新</button></div>
+        </div>
+
+        <div class="ow-group">
+          <div class="ow-group-title"><i class="fa-solid fa-layer-group"></i> 总结</div>
+          <div class="ow-row"><label><input type="checkbox" id="ow_sum_enabled" ${s.summary.enabled ? 'checked' : ''}> 启用总结功能</label></div>
+
+          <div class="ow-field-label">摘要缺失时</div>
+          <div class="ow-row">
+            <label><input type="radio" name="ow_sum_missing" value="generate" ${s.summary.onMissing === 'generate' ? 'checked' : ''}> 让模型补写并标 ⚠️</label>
+            <label><input type="radio" name="ow_sum_missing" value="skip" ${s.summary.onMissing === 'skip' ? 'checked' : ''}> 跳过并列出章号</label>
+          </div>
+
+          <div class="ow-field-label">压缩</div>
+          <div class="ow-row">
+            <label><input type="radio" name="ow_sum_cmode" value="manual" ${s.summary.compressMode === 'manual' ? 'checked' : ''}> 手动</label>
+            <label><input type="radio" name="ow_sum_cmode" value="auto" ${s.summary.compressMode === 'auto' ? 'checked' : ''}> 自动</label>
+            <label>差值 <input type="number" class="ow-input ow-num" id="ow_sum_lag" min="1" value="${s.summary.compressLag}" ${s.summary.compressMode === 'auto' ? '' : 'disabled'}></label>
+          </div>
+          <div class="ow-muted" style="font-size:11.5px;">差值 5 = 出现第 5 次总结时压缩第 1 次，第 6 次时压缩第 2 次，依此类推。压缩只动叙述，高光对话与物理锚点一字不改。</div>
+
+          ${moduleApiRow('summary', '使用的 API')}
+
+          <div class="ow-field-label">注入正文</div>
+          <div class="ow-row">
+            <label><input type="checkbox" id="ow_sum_inject" ${s.summary.injectEnabled ? 'checked' : ''}> 注入历史总结</label>
+            <select class="ow-select" id="ow_sum_inject_pos">${posOptions(s.summary.injectPosition)}</select>
+            <label>深度 <input type="number" class="ow-input ow-num" id="ow_sum_inject_depth" min="0" value="${s.summary.injectDepth}"></label>
+          </div>
         </div>
 
         <div class="ow-group">
@@ -3321,23 +4550,10 @@ ${innerHtml}
         </div>
 
         <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-plug"></i> API</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_api_mode" value="system" ${s.api.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
-            <label><input type="radio" name="ow_api_mode" value="custom" ${s.api.mode === 'custom' ? 'checked' : ''}> 独立 API</label>
-          </div>
-          <div class="ow-sub-fields" id="ow_custom_api_fields" style="${s.api.mode === 'custom' ? '' : 'display:none;'}">
-            <input type="text" class="ow-input" id="ow_api_url" placeholder="URL，如 https://api.openai.com/v1" value="${escapeHtml(s.api.url)}">
-            <input type="password" class="ow-input" id="ow_api_key" placeholder="API Key" value="${escapeHtml(s.api.key)}">
-            <div class="ow-row">
-              <select class="ow-select ow-grow" id="ow_api_model">
-                ${s.api.model ? `<option value="${escapeHtml(s.api.model)}" selected>${escapeHtml(s.api.model)}</option>` : ''}
-                ${(s.api.modelList || []).filter((m) => m !== s.api.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
-              </select>
-              <button class="ow-btn" id="ow_api_pull_models">拉取模型</button>
-            </div>
-            <div class="ow-muted">填写即保存。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
-          </div>
+          <div class="ow-group-title"><i class="fa-solid fa-plug"></i> API 预设</div>
+          <div class="ow-muted" style="margin-bottom:6px;">在这里维护多套 API，各模块在自己的分组里选择用哪一套。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+          <div id="ow_api_presets"></div>
+          <div class="ow-row"><button class="ow-btn ow-primary" id="ow_api_add">+ 新建预设</button></div>
         </div>
 
         <div class="ow-group">
@@ -3370,6 +4586,22 @@ ${innerHtml}
         `;
         $panel.html(html);
         renderUpdateSection($panel);
+        renderApiPresets($panel);
+        renderInjectionOverview($panel);
+        $panel.find('#ow_inject_refresh').on('click', () => renderInjectionOverview($panel));
+        $panel.find('#ow_lore_inject').on('change', function () { s.lore.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); renderInjectionOverview($panel); });
+        $panel.find('#ow_lore_pos').on('change', function () { s.lore.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
+        $panel.find('#ow_lore_depth').on('change', function () { s.lore.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_lore_scan').on('change', function () { s.lore.scanDepth = Math.max(1, Number($(this).val()) || 10); saveSettings(); updateInjections(); });
+        bindModuleApiRows($panel);
+
+        $panel.find('#ow_sum_enabled').on('change', function () { s.summary.enabled = $(this).is(':checked'); saveSettings(); });
+        $panel.find('input[name="ow_sum_missing"]').on('change', function () { s.summary.onMissing = $(this).val(); saveSettings(); });
+        $panel.find('input[name="ow_sum_cmode"]').on('change', function () { s.summary.compressMode = $(this).val(); saveSettings(); renderSettingsPanel($panel); });
+        $panel.find('#ow_sum_lag').on('change', function () { s.summary.compressLag = Math.max(1, Number($(this).val()) || 5); saveSettings(); });
+        $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
+        $panel.find('#ow_sum_inject_pos').on('change', function () { s.summary.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
+        $panel.find('#ow_sum_inject_depth').on('change', function () { s.summary.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
         $panel.find('#ow_check_update').on('click', async function () {
             const $btn = $(this);
@@ -3446,29 +4678,6 @@ ${innerHtml}
         $panel.find('#ow_off_inject_pos').on('change', function () { s.offscreen.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_off_inject_depth').on('change', function () { s.offscreen.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
-        $panel.find('input[name="ow_api_mode"]').on('change', function () {
-            s.api.mode = $(this).val();
-            saveSettings();
-            $panel.find('#ow_custom_api_fields').toggle(s.api.mode === 'custom');
-        });
-        $panel.find('#ow_api_url').on('input', function () { s.api.url = $(this).val().trim(); saveSettings(); log('debug', 'system', 'API URL 已自动保存'); });
-        $panel.find('#ow_api_key').on('input', function () { s.api.key = $(this).val(); saveSettings(); log('debug', 'system', 'API Key 已自动保存'); });
-        $panel.find('#ow_api_model').on('change', function () { s.api.model = $(this).val(); saveSettings(); log('debug', 'system', `API 模型已自动保存为 ${s.api.model}`); });
-        $panel.find('#ow_api_pull_models').on('click', async function () {
-            if (!s.api.url) { toast('请先填写 API URL', 'warning'); return; }
-            const $btn = $(this);
-            $btn.prop('disabled', true).text('拉取中…');
-            try {
-                const list = await fetchCustomModelList();
-                toast(`拉取到 ${list.length} 个模型`, 'success');
-                renderSettingsPanel($panel);
-            } catch (err) {
-                console.error(err);
-                toast(`拉取失败：${err.message || err}`, 'error');
-            } finally {
-                $btn.prop('disabled', false).text('拉取模型列表');
-            }
-        });
 
         $panel.find('input[name="ow_theme_mode"]').on('change', function () {
             s.theme.mode = $(this).val();
