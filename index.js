@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.2.1';
+    const EXT_VERSION = '2.3.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -234,6 +234,7 @@
         favorites: { folders: [{ id: 'default', name: '默认收藏夹', createdAt: Date.now() }], items: [] },
         // 剧情推演
         plot: {
+            customEvents: '',
             historyDepth: 20,
             minEvents: 10,
             injectEnabled: true,
@@ -498,6 +499,11 @@
   · 正文中未提及 → 必须原样保留上一版条目的所有字段，一字不改地照抄，不允许新增/删除/修改。
   · 禁止基于逻辑推理、默认进程、或"应该发生了"而主动修改这些表的状态。
 - 各表生命周期（新增/更新/删除时机）互不相同、不共用一套标准，严格按各表小节内的规则执行，不要把某张表的清理逻辑套用到另一张表上。
+- **【增量维护，不是重写】**：下方会提供"已有表格数据"。你的工作是在它的基础上做**修改与追加**，
+  不是推倒重来。除非某表的规则明确要求删除某行，否则**已有的每一行都必须原样保留在输出里**
+  （包括其所有字段内容），只对确实发生变化的字段做修改，并把新出现的内容追加为新行。
+  场景表、物品轨迹表、核心待办事项表、日程表尤其如此——它们的价值就在于跨轮次累积，
+  每次重写会导致历史信息丢失。输出时必须包含全部保留行 + 修改行 + 新增行的完整表格。
 - 所有带编号的标签字段，输出时必须整体带上反引号，例如 \`[Scene_1]\`、\`[Item_Anchor_1]\`、\`[Chapter_1]\`、\`[Foreshadow_1]\`。
 - 若故事本身没有明确章节划分，请自行以连续递增的编号维护一套 \`[Chapter_X]\` 标签体系，保持前后一致、不重新编号已分配过的章节。`;
 
@@ -536,9 +542,11 @@
             if (rows.length) hasExisting = true;
         }
         if (hasExisting) {
-            parts.push(`【已有表格数据（除"正文触发原则"要求变更的部分外，请原样保留，不要从零重写）】\n${JSON.stringify(existing)}`);
+            parts.push(`【已有表格数据 —— 这是上一轮的完整结果，请在此基础上增量维护】\n${JSON.stringify(existing)}\n\n处理要求：以上每一行都要原样出现在你的输出里（除非该表规则明确要求删除它），只修改确实变化了的字段，并追加新增行。禁止只输出新增部分，禁止重写或精简已有行。`);
         }
-        parts.push('请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成或更新以上表格。');
+        parts.push(hasExisting
+            ? '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容，在已有表格基础上做增量更新，输出包含全部保留行的完整表格。'
+            : '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成以上表格。');
         return parts.join('\n\n');
     }
 
@@ -627,12 +635,27 @@
 - 允许事件之间回环跳转（如事件05的某分支回到事件02），但必须保证**从任何一个事件出发，
   沿着任意分支走下去，都能在有限步内抵达 OPEN 或 END**，不能存在只在几个事件间无限打转的闭环。
 
+【分支条件的写法（极其重要，写错会导致剧情永远卡住）】
+- 这是 AI 角色扮演，不是让用户点选项。**绝对不要把分支条件写成某个具体动作**
+  （如"若用户当众下跪道歉""若用户砸碎了那只杯子"）——用户很可能永远不会做那个特定动作，
+  剧情就会永远卡在这个事件里出不去。
+- 分支条件必须落在**用户的情绪与情感倾向**上，判定依据是用户言行中透出的态度，而不是某个指定行为。
+- 一个事件的两条分支必须是**情感方向相反**的一组，并且要**穷尽式覆盖**：
+  任何一种用户反应都应该能被归入其中一边，不留中间地带。
+- 正确示范：
+  · 分支A：若用户表现出**靠近与接纳**的情感倾向——软化、心疼、妥协、想要挽留、愿意共担（无论以何种方式表达）
+  · 分支B：若用户表现出**疏离与抗拒**的情感倾向——冷淡、防备、愤怒、划清界限、选择自保（无论以何种方式表达）
+- 错误示范（禁止这样写）：
+  · ✗ "若用户答应了求婚" ✗ "若用户在三天内回到老宅" ✗ "若用户交出那份文件"
+- 每条分支都要写清是"哪一类情感倾向"，并加上"无论以何种方式表达"之类的兜底措辞，
+  让判定看的是情感基调而非具体动作。
+
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
 {"events":[{"id":"01","title":"事件代号","core":"戏剧核心：本事件旨在催生/改变的情感张力",
 "trigger":"导火索(起)：如何在正文中自然触发","branches":[
-{"key":"A","condition":"若用户最终做出XX行为/决定","next":"02"},
-{"key":"B","condition":"若用户最终做出XX行为/决定","next":"03"}]}]}
+{"key":"A","condition":"若用户表现出XX类情感倾向（无论以何种方式表达）","next":"02"},
+{"key":"B","condition":"若用户表现出与之相反的XX类情感倾向（无论以何种方式表达）","next":"03"}]}]}
 id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。
 next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开放结局）、或 "END"（仅在指定 HE/BE 时可用）。`;
 
@@ -646,7 +669,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 运行法则：
 - 本事件是一个宏观篇章，需要经历多轮互动才能收束。在用户的行为真正满足下面某条终局分支条件之前，
   请持续在本事件内部深化细节、对话与拉扯，不要急于推进，按当前对话的自然速率行进。
-- 每次回复前在后台比对用户输入：若判定其行为真正满足了某条终局分支条件，则在本次正文的末尾
+- 分支判定看的是**用户言行透出的情感倾向**（靠近/疏离、软化/强硬等），不是某个具体动作；
+  只要情感基调明确落向某一边，即可判定该分支成立，不要死等某个特定行为发生。
+- 每次回复前在后台比对用户输入：若判定其情感倾向真正满足了某条终局分支条件，则在本次正文的末尾
   以自然叙事手法无痕引入下一事件的导火索，并在正文最末尾追加一行隐藏标记：
   {{marker_example}}
   其中最后一个字母替换为实际触发的分支字母。该标记是 HTML 注释，不会显示给用户，请务必原样输出。
@@ -676,6 +701,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             parts.push('【结局许可】未指定 HE 或 BE，禁止使用 "END"。所有线路最终都收束到阶段性开放结局（next="OPEN"）。');
         }
         parts.push('【通用约束】所有事件必须基于正文与世界书中已经确立的人物、场所、关系推导，禁止凭空引入未出现过的重要角色或设定，禁止改变世界规则。');
+        const custom = String(s.plot.customEvents || '').trim();
+        if (custom) {
+            parts.push(`【用户指定的必含事件（最高优先级）】\n${custom}\n\n处理要求：以上每一条都**必须**作为独立事件出现在本次矩阵中，不得省略、不得合并、不得改写其核心诉求；\n可以为它们补充戏剧核心、导火索与分支条件，并安排合理的先后顺序与跳转关系。\n若这些事件数量不足要求的节点总数，由你补全其余事件；若已超过，则以用户指定的为准全部保留。`);
+        }
         parts.push(`【要求生成的事件节点数量】至少 ${s.plot.minEvents} 个`);
         if (extras.history) parts.push(`【最近聊天记录】\n${extras.history}`);
         if (extras.worldInfo) parts.push(`【世界书参考】\n${extras.worldInfo}`);
@@ -1744,6 +1773,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
     function openModal() {
         if ($modal) { $modal.remove(); $modal = null; }
+        // 关掉酒馆的"魔法棒"菜单：它是 z-index 29999 的不透明面板，
+        // 窄屏时会铺满视口挡住我们的弹窗。
+        try {
+            const $menu = $('#extensionsMenu');
+            if ($menu.length && $menu.is(':visible')) $menu.hide();
+        } catch (e) { /* 忽略 */ }
         const html = `
         <div class="ow-modal-overlay" id="ow_modal_overlay">
           <div class="ow-modal">
@@ -1905,7 +1940,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         renderWidgetResults($panel);
 
         $panel.find('#ow_generate_now').on('click', () => {
-            startBackgroundTask('组件与表格', () => runGenerationPipeline());
+            const so = settings().offscreen;
+            const withTables = so.enabled && so.followWidgets;
+            startBackgroundTask(withTables ? '组件与表格' : '组件', () => runGenerationPipeline());
         });
         $panel.find('#ow_widget_list_btn').on('click', () => openWidgetListDialog($panel));
         refreshGeneratingIndicator();
@@ -2309,9 +2346,9 @@ ${innerHtml}
         let html = `
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
-            <label><input type="checkbox" id="ow_off_enabled" ${s.offscreen.enabled ? 'checked' : ''}> 启用表格生成</label>
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成/更新</button>
             <span class="ow-muted">${off.updatedAt ? `上次更新 ${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
+            ${s.offscreen.enabled ? '' : '<span class="ow-muted">（未启用：不会随组件生成，也不会注入正文；此处仍可手动生成。可在设置里启用）</span>'}
           </div>
           <button class="ow-btn" id="ow_table_manager_btn"><i class="fa-solid fa-table-list"></i> 表格管理</button>
         </div>
@@ -2338,11 +2375,6 @@ ${innerHtml}
                 for (const row of off.tables?.[t.key] || []) $tbody.append(offscreenRowHtml(t, row));
             }
         }
-
-        $panel.find('#ow_off_enabled').on('change', function () {
-            s.offscreen.enabled = $(this).is(':checked');
-            saveSettings();
-        });
 
         $panel.find('#ow_off_generate').on('click', function () {
             startBackgroundTask('表格生成', () => generateOffscreen());
@@ -2583,6 +2615,7 @@ ${innerHtml}
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_plot_gen"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成推演</button>
+            <button class="ow-btn" id="ow_plot_custom_btn"><i class="fa-solid fa-pen-to-square"></i> 自定义事件${String(s.plot.customEvents || '').trim() ? '<span class="ow-log-badge">已填</span>' : ''}</button>
             <span class="ow-muted">${pl.events.length ? `${pl.events.length} 个事件` : '尚未生成'}${pl.updatedAt ? ' · ' + new Date(pl.updatedAt).toLocaleString() : ''}</span>
           </div>
           <button class="ow-btn" id="ow_plot_dir_btn"><i class="fa-solid fa-compass"></i> 发展方向${dirs.length ? `（${dirs.length}）` : ''}</button>
@@ -2601,6 +2634,7 @@ ${innerHtml}
             startBackgroundTask('剧情推演', () => generatePlot());
         });
         $panel.find('#ow_plot_dir_btn').on('click', () => openDirectionsDialog($panel));
+        $panel.find('#ow_plot_custom_btn').on('click', () => openCustomEventsDialog($panel));
 
         // 手动把某条分支标记为"已走"（模型没输出标记时的兜底）
         $tree.on('click', '[data-action="plot-take"]', function () {
@@ -2696,6 +2730,44 @@ ${innerHtml}
         }
         html += '</div>';
         return html;
+    }
+
+    // ---------------- 自定义事件子弹窗 ----------------
+    function openCustomEventsDialog($plotPanel) {
+        const s = settings();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:80vh;width:min(620px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">自定义事件</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">按点写，一行一个事件，只写你想要发生什么，不用写分支与细节——模型会补上戏剧核心、导火索与情感分支。<br>
+              这里写的每一条都<b>必须</b>出现在生成的矩阵里；不够设定的节点数时，其余由模型补全。留空则完全由模型自由发挥。</div>
+              <textarea class="ow-textarea" id="ow_custom_events" style="min-height:200px;"
+                placeholder="例如：&#10;两人被困在电梯里一整夜&#10;她发现了他藏了三年的那封信&#10;前任带着孩子突然出现在家门口">${escapeHtml(s.plot.customEvents || '')}</textarea>
+              <div class="ow-row" style="margin-top:10px;justify-content:flex-end;">
+                <button class="ow-btn ow-danger" id="ow_custom_clear">清空</button>
+                <button class="ow-btn ow-primary ow-sub-close">完成</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.body);
+
+        const close = () => { $ov.remove(); renderPlotPanel($plotPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+        $ov.find('#ow_custom_events').on('input', function () {
+            s.plot.customEvents = $(this).val();
+            saveSettings();
+        });
+        $ov.find('#ow_custom_clear').on('click', function () {
+            if (!confirm('清空自定义事件？')) return;
+            s.plot.customEvents = '';
+            saveSettings();
+            $ov.find('#ow_custom_events').val('');
+        });
     }
 
     // ---------------- 发展方向子弹窗（与组件列表/表格管理同款交互） ----------------

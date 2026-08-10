@@ -36,7 +36,9 @@
     inset: 0;
     background: rgba(0, 0, 0, 0.55);
     backdrop-filter: blur(2px);
-    z-index: 9998;
+    /* 必须高于酒馆 #extensionsMenu 的 z-index:29999——该菜单带不透明毛玻璃背景，
+       窄屏时会铺满整个视口，我们的弹窗若在其下方就会完全看不见（拉宽后菜单变小才"自己冒出来"） */
+    z-index: 30050;
     display: flex;
     /* flex-start + overflow auto：窗口比视口高时从顶部开始排布，
        不会像 center 那样把上半部分推到视口外导致标题栏/标签栏看不见 */
@@ -47,7 +49,7 @@
     overscroll-behavior: contain;
     animation: ow-fade 0.16s ease;
 }
-.ow-sub-overlay { z-index: 10000; }
+.ow-sub-overlay { z-index: 30060; }
 
 @keyframes ow-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes ow-rise {
