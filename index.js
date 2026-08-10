@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.6.0';
+    const EXT_VERSION = '2.6.2';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -660,28 +660,48 @@
         return kws.some((k) => recentText.includes(k));
     }
 
-    function buildLoreInjectionText() {
+    /**
+     * 按注入位置把生效的设定条目分组。
+     * 每条可以单独指定位置/深度（像世界书那样），没指定的用模块默认值。
+     * 返回 [{position, depth, text}]
+     */
+    function buildLoreInjectionGroups() {
         const s = settings();
         const list = loreEntries();
-        if (!list.length) return '';
+        if (!list.length) return [];
         const chat = ctx().chat || [];
         const depth = Math.max(1, Number(s.lore.scanDepth) || 10);
         const recentText = chat.slice(-depth).map((m) => String(m.mes || '')).join('\n');
 
         const active = list.filter((e) => isLoreEntryActive(e, recentText));
-        if (!active.length) return '';
-        const byType = {};
-        for (const e of active) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
-
-        const parts = [];
-        for (const t of LORE_TYPES) {
-            const arr = byType[t.id];
-            if (!arr?.length) continue;
-            parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
-        }
         const skipped = list.length - active.length;
-        if (skipped > 0) log('debug', 'inject', `本聊天设定：注入 ${active.length} 条，${skipped} 条因关键词未命中而跳过`);
-        return parts.join('\n\n');
+        if (skipped > 0) log('debug', 'inject', `本聊天设定：生效 ${active.length} 条，${skipped} 条因未启用或关键词未命中而跳过`);
+        if (!active.length) return [];
+
+        const groups = new Map();
+        for (const e of active) {
+            const pos = e.position || s.lore.injectPosition;
+            const dep = e.depth ?? s.lore.injectDepth;
+            const key = `${pos}::${dep}`;
+            if (!groups.has(key)) groups.set(key, { position: pos, depth: Number(dep) || 0, items: [] });
+            groups.get(key).items.push(e);
+        }
+        return [...groups.values()].map((g) => {
+            const byType = {};
+            for (const e of g.items) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
+            const parts = [];
+            for (const t of LORE_TYPES) {
+                const arr = byType[t.id];
+                if (!arr?.length) continue;
+                parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
+            }
+            return { position: g.position, depth: g.depth, text: parts.join('\n\n') };
+        }).filter((g) => g.text);
+    }
+
+    /** 合并成一段纯文本（注入总览用） */
+    function buildLoreInjectionText() {
+        return buildLoreInjectionGroups().map((g) => g.text).join('\n\n');
     }
 
     // ------------------------------------------------------------------
@@ -838,11 +858,22 @@
 - 下方会给出【已有场景标签】。若该地点已经存在，**必须复用其 \`[Scene_X]\` 标签**，不要另起名字；确实是新地点才留空由程序分配。
 
 【第二步：高光对话提取】
-- 针对每个转场区间，回到正文原文中寻找最具张力或推动力的**连续互动**。
-- 以剧本格式提取**连续 3-5 个回合**的原文：角色名、对白、动作描写。
-- **对白与动作必须 100% 逐字摘抄正文原文，一个字都不许改写、删减或润色**。程序会把你摘录的每一句拿回原文里做匹配校验，对不上会被标红。
-- 一个区间**只准一段**。剧情必须连续。
-- 若该区间确实没有值得记录的高光互动，填 null——**宁缺毋滥，不要为了填满而硬凑**。
+- 针对每个转场区间，回到正文原文中寻找最具张力或推动力的**连续互动**，以剧本格式提取。
+- **一行 = 一个角色的一句台词 + 一个短动作**。严格照这个样子写：
+      安琳："上车。" (转身时，深褐色的皮草边缘在潮湿的空气中划出一道沉闷的弧度。)
+      况野："好姐姐，你走慢点，小狗没打伞，又要淋湿了。" (换上一副没皮没脸的笑，语调黏糊，三两步追上。)
+- **只输出 3-5 行**（是 3-5 行台词，不是 3-5 段正文）。
+- **对白**：必须是角色说出口的那一句话，逐字原文，不许改写、不许合并两句、不许加省略号省略中间。
+- **动作**：只写这个角色**说这句话的那一瞬间**的肢体、表情或语气，从原文里摘取最贴近的那一个短句即可，
+  **控制在 40 字以内**。
+- **严禁**把整段正文、整章内容、旁白、心理描写或多句台词塞进一行；
+  **严禁**把这一区间所有说过的话堆在一起；**严禁**把别的角色的动作写进这一行。
+  括号里出现两个以上句号，或明显是成段的场景描写，都属于错误。
+- 反例（禁止这样写）：
+      ✗ 安琳："上车。" (雨下得很大。况野站在原地没有动。他想起三年前的那个晚上……整段正文照抄)
+      ✗ 安琳："上车。你怎么还不走？我说了多少次了？" ← 多句合并
+- 一个区间**只准一段**（即只准这 3-5 行）。剧情必须连续。
+- 若该区间确实没有值得记录的高光互动，dialogue 填 null——**宁缺毋滥，不要为了填满而硬凑**。
 - 必须注明这段对话出自第几章。
 
 【第三步：物理锚点】
@@ -861,7 +892,7 @@
   "sceneName":"地点名称",
   "time":"具体日期与时段",
   "chapters":[1,2,3],
-  "dialogue":{"fromChapter":2,"lines":[{"speaker":"角色名","quote":"逐字原文对白","action":"逐字原文动作描写"}]},
+  "dialogue":{"fromChapter":2,"lines":[{"speaker":"角色名","quote":"该角色说出口的那一句话（逐字原文）","action":"说这句话时的一个短动作，40字以内"}]},
   "itemAnchors":[{"tag":"\`[Item_Anchor_1]\` 或留空","name":"物品名","origin":"来源","location":"当前位置","note":"伤情时间节点等","chapters":[2]}]
 }]}
 dialogue 没有时填 null。`;
@@ -918,8 +949,17 @@ dialogue 没有时填 null。`;
         for (const line of section.dialogue.lines) {
             const q = norm(line.quote);
             line.verified = !!(q && pool.includes(q));
+            // 兜底：模型有时会把整段正文塞进括号里的动作，或把多句台词并成一句。
+            // 提示词已经明令禁止，这里再做一道长度检查，超标就标出来让人过目。
+            line.tooLong = (String(line.action || '').length > 60) || (String(line.quote || '').length > 120);
         }
         const bad = section.dialogue.lines.filter((l) => !l.verified).length;
+        const longN = section.dialogue.lines.filter((l) => l.tooLong).length;
+        if (longN) {
+            log('warn', 'parse',
+                `高光对话：有 ${longN} 行的动作或台词过长，模型可能把整段正文塞进来了（已在文档里标注，可编辑或重新生成该区间）`,
+                section.dialogue.lines.filter((l) => l.tooLong).map((l) => `${l.speaker}：${String(l.quote).slice(0, 30)}… (动作${String(l.action).length}字)`));
+        }
         if (bad) {
             log('warn', 'parse',
                 `高光对话校验：有 ${bad} 句在原文中找不到，可能被模型改写或杜撰（已在界面标红，可点"重挑"重新生成该区间）`,
@@ -1039,7 +1079,28 @@ dialogue 没有时填 null。`;
         const cd = chatData();
         const big = cd.summary.bigSummaries.find((b) => b.id === bigId);
         if (!big) throw new Error('找不到这条总结');
-        if (big.level >= 2) { toast('这条已经压缩过了', 'info'); return; }
+        if (big.level >= 2) { toast('这条已经压缩过了（可点还原后重压）', 'info'); return; }
+
+        // 粘贴导入的大总结是一整块文本，里面混着高光原话与物理锚点。
+        // 压缩时必须额外交代"只压叙述、原话一字不改"，并保留原文以便还原。
+        if (big.imported) {
+            const guard = `${s.prompts.summaryCompressPrompt}
+
+【针对整块档案的额外规则（最高优先级）】
+- 下面是一整份剧情档案，里面混有：转场标题、高光对话（带引号的角色原话）、不可忽略物理因素、线性摘要搬运记录。
+- **只允许压缩"线性摘要搬运记录"里的叙述文字**。
+- 【转场标题】【高光对话】里的每一句带引号原话与动作描写、【不可忽略物理因素】的每一条，都必须**逐字原样保留**，一个字都不许改写、合并或删除。
+- 保持原有的层级结构与标签（例如 [Chapter_X]、[Dialogue_Anchor_X]、[Item_Anchor_X] 这类带反引号的标记）不变。
+只输出压缩后的完整档案文本本身。`;
+            const out = await callModel(guard, `【待压缩的剧情档案】\n${big.rawText}`, `压缩(导入):${big.fromCh}-${big.toCh}`, 'summary');
+            big.compressedText = stripCodeFence(out).trim();
+            big.level = 2;
+            big.compressedAt = Date.now();
+            saveChatData();
+            updateInjections();
+            log('info', 'system', `已压缩导入的总结（第 ${big.fromCh}–${big.toCh} 章）。原文已保留，可随时还原。`);
+            return;
+        }
         const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
 
         for (const sec of big.sections) {
@@ -1064,8 +1125,53 @@ dialogue 没有时填 null。`;
         log('info', 'system', `已压缩第 ${big.fromCh}–${big.toCh} 章的总结（高光对话与物理锚点未改动，原始摘要索引也完整保留）`);
     }
 
+    /** 还原压缩：回到未压缩状态（原始数据一直都在，所以是无损的） */
+    function restoreBigSummary(bigId) {
+        const cd = chatData();
+        const big = cd.summary.bigSummaries.find((b) => b.id === bigId);
+        if (!big) return false;
+        big.level = 1;
+        big.compressedAt = null;
+        if (big.imported) delete big.compressedText;
+        else big.sections.forEach((sec) => { delete sec.compressed; });
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `已还原第 ${big.fromCh}–${big.toCh} 章的总结为未压缩状态`);
+        return true;
+    }
+
+    /** 粘贴导入一条已经写好的大总结 */
+    function importBigSummary(rawText, fromCh, toCh) {
+        const cd = chatData();
+        const text = String(rawText || '').trim();
+        if (!text) throw new Error('内容为空');
+        const from = Math.max(1, Number(fromCh) || 1);
+        const to = Math.max(from, Number(toCh) || from);
+        const big = {
+            id: `sum_${Date.now().toString(36)}`,
+            fromCh: from, toCh: to,
+            createdAt: Date.now(),
+            imported: true,
+            rawText: text,
+            sections: [],
+            level: 1,
+            compressedAt: null,
+        };
+        cd.summary.bigSummaries.push(big);
+        cd.summary.bigSummaries.sort((a, b) => a.fromCh - b.fromCh);
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `导入大总结：第 ${from}–${to} 章，${text.length} 字`);
+        return big;
+    }
+
     /** 按你的模板把一条大总结渲染成文本；摘要正文直接取自扩展存档 */
     function renderBigSummary(big, { compressed = null } = {}) {
+        // 粘贴导入的大总结：原样保存原文，压缩后另存，随时可还原
+        if (big.imported) {
+            const useC = compressed === null ? (big.level >= 2) : compressed;
+            return (useC && big.compressedText) ? big.compressedText : (big.rawText || '');
+        }
         const cd = chatData();
         const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
         const useCompressed = compressed === null ? (big.level >= 2) : compressed;
@@ -1077,7 +1183,7 @@ dialogue 没有时填 null。`;
             if (sec.dialogue) {
                 L.push(`    - 高光对话 ${sec.dialogue.tag || ''}${sec.dialogue.fromChapter ? `（出自第${sec.dialogue.fromChapter}章 \`[Chapter_${sec.dialogue.fromChapter}]\`）` : ''}：`);
                 for (const ln of sec.dialogue.lines) {
-                    const mark = ln.verified === false ? ' ⚠️原文未匹配' : '';
+                    const mark = (ln.verified === false ? ' ⚠️原文未匹配' : '') + (ln.tooLong ? ' ⚠️过长(疑似整段照抄)' : '');
                     L.push(`        ${ln.speaker}："${ln.quote}"${ln.action ? ` (${ln.action})` : ''}${mark}`);
                 }
             } else {
@@ -2081,13 +2187,15 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
         }
 
-        // 本聊天设定注入
+        // 本聊天设定注入：每条可以有自己的位置/深度，所以按位置分组各注册一个
+        for (let i = 0; i < 8; i++) c.setExtensionPrompt(`${INJECT_KEY_LORE}_${i}`, '', PROMPT_TYPES.IN_PROMPT, 0);
         if (s.lore.injectEnabled) {
-            const txt = buildLoreInjectionText();
-            if (txt) c.setExtensionPrompt(INJECT_KEY_LORE, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${txt}]`, positionKeyToEnum(s.lore.injectPosition), Number(s.lore.injectDepth) || 0);
-            else c.setExtensionPrompt(INJECT_KEY_LORE, '', PROMPT_TYPES.IN_PROMPT, 0);
-        } else {
-            c.setExtensionPrompt(INJECT_KEY_LORE, '', PROMPT_TYPES.IN_PROMPT, 0);
+            const groups = buildLoreInjectionGroups().slice(0, 8);
+            groups.forEach((g, i) => {
+                c.setExtensionPrompt(`${INJECT_KEY_LORE}_${i}`,
+                    `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`,
+                    positionKeyToEnum(g.position), Number(g.depth) || 0);
+            });
         }
 
         // 总结注入
@@ -3774,7 +3882,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                         <input type="checkbox" class="ow-lore-on" ${e.enabled !== false ? 'checked' : ''}><span class="ow-switch-track"></span>
                       </label>
                       <span class="ow-widget-name" data-action="lore-toggle">${escapeHtml(e.name || '未命名')}</span>
-                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 20))}` : '常驻'}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
+                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'}${e.position ? ' · 自定位置' : ''}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
                       <span class="ow-spacer"></span>
                       <button class="ow-btn ow-danger" data-action="lore-del"><i class="fa-solid fa-trash"></i></button>
                     </div>
@@ -3789,6 +3897,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       <textarea class="ow-textarea ow-lore-content" style="min-height:120px;">${escapeHtml(e.content || '')}</textarea>
                       <div class="ow-field-label">关键词（可选，逗号分隔；留空＝常驻注入）</div>
                       <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
+                      <div class="ow-field-label">注入位置</div>
+                      <div class="ow-row">
+                        <select class="ow-select ow-lore-pos">
+                          <option value="" ${!e.position ? 'selected' : ''}>跟随模块设置</option>
+                          <option value="IN_PROMPT" ${e.position === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
+                          <option value="IN_CHAT" ${e.position === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
+                          <option value="BEFORE_PROMPT" ${e.position === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>
+                        </select>
+                        <label>深度 <input type="number" class="ow-input ow-num ow-lore-depth" min="0" value="${e.depth ?? ''}" placeholder="—"></label>
+                      </div>
                     </div>
                   </div>`;
                 }).join('');
@@ -3814,6 +3932,13 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $list.on('input', '.ow-lore-content', function () { const e = find(this); if (e) { e.content = $(this).val(); saveChatData(); updateInjections(); } });
         $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
+        $list.on('change', '.ow-lore-pos', function () { const e = find(this); if (e) { e.position = $(this).val() || null; saveChatData(); updateInjections(); } });
+        $list.on('change', '.ow-lore-depth', function () {
+            const e = find(this); if (!e) return;
+            const v = $(this).val();
+            e.depth = v === '' ? null : Math.max(0, Number(v) || 0);
+            saveChatData(); updateInjections();
+        });
         $list.on('change', '.ow-lore-type', function () { const e = find(this); if (e) { e.type = $(this).val(); saveChatData(); renderLorePanel($panel); } });
         $list.on('click', '[data-action="lore-del"]', function () {
             const e = find(this);
@@ -3841,7 +3966,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <span class="ow-muted">共 ${chapters.length} 章 · 已总结至第 ${done} 章 · 识别摘要 ${nativeN}${missN ? ` · 缺失 ${missN}` : ''}</span>
           </div>
           <span>
-            <button class="ow-btn" id="ow_sum_import_btn"><i class="fa-solid fa-file-import"></i> 导入历史总结</button>
+            <button class="ow-btn" id="ow_sum_import_btn"><i class="fa-solid fa-file-import"></i> 导入章节摘要</button>
+            <button class="ow-btn" id="ow_sum_impbig_btn"><i class="fa-solid fa-file-lines"></i> 导入大总结</button>
             <button class="ow-btn" id="ow_sum_hide_btn"><i class="fa-solid fa-eye-slash"></i> 隐藏楼层</button>
           </span>
         </div>
@@ -3858,9 +3984,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 <div class="ow-widget-card-head">
                   <span class="ow-caret" data-action="sum-toggle"><i class="fa-solid fa-chevron-right"></i></span>
                   <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} 章</span>
-                  <span class="ow-muted ow-widget-meta">${b.sections.length} 区间 · ${b.level >= 2 ? '已压缩' : '原始'}${badDlg ? ` · <span style="color:#e5787d;">${badDlg} 句待核</span>` : ''}</span>
+                  <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : `${b.sections.length} 区间`} · ${b.level >= 2 ? '已压缩' : '原始'}${badDlg ? ` · <span style="color:#e5787d;">${badDlg} 句待核</span>` : ''}</span>
                   <span class="ow-spacer"></span>
-                  ${b.level < 2 ? `<button class="ow-btn" data-action="sum-compress" title="压缩叙述（不动高光与物品锚点）"><i class="fa-solid fa-compress"></i></button>` : ''}
+                  ${b.level < 2
+                    ? `<button class="ow-btn" data-action="sum-compress" title="压缩叙述（高光原话与物品锚点一字不改）"><i class="fa-solid fa-compress"></i> 压缩</button>`
+                    : `<button class="ow-btn" data-action="sum-restore" title="还原为未压缩（原始数据一直保留）"><i class="fa-solid fa-rotate-left"></i> 还原</button>`}
                   <button class="ow-btn" data-action="sum-copy" title="复制文本"><i class="fa-regular fa-copy"></i></button>
                   <button class="ow-btn ow-danger" data-action="sum-del" title="删除"><i class="fa-solid fa-trash"></i></button>
                 </div>
@@ -3879,6 +4007,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $panel.find('#ow_sum_hide_btn').on('click', () => openHideDialog($panel));
         $panel.find('#ow_sum_import_btn').on('click', () => openImportDialog($panel));
+        $panel.find('#ow_sum_impbig_btn').on('click', () => openImportBigDialog($panel));
 
         $list.on('click', '[data-action="sum-toggle"]', function () {
             const $c = $(this).closest('.ow-widget-card');
@@ -3889,6 +4018,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const id = $(this).closest('.ow-widget-card').data('sid');
             if (!confirm('压缩这条总结的叙述部分？高光对话与物理锚点不会被改动，原始每章摘要也完整保留。')) return;
             startBackgroundTask('压缩总结', async () => { await compressBigSummary(id); });
+        });
+        $list.on('click', '[data-action="sum-restore"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('sid');
+            if (!confirm('还原为未压缩状态？原始数据一直保留着，所以是无损的。')) return;
+            restoreBigSummary(id);
+            renderSummaryPanel($panel);
         });
         $list.on('click', '[data-action="sum-copy"]', async function () {
             const id = $(this).closest('.ow-widget-card').data('sid');
@@ -3905,6 +4040,65 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             saveChatData(); updateInjections(); renderSummaryPanel($panel);
         });
         refreshGeneratingIndicator();
+    }
+
+    // ---------------- 导入大总结子弹窗 ----------------
+    function openImportBigDialog($sumPanel) {
+        const done = lastSummarizedChapter();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:88vh;width:min(700px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">导入大总结</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-hint">把你已经写好的整份大总结粘进来，指定它覆盖第几章到第几章即可。<br>
+              导入的内容会**原样保存**，注入正文时按原文发送。压缩时会额外交代模型只压缩叙述、
+              高光原话与物理锚点逐字保留，并且原文一直留着，随时可以还原。</div>
+              <div class="ow-row">
+                <label>覆盖 第 <input type="number" class="ow-input ow-num" id="ow_ib_from" min="1" value="${done + 1}"> 章</label>
+                <label>到 第 <input type="number" class="ow-input ow-num" id="ow_ib_to" min="1" value="${done + 1}"> 章</label>
+                <span class="ow-muted">当前已总结至第 ${done} 章</span>
+              </div>
+              <div class="ow-field-label">大总结全文</div>
+              <textarea class="ow-textarea" id="ow_ib_text" style="min-height:280px;" placeholder="&lt;大总结(第1-20章)&gt;
+- 【转场标题一】：玄关 - 时间：2024.10.24 20:00
+  - 核心锚点：
+    - 高光对话 \`[Dialogue_Anchor_1]\`：
+        安琳：“你终于来了。”
+  - 线性摘要搬运记录：
+    - \`[Chapter_1]\`：……
+&lt;/大总结(第1-20章)&gt;"></textarea>
+              <div class="ow-row" style="margin-top:10px;justify-content:flex-end;">
+                <button class="ow-btn ow-sub-close">取消</button>
+                <button class="ow-btn ow-primary" id="ow_ib_do">确认导入</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+
+        const close = () => { $ov.remove(); renderSummaryPanel($sumPanel); };
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        // 粘贴时如果标题里写了章号范围，自动填进上面的输入框
+        $ov.find('#ow_ib_text').on('input', function () {
+            const m = /第\s*(\d+)\s*[-–~至]\s*(\d+)\s*章/.exec(String($(this).val() || ''));
+            if (m) { $ov.find('#ow_ib_from').val(m[1]); $ov.find('#ow_ib_to').val(m[2]); }
+        });
+        $ov.find('#ow_ib_do').on('click', function () {
+            const txt = $ov.find('#ow_ib_text').val();
+            if (!String(txt || '').trim()) { toast('请先粘贴内容', 'warning'); return; }
+            const from = Number($ov.find('#ow_ib_from').val()) || 1;
+            const to = Number($ov.find('#ow_ib_to').val()) || from;
+            if (to < from) { toast('结束章号不能小于起始章号', 'warning'); return; }
+            try {
+                importBigSummary(txt, from, to);
+                toast(`已导入第 ${from}–${to} 章的大总结`, 'success');
+                close();
+            } catch (err) { toast(`导入失败：${err.message || err}`, 'error'); }
+        });
     }
 
     // ---------------- 导入历史总结子弹窗 ----------------
