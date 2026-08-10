@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.3.2';
+    const EXT_VERSION = '2.4.1';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -215,8 +215,10 @@
         injectDepth: 0,
         offscreen: {
             enabled: false,
-            followWidgets: true,   // 表格随组件一起生成（此时楼层间隔与上下文楼层跟随组件设置）
-            historyDepth: 5,       // 仅在不跟随组件时生效
+            triggerMode: 'manual',  // 'manual' | 'auto'
+            autoMode: 'follow',     // 'follow'=跟随组件 | 'floor'=自选楼层间隔
+            floorInterval: 10,      // autoMode='floor' 时生效
+            historyDepth: 5,        // autoMode='follow' 时跟随组件的设置
             injectTables: false,
             injectPosition: 'IN_CHAT',
             injectDepth: 0,
@@ -249,6 +251,9 @@
         // 自动触发的细分开关：除了"检测到正文闭合标签"，还支持按楼层数（消息条数）独立触发
         // 组件生成与表格生成，两者的间隔互不影响。
         autoTriggers: {
+            // 楼层自动触发时，回避最新的这几层不读——酒馆可以重 roll，
+            // 刚出的那条很可能被重写，读进去就白读了，留一轮余地。
+            floorBackoff: 2,
             onContentTag: true,
             widgetsByFloor: { enabled: false, interval: 5 },
             offscreenByFloor: { enabled: false, interval: 10 },
@@ -273,9 +278,25 @@
         const es = ctx().extensionSettings;
         if (!es[MODULE_NAME]) es[MODULE_NAME] = {};
         deepMergeDefaults(es[MODULE_NAME], defaultSettings());
+        const st = es[MODULE_NAME];
+        // 迁移：表格触发从 followWidgets + autoTriggers.offscreenByFloor 改为独立的 triggerMode/autoMode
+        if (st.offscreen && st.offscreen.followWidgets !== undefined) {
+            const oldFloor = st.autoTriggers?.offscreenByFloor;
+            if (st.offscreen.followWidgets) {
+                st.offscreen.triggerMode = 'auto';
+                st.offscreen.autoMode = 'follow';
+            } else if (oldFloor?.enabled) {
+                st.offscreen.triggerMode = 'auto';
+                st.offscreen.autoMode = 'floor';
+                st.offscreen.floorInterval = oldFloor.interval || 10;
+            } else {
+                st.offscreen.triggerMode = 'manual';
+            }
+            delete st.offscreen.followWidgets;
+            if (st.autoTriggers) delete st.autoTriggers.offscreenByFloor;
+        }
         // 迁移：旧版本的发展方向只有 {id,name,enabled}，没有 prompt 字段。
         // deepMergeDefaults 不会深入数组元素，这里按 id 补上内置方向的默认提示词。
-        const st = es[MODULE_NAME];
         if (Array.isArray(st.plot?.directions)) {
             const builtin = defaultPlotDirections();
             for (const d of st.plot.directions) {
@@ -898,13 +919,36 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // ------------------------------------------------------------------
     // 上下文素材收集
     // ------------------------------------------------------------------
-    function gatherHistory(n) {
+    /**
+     * 读取聊天记录。
+     * @param {number} n      读取多少层
+     * @param {number} offset 回避最新的多少层不读（楼层自动触发时用，留出重 roll 的余地）
+     */
+    function gatherHistory(n, offset = 0) {
         if (!n || n <= 0) return '';
         const c = ctx();
         const chat = c.chat || [];
-        return chat.slice(-n)
+        const end = Math.max(0, chat.length - Math.max(0, offset));
+        const start = Math.max(0, end - n);
+        return chat.slice(start, end)
             .map((m) => `${m.name}：${String(m.mes || '').slice(0, 2000)}`)
             .join('\n');
+    }
+
+    /** 本次实际读取了聊天记录的哪一段楼层（1 起算，含首尾） */
+    function computeFloorRange(n, offset = 0) {
+        const total = (ctx().chat || []).length;
+        if (!n || n <= 0 || total === 0) return { from: 0, to: 0, count: 0, total, offset };
+        const end = Math.max(0, total - Math.max(0, offset));
+        if (end === 0) return { from: 0, to: 0, count: 0, total, offset };
+        const count = Math.min(n, end);
+        return { from: end - count + 1, to: end, count, total, offset };
+    }
+
+    function formatFloorRange(fr) {
+        if (!fr || !fr.count) return '未读取聊天记录';
+        const base = fr.from === fr.to ? `第 ${fr.to} 层` : `第 ${fr.from}–${fr.to} 层`;
+        return fr.offset ? `${base}（回避最新 ${fr.offset} 层）` : base;
     }
 
     // 获取当前"已绑定/已激活"的世界书清单：全局勾选激活的世界书（读取酒馆世界书面板的
@@ -1040,10 +1084,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return text.trim();
     }
 
-    async function gatherExtras({ historyDepth } = {}) {
+    async function gatherExtras({ historyDepth, floorOffset = 0 } = {}) {
         const s = settings();
         const extras = { history: '', worldInfo: '', charBook: '' };
-        extras.history = gatherHistory(historyDepth === undefined ? s.historyDepth : historyDepth);
+        const depth = historyDepth === undefined ? s.historyDepth : historyDepth;
+        extras.history = gatherHistory(depth, floorOffset);
+        extras.floorRange = computeFloorRange(depth, floorOffset);
         if (s.includeWorldInfo) extras.worldInfo = await gatherWorldInfo();
         if (s.includeCharBook) extras.charBook = await gatherCharBook();
         return extras;
@@ -1166,26 +1212,26 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // ------------------------------------------------------------------
     // 生成：组件
     // ------------------------------------------------------------------
-    async function generateWidget(widget) {
+    async function generateWidget(widget, { floorOffset = 0 } = {}) {
         log('info', 'system', `开始生成组件「${widget.name}」`, { id: widget.id, prompt: widget.prompt });
-        const extras = await gatherExtras();
+        const extras = await gatherExtras({ floorOffset });
         const userPrompt = buildWidgetUserPrompt(widget, extras);
         const raw = await callModel(settings().prompts.widgetSystemPrompt, userPrompt, `组件:${widget.name}`);
         const html = stripCodeFence(raw);
         const cd = chatData();
-        cd.widgetResults[widget.id] = { html, updatedAt: Date.now() };
+        cd.widgetResults[widget.id] = { html, updatedAt: Date.now(), floorRange: extras.floorRange };
         saveChatData();
         log('info', 'system', `组件「${widget.name}」生成完成，已写入 chatMetadata.${MODULE_NAME}.widgetResults["${widget.id}"]`);
         return html;
     }
 
-    async function generateAllWidgets({ onProgress } = {}) {
+    async function generateAllWidgets({ onProgress, floorOffset = 0 } = {}) {
         const s = settings();
         const enabled = s.widgets.filter((w) => w.enabled);
         for (const w of enabled) {
             onProgress?.(w, 'start');
             try {
-                await generateWidget(w);
+                await generateWidget(w, { floorOffset });
                 onProgress?.(w, 'done');
             } catch (err) {
                 console.error('[Ego] 组件生成失败', w.name, err);
@@ -1201,12 +1247,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // ------------------------------------------------------------------
     // 生成：镜头之外
     // ------------------------------------------------------------------
-    async function generateOffscreen({ onProgress } = {}) {
+    async function generateOffscreen({ onProgress, floorOffset = 0 } = {}) {
         log('info', 'system', '开始生成/更新「表格生成」内容');
         onProgress?.('offscreen', 'start');
         const sOff = settings().offscreen;
-        const depth = sOff.followWidgets ? settings().historyDepth : sOff.historyDepth;
-        const extras = await gatherExtras({ historyDepth: depth });
+        const depth = (sOff.triggerMode === 'auto' && sOff.autoMode === 'follow') ? settings().historyDepth : sOff.historyDepth;
+        const extras = await gatherExtras({ historyDepth: depth, floorOffset });
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
             const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '表格生成');
@@ -1230,8 +1276,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 }
             }
             cd.offscreen.updatedAt = Date.now();
+            cd.offscreen.floorRange = extras.floorRange;
             saveChatData();
-            log('info', 'system', `「表格生成」更新完成：${changed.join('、') || '（无表被更新，请检查上面的 parse 警告）'}`);
+            log('info', 'system', `「表格生成」更新完成（读取${formatFloorRange(extras.floorRange)}）：${changed.join('、') || '（无表被更新，请检查上面的 parse 警告）'}`);
             onProgress?.('offscreen', 'done');
         } catch (err) {
             log('error', 'system', `「表格生成」生成失败：${err.message || err}`, err);
@@ -1308,7 +1355,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         log('info', 'system', '=== 开始批量生成流程 ===');
         await generateAllWidgets({ onProgress });
         const s = settings();
-        if (s.offscreen.enabled && s.offscreen.followWidgets) {
+        if (s.offscreen.enabled && s.offscreen.triggerMode === 'auto' && s.offscreen.autoMode === 'follow') {
             try {
                 await generateOffscreen({ onProgress });
             } catch (e) {
@@ -1331,6 +1378,32 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
     async function onCharacterMessageRendered(messageId) {
         const s = settings();
+
+        // 表格的楼层自动更新：与组件的触发方式完全独立，
+        // 组件是手动模式时表格照样可以按自己的楼层间隔更新。
+        try {
+            const c1 = ctx();
+            const mes1 = c1.chat?.[messageId];
+            if (mes1 && !mes1.is_user && !mes1.is_system
+                && s.offscreen.enabled && s.offscreen.triggerMode === 'auto' && s.offscreen.autoMode === 'floor') {
+                const cdT = chatData();
+                const floorNow = c1.chat.length;
+                const iv = Math.max(1, Number(s.offscreen.floorInterval) || 1);
+                const delta = floorNow - (cdT.autoTriggerState.lastOffscreenFloor || 0);
+                log('debug', 'trigger', `[表格楼层触发] 当前第${floorNow}层，距上次已过${delta}层，间隔设置${iv}层`);
+                if (delta >= iv && !isGenerating()) {
+                    const backoff = Math.max(0, Number(s.autoTriggers.floorBackoff) || 0);
+                    log('info', 'trigger', `[表格楼层触发] 达到间隔，开始生成（读取时回避最新 ${backoff} 层，留出重 roll 余地）`);
+                    startBackgroundTask('表格生成', async () => {
+                        await generateOffscreen({ floorOffset: backoff });
+                        cdT.autoTriggerState.lastOffscreenFloor = floorNow;
+                        saveChatData();
+                    });
+                }
+            }
+        } catch (err) {
+            log('error', 'trigger', `表格楼层触发出错：${err.message || err}`, err);
+        }
 
         // 剧情推演标记扫描：与手动/自动模式无关，只要正文里出现标记就推进
         try {
@@ -1391,32 +1464,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 const delta = currentFloor - (at.lastWidgetFloor || 0);
                 log('debug', 'trigger', `[组件楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta}层，间隔设置${interval}层`);
                 if (delta >= interval) {
-                    log('info', 'trigger', `[组件楼层触发] 达到间隔，自动生成组件`);
+                    const backoff = Math.max(0, Number(s.autoTriggers.floorBackoff) || 0);
+                    log('info', 'trigger', `[组件楼层触发] 达到间隔，自动生成组件（读取时回避最新 ${backoff} 层）`);
                     try {
-                        await generateAllWidgets();
+                        await generateAllWidgets({ floorOffset: backoff });
                         at.lastWidgetFloor = currentFloor;
                         saveChatData();
                         refreshOpenPanels();
                     } catch (err) {
                         log('error', 'trigger', '[组件楼层触发] 生成失败', err);
                         toast('按楼层自动生成组件时出错，详见日志标签页', 'error');
-                    }
-                }
-            }
-            if (s.offscreen.enabled && !s.offscreen.followWidgets && s.autoTriggers.offscreenByFloor?.enabled) {
-                const interval2 = Math.max(1, Number(s.autoTriggers.offscreenByFloor.interval) || 1);
-                const delta2 = currentFloor - (at.lastOffscreenFloor || 0);
-                log('debug', 'trigger', `[表格楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta2}层，间隔设置${interval2}层`);
-                if (delta2 >= interval2) {
-                    log('info', 'trigger', `[表格楼层触发] 达到间隔，自动生成表格`);
-                    try {
-                        await generateOffscreen();
-                        at.lastOffscreenFloor = currentFloor;
-                        saveChatData();
-                        refreshOpenPanels();
-                    } catch (err) {
-                        log('error', 'trigger', '[表格楼层触发] 生成失败', err);
-                        toast('按楼层自动生成表格时出错，详见日志标签页', 'error');
                     }
                 }
             }
@@ -2031,7 +2088,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
         $panel.find('#ow_generate_now').on('click', () => {
             const so = settings().offscreen;
-            const withTables = so.enabled && so.followWidgets;
+            const withTables = so.enabled && so.triggerMode === 'auto' && so.autoMode === 'follow';
             startBackgroundTask(withTables ? '组件与表格' : '组件', () => runGenerationPipeline());
         });
         $panel.find('#ow_widget_list_btn').on('click', () => openWidgetListDialog($panel));
@@ -2101,7 +2158,7 @@ ${innerHtml}
             $results.append(`
               <div class="ow-result-frame-wrap" data-id="${w.id}">
                 <div class="ow-result-head">
-                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}</span>
+                  <span>${escapeHtml(w.name)} — ${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}${result.floorRange?.count ? ` · 读至${escapeHtml(formatFloorRange(result.floorRange))}` : ''}</span>
                   <span>
                     <button class="ow-btn ow-fav-btn" data-action="favorite" data-id="${w.id}" title="收藏到收藏夹">
                       <i class="${isFavorited(w.id) ? 'fa-solid' : 'fa-regular'} fa-star"></i>
@@ -2437,7 +2494,7 @@ ${innerHtml}
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_off_generate"><i class="fa-solid fa-wand-magic-sparkles"></i> 生成/更新</button>
-            <span class="ow-muted">${off.updatedAt ? `上次更新 ${new Date(off.updatedAt).toLocaleString()}` : '尚未生成'}</span>
+            <span class="ow-muted">${off.updatedAt ? `上次更新 ${new Date(off.updatedAt).toLocaleString()}${off.floorRange?.count ? ` · 读取${escapeHtml(formatFloorRange(off.floorRange))}` : ''}` : '尚未生成'}</span>
             ${s.offscreen.enabled ? '' : '<span class="ow-muted">（未启用：不会随组件生成，也不会注入正文；此处仍可手动生成。可在设置里启用）</span>'}
           </div>
           <button class="ow-btn" id="ow_table_manager_btn"><i class="fa-solid fa-table-list"></i> 表格管理</button>
@@ -3157,7 +3214,9 @@ ${innerHtml}
 
     function renderSettingsPanel($panel) {
         const s = settings();
-        const follow = s.offscreen.followWidgets;
+        const so = s.offscreen;
+        const tblAuto = so.triggerMode === 'auto';
+        const tblFollow = tblAuto && so.autoMode === 'follow';
         const posOptions = (sel) => `
             <option value="IN_PROMPT" ${sel === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
             <option value="IN_CHAT" ${sel === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
@@ -3175,6 +3234,9 @@ ${innerHtml}
             <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
             <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 每
               <input type="number" class="ow-input ow-num" id="ow_auto_widget_floor_n" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成一次</label>
+            <label>楼层触发时回避最新
+              <input type="number" class="ow-input ow-num" id="ow_floor_backoff" min="0" value="${s.autoTriggers.floorBackoff}"> 层</label>
+            <div class="ow-muted" style="font-size:11.5px;">留出重 roll 的余地：刚生成的那几层可能被你重写，回避后不会白读。组件与表格的楼层触发共用此设置。</div>
           </div>
 
           <div class="ow-field-label">上下文</div>
@@ -3199,14 +3261,20 @@ ${innerHtml}
 
           <div class="ow-field-label">生成方式</div>
           <div class="ow-row">
-            <label><input type="checkbox" id="ow_off_follow" ${follow ? 'checked' : ''}> 跟随组件一起生成</label>
+            <label><input type="radio" name="ow_off_trigger" value="manual" ${!tblAuto ? 'checked' : ''}> 手动</label>
+            <label><input type="radio" name="ow_off_trigger" value="auto" ${tblAuto ? 'checked' : ''}> 自动</label>
           </div>
-          <div class="ow-sub-fields ${follow ? 'ow-disabled' : ''}" id="ow_off_own_fields">
-            <label><input type="checkbox" id="ow_auto_offscreen_floor" ${s.autoTriggers.offscreenByFloor.enabled ? 'checked' : ''} ${follow ? 'disabled' : ''}> 每
-              <input type="number" class="ow-input ow-num" id="ow_auto_offscreen_floor_n" min="1" value="${s.autoTriggers.offscreenByFloor.interval}" ${follow ? 'disabled' : ''}>楼层生成一次</label>
-            <label>获取最近
-              <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${s.offscreen.historyDepth}" ${follow ? 'disabled' : ''}> 楼聊天记录</label>
-            <div class="ow-muted ow-follow-note" style="${follow ? '' : 'display:none;'}">已跟随组件设置：楼层间隔与上下文楼层数与组件一致</div>
+          <div class="ow-sub-fields ${tblAuto ? '' : 'ow-disabled'}" id="ow_off_auto_fields">
+            <label><input type="radio" name="ow_off_automode" value="follow" ${so.autoMode === 'follow' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 跟随组件一起生成</label>
+            <label><input type="radio" name="ow_off_automode" value="floor" ${so.autoMode === 'floor' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 每
+              <input type="number" class="ow-input ow-num" id="ow_off_floor_n" min="1" value="${so.floorInterval}" ${tblAuto && so.autoMode === 'floor' ? '' : 'disabled'}>楼层自动生成一次</label>
+            ${so.autoMode === 'floor' && tblAuto ? `<div class="ow-muted" style="font-size:11.5px;">读取时会回避最新 ${s.autoTriggers.floorBackoff} 层（在「组件」分组里调整），留出重 roll 余地。</div>` : ''}
+          </div>
+
+          <div class="ow-field-label">上下文</div>
+          <div class="ow-row ${tblFollow ? 'ow-disabled' : ''}" id="ow_off_ctx_row">
+            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${so.historyDepth}" ${tblFollow ? 'disabled' : ''}> 楼聊天记录</label>
+            ${tblFollow ? '<span class="ow-muted ow-follow-note">已跟随组件设置</span>' : ''}
           </div>
 
           <div class="ow-field-label">注入正文</div>
@@ -3320,20 +3388,30 @@ ${innerHtml}
         });
         $panel.find('#ow_auto_content_tag').on('change', function () { s.autoTriggers.onContentTag = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_auto_widget_floor').on('change', function () { s.autoTriggers.widgetsByFloor.enabled = $(this).is(':checked'); saveSettings(); });
+        $panel.find('#ow_floor_backoff').on('change', function () {
+            s.autoTriggers.floorBackoff = Math.max(0, Number($(this).val()) || 0);
+            saveSettings();
+            renderSettingsPanel($panel);
+        });
         $panel.find('#ow_auto_widget_floor_n').on('change', function () { s.autoTriggers.widgetsByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
         $panel.find('#ow_off_enabled_set').on('change', function () {
             s.offscreen.enabled = $(this).is(':checked');
             saveSettings();
             if ($modal) renderOffscreenPanel($modal.find('.ow-panel[data-panel="offscreen"]'));
         });
-        $panel.find('#ow_off_follow').on('change', function () {
-            s.offscreen.followWidgets = $(this).is(':checked');
+        $panel.find('input[name="ow_off_trigger"]').on('change', function () {
+            s.offscreen.triggerMode = $(this).val();
             saveSettings();
-            const on = s.offscreen.followWidgets;
-            const $f = $panel.find('#ow_off_own_fields');
-            $f.toggleClass('ow-disabled', on);
-            $f.find('input').prop('disabled', on);
-            $f.find('.ow-follow-note').toggle(on);
+            renderSettingsPanel($panel);
+        });
+        $panel.find('input[name="ow_off_automode"]').on('change', function () {
+            s.offscreen.autoMode = $(this).val();
+            saveSettings();
+            renderSettingsPanel($panel);
+        });
+        $panel.find('#ow_off_floor_n').on('change', function () {
+            s.offscreen.floorInterval = Math.max(1, Number($(this).val()) || 1);
+            saveSettings();
         });
         $panel.find('#ow_off_history_depth').on('change', function () { s.offscreen.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_diag_geometry').on('click', function () {
@@ -3356,8 +3434,6 @@ ${innerHtml}
             }
             toast('没找到扩展管理器入口，请手动打开酒馆左侧「扩展」面板 → Manage extensions', 'warning');
         });
-        $panel.find('#ow_auto_offscreen_floor').on('change', function () { s.autoTriggers.offscreenByFloor.enabled = $(this).is(':checked'); saveSettings(); });
-        $panel.find('#ow_auto_offscreen_floor_n').on('change', function () { s.autoTriggers.offscreenByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_include_wi').on('change', function () { s.includeWorldInfo = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_include_cb').on('change', function () { s.includeCharBook = $(this).is(':checked'); saveSettings(); });
