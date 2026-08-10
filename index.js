@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.3.0';
+    const EXT_VERSION = '2.3.1';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -1604,7 +1604,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               </div>
             </div>
           </div>
-        </div>`).appendTo(document.body);
+        </div>`).appendTo(document.documentElement);
 
         const close = () => $ov.remove();
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
@@ -1808,7 +1808,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <div class="ow-panel" data-panel="log"></div>
           </div>
         </div>`;
-        $modal = $(html).appendTo(document.body);
+        // 挂到 <html> 而不是 <body>：窄屏时酒馆会给 body 加
+        // position:fixed + overflow:hidden（mobile-styles.css，≤1000px），
+        // 挂在 body 下容易被其盒模型/裁剪影响。同时用内联 !important 强制几何，
+        // 避免任何外部样式把弹窗挤出视口。
+        $modal = $(html).appendTo(document.documentElement);
+        forceOverlayGeometry($modal);
 
         $modal.on('click', (e) => { if (e.target.id === 'ow_modal_overlay') closeModal(); });
         $modal.find('#ow_close_btn').on('click', closeModal);
@@ -1846,6 +1851,18 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         renderLogEntries($logPanel);
         refreshGeneratingIndicator();
         log('info', 'ui', '主界面已打开');
+        // 打开后量一次实际几何，写进日志。若窗口在视口外或尺寸为 0，这里会直接暴露出来。
+        setTimeout(() => {
+            let info = null;
+            try { info = diagnoseModalGeometry(); } catch (e) { log('warn', 'ui', `几何诊断失败（不影响使用）：${e.message || e}`); }
+            try {
+                const r = $modal && $modal.find('.ow-modal')[0]?.getBoundingClientRect();
+                if (r && (r.width < 50 || r.height < 50 || r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth)) {
+                    log('error', 'ui', '⚠ 弹窗被渲染到视口之外或尺寸异常，已尝试强制复位。若仍看不到界面，请把上面这条几何诊断日志发给开发者。', info);
+                    forceOverlayGeometry($modal);
+                }
+            } catch (e) { /* 忽略 */ }
+        }, 60);
 
         // 每次打开都重新检查一次更新（有缓存也无妨，请求很轻量），完成后刷新横幅/设置页状态/菜单角标
         checkExtensionUpdate().then(() => {
@@ -1854,6 +1871,66 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const $panel = $modal.find('.ow-panel[data-panel="settings"]');
             if ($panel.find('#ow_update_status').length) renderUpdateSection($panel);
         });
+    }
+
+    /**
+     * 用内联 !important 强制遮罩层的定位与尺寸。
+     * 窄屏下酒馆会改写 body 的定位/溢出，某些主题也可能带全局规则，
+     * 这里不依赖外部 CSS，直接把几何钉死在视口上。
+     */
+    function forceOverlayGeometry($root) {
+        const el = $root && $root[0];
+        if (!el) return;
+        const css = [
+            ['position', 'fixed'], ['top', '0px'], ['left', '0px'],
+            ['right', '0px'], ['bottom', '0px'],
+            ['width', '100vw'], ['height', '100vh'],
+            ['max-width', 'none'], ['max-height', 'none'],
+            ['margin', '0'], ['transform', 'none'], ['zoom', '1'],
+            ['display', 'flex'], ['visibility', 'visible'], ['opacity', '1'],
+            ['z-index', '30050'],
+        ];
+        for (const [k, v] of css) el.style.setProperty(k, v, 'important');
+        // 支持 dvh 的浏览器用 dvh，避免移动端地址栏收放导致高度不对
+        if (window.CSS?.supports?.('height', '100dvh')) {
+            el.style.setProperty('height', '100dvh', 'important');
+        }
+    }
+
+    /** 诊断：报告弹窗实际的位置与尺寸，排查"点了但看不见"这类问题 */
+    function diagnoseModalGeometry() {
+        if (!$modal) { log('warn', 'ui', '诊断：当前没有打开的弹窗'); return null; }
+        // 诊断本身绝不能抛错影响主流程
+        const gcs = (el) => {
+            try { return (window.getComputedStyle || globalThis.getComputedStyle)?.(el) || {}; }
+            catch (e) { return {}; }
+        };
+        const rect = (el) => {
+            try { const r = el.getBoundingClientRect(); return { top: Math.round(r.top), left: Math.round(r.left), width: Math.round(r.width), height: Math.round(r.height), bottom: Math.round(r.bottom), right: Math.round(r.right) }; }
+            catch (e) { return '读取失败'; }
+        };
+        const ov = $modal[0];
+        const md = $modal.find('.ow-modal')[0];
+        const info = {
+            视口: `${window.innerWidth} x ${window.innerHeight}`,
+            遮罩层位置: ov ? rect(ov) : '无',
+            弹窗位置: md ? rect(md) : '无',
+            遮罩层计算样式: ov ? (() => {
+                const c = gcs(ov);
+                return { position: c.position, display: c.display, visibility: c.visibility, opacity: c.opacity, zIndex: c.zIndex, overflow: c.overflow };
+            })() : '无',
+            弹窗计算样式: md ? (() => {
+                const c = gcs(md);
+                return { width: c.width, height: c.height, display: c.display, visibility: c.visibility, opacity: c.opacity, transform: c.transform };
+            })() : '无',
+            body样式: (() => {
+                const c = gcs(document.body);
+                return { position: c.position, overflow: c.overflow, transform: c.transform, filter: c.filter, width: c.width, height: c.height };
+            })(),
+            挂载父节点: ov?.parentElement?.tagName || '未知',
+        };
+        log('info', 'ui', '弹窗几何诊断（若界面显示不出来，请把这条日志发给开发者）', info);
+        return info;
     }
 
     function closeModal() {
@@ -2073,7 +2150,7 @@ ${innerHtml}
               <div id="ow_widget_list"></div>
             </div>
           </div>
-        </div>`).appendTo(document.body);
+        </div>`).appendTo(document.documentElement);
 
         const close = () => { $ov.remove(); renderWidgetsPanel($widgetsPanel); };
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
@@ -2440,7 +2517,7 @@ ${innerHtml}
               </div>
             </div>
           </div>
-        </div>`).appendTo(document.body);
+        </div>`).appendTo(document.documentElement);
 
         const close = () => { $ov.remove(); renderOffscreenPanel($offscreenPanel); };
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
@@ -2753,7 +2830,7 @@ ${innerHtml}
               </div>
             </div>
           </div>
-        </div>`).appendTo(document.body);
+        </div>`).appendTo(document.documentElement);
 
         const close = () => { $ov.remove(); renderPlotPanel($plotPanel); };
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
@@ -2791,7 +2868,7 @@ ${innerHtml}
               </div>
             </div>
           </div>
-        </div>`).appendTo(document.body);
+        </div>`).appendTo(document.documentElement);
 
         const close = () => { $ov.remove(); renderPlotPanel($plotPanel); };
         $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
@@ -3205,6 +3282,7 @@ ${innerHtml}
             </a>
             <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
             <button class="ow-btn" id="ow_open_ext_manager"><i class="fa-solid fa-gear"></i> 打开扩展管理器</button>
+            <button class="ow-btn" id="ow_diag_geometry"><i class="fa-solid fa-ruler-combined"></i> 界面显示诊断</button>
           </div>
           <div id="ow_update_status" class="ow-hint">尚未检查</div>
         </div>
@@ -3245,6 +3323,11 @@ ${innerHtml}
             $f.find('.ow-follow-note').toggle(on);
         });
         $panel.find('#ow_off_history_depth').on('change', function () { s.offscreen.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_diag_geometry').on('click', function () {
+            forceOverlayGeometry($modal);
+            diagnoseModalGeometry();
+            toast('已复位窗口并记录几何诊断，详见「日志」标签页', 'info');
+        });
         $panel.find('#ow_plot_history').on('change', function () { s.plot.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_plot_min').on('change', function () { s.plot.minEvents = Math.max(2, Number($(this).val()) || 2); saveSettings(); });
         $panel.find('#ow_plot_send_current').on('change', function () { s.plot.sendCurrent = $(this).is(':checked'); saveSettings(); });
