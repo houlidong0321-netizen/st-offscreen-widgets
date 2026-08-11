@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.6.2';
+    const EXT_VERSION = '2.7.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -150,7 +150,51 @@
 
     // 酒馆的 extension_prompt_types 枚举值（见 public/script.js），此处静态复制，
     // 避免额外导入。若未来酒馆更改枚举值，可在此处调整。
+    // 与酒馆世界书的位置语义对齐：
+    //   角色定义前 = BEFORE_PROMPT（getExtensionPrompt 里的 beforeScenarioAnchor）
+    //   角色定义后 = IN_PROMPT   （afterScenarioAnchor）
+    //   聊天中     = IN_CHAT     （按 depth 插入聊天记录）
+    // 注意：酒馆对"角色定义前/后"的多条注入是按注入键名 Object.keys().sort() 排序的，
+    // depth 只对"聊天中"生效。所以"顺序"必须编码进键名里（补零后参与字典序）。
     const PROMPT_TYPES = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+    const POSITION_LABELS = {
+        BEFORE_PROMPT: '角色定义前',
+        IN_PROMPT: '角色定义后',
+        IN_CHAT: '聊天中（按深度）',
+    };
+    const isDepthPosition = (pos) => pos === 'IN_CHAT';
+
+    /** 生成与酒馆一致的位置下拉选项 */
+    function positionOptionsHtml(sel) {
+        return ['BEFORE_PROMPT', 'IN_PROMPT', 'IN_CHAT']
+            .map((k) => `<option value="${k}" ${sel === k ? 'selected' : ''}>${POSITION_LABELS[k]}</option>`)
+            .join('');
+    }
+
+    // 已注册的注入键，用于在重新注入前清干净（键名会随顺序变化）
+    const registeredInjectKeys = new Set();
+
+    /**
+     * 注册一条注入。
+     * @param {string} baseName 模块标识
+     * @param {string} position 'BEFORE_PROMPT' | 'IN_PROMPT' | 'IN_CHAT'
+     * @param {number} depth    仅"聊天中"生效
+     * @param {number} order    仅"角色定义前/后"生效，数字越小越靠前
+     */
+    function setInjection(baseName, text, position, depth, order) {
+        const c = ctx();
+        const ord = String(Math.max(0, Number(order) || 0)).padStart(4, '0');
+        const key = `${MODULE_NAME}_${ord}_${baseName}`;
+        registeredInjectKeys.add(key);
+        c.setExtensionPrompt(key, text || '', PROMPT_TYPES[position] ?? PROMPT_TYPES.IN_CHAT,
+            isDepthPosition(position) ? (Number(depth) || 0) : 0);
+    }
+
+    function clearAllInjections() {
+        const c = ctx();
+        for (const k of registeredInjectKeys) c.setExtensionPrompt(k, '', PROMPT_TYPES.IN_PROMPT, 0);
+        registeredInjectKeys.clear();
+    }
     const INJECT_KEY_WIDGETS = `${MODULE_NAME}_widgets`;
     const INJECT_KEY_OFFSCREEN = `${MODULE_NAME}_offscreen`;
     const INJECT_KEY_PLOT = `${MODULE_NAME}_plot`;
@@ -215,6 +259,7 @@
         injectWidgets: false,
         injectPosition: 'IN_CHAT',
         injectDepth: 0,
+        injectOrder: 100,
         offscreen: {
             enabled: false,
             triggerMode: 'manual',  // 'manual' | 'auto'
@@ -224,6 +269,7 @@
             injectTables: false,
             injectPosition: 'IN_CHAT',
             injectDepth: 0,
+            injectOrder: 110,
         },
         api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '' },
         // 各模块用哪套 API：'system'=跟随酒馆，'preset'=指定预设
@@ -250,6 +296,7 @@
             injectEnabled: true,
             injectPosition: 'IN_PROMPT',
             injectDepth: 0,
+            injectOrder: 50,
             scanDepth: 10,   // 关键词触发时向前扫描多少层聊天
         },
         // 总结
@@ -269,6 +316,7 @@
             injectEnabled: false,
             injectPosition: 'IN_CHAT',
             injectDepth: 2,
+            injectOrder: 90,
         },
         // 剧情推演
         plot: {
@@ -278,6 +326,7 @@
             injectEnabled: true,
             injectPosition: 'IN_CHAT',
             injectDepth: 1,
+            injectOrder: 120,
             sendCurrent: false, // 生成时是否把当前推演一并发给模型（默认不发）
             directions: defaultPlotDirections(),
         },
@@ -682,8 +731,9 @@
         for (const e of active) {
             const pos = e.position || s.lore.injectPosition;
             const dep = e.depth ?? s.lore.injectDepth;
-            const key = `${pos}::${dep}`;
-            if (!groups.has(key)) groups.set(key, { position: pos, depth: Number(dep) || 0, items: [] });
+            const ord = e.order ?? s.lore.injectOrder;
+            const key = `${pos}::${dep}::${ord}`;
+            if (!groups.has(key)) groups.set(key, { position: pos, depth: Number(dep) || 0, order: Number(ord) || 0, items: [] });
             groups.get(key).items.push(e);
         }
         return [...groups.values()].map((g) => {
@@ -695,8 +745,8 @@
                 if (!arr?.length) continue;
                 parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
             }
-            return { position: g.position, depth: g.depth, text: parts.join('\n\n') };
-        }).filter((g) => g.text);
+            return { position: g.position, depth: g.depth, order: g.order, text: parts.join('\n\n') };
+        }).filter((g) => g.text).sort((a, b) => a.order - b.order);
     }
 
     /** 合并成一段纯文本（注入总览用） */
@@ -2154,69 +2204,46 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     }
 
     function updateInjections() {
-        const c = ctx();
         const s = settings();
-        log('debug', 'inject', `更新正文注入（组件注入:${s.injectWidgets ? '开' : '关'}，表格注入:${s.offscreen.enabled && s.offscreen.injectTables ? '开' : '关'}）`);
-        // 组件注入
+        log('debug', 'inject', '更新正文注入');
+        // 键名里带顺序号，改顺序会换键名，所以先把上一轮注册过的全部清空
+        clearAllInjections();
+
+        // 组件
         if (s.injectWidgets) {
             const cd = chatData();
-            const enabled = s.widgets.filter((w) => w.enabled);
-            const text = enabled
-                .map((w) => cd.widgetResults[w.id]?.html)
-                .filter(Boolean)
-                .join('\n\n');
-            if (text) {
-                c.setExtensionPrompt(INJECT_KEY_WIDGETS, `[以下是与当前场景相关的附加参考素材，不要在正文中直接复述或提及其存在：\n${text}]`, positionKeyToEnum(s.injectPosition), Number(s.injectDepth) || 0);
-            } else {
-                c.setExtensionPrompt(INJECT_KEY_WIDGETS, '', PROMPT_TYPES.IN_PROMPT, 0);
-            }
-        } else {
-            c.setExtensionPrompt(INJECT_KEY_WIDGETS, '', PROMPT_TYPES.IN_PROMPT, 0);
+            const text = s.widgets.filter((w) => w.enabled)
+                .map((w) => cd.widgetResults[w.id]?.html).filter(Boolean).join('\n\n');
+            if (text) setInjection('widgets', `[以下是与当前场景相关的附加参考素材，不要在正文中直接复述或提及其存在：\n${text}]`,
+                s.injectPosition, s.injectDepth, s.injectOrder);
         }
 
-        // 表格注入
+        // 表格
         if (s.offscreen.enabled && s.offscreen.injectTables) {
-            const cd = chatData();
-            const text = renderOffscreenAsPlainText(cd.offscreen);
-            if (text) {
-                c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`, positionKeyToEnum(s.offscreen.injectPosition), Number(s.offscreen.injectDepth) || 0);
-            } else {
-                c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
-            }
-        } else {
-            c.setExtensionPrompt(INJECT_KEY_OFFSCREEN, '', PROMPT_TYPES.IN_PROMPT, 0);
+            const text = renderOffscreenAsPlainText(chatData().offscreen);
+            if (text) setInjection('tables', `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`,
+                s.offscreen.injectPosition, s.offscreen.injectDepth, s.offscreen.injectOrder);
         }
 
-        // 本聊天设定注入：每条可以有自己的位置/深度，所以按位置分组各注册一个
-        for (let i = 0; i < 8; i++) c.setExtensionPrompt(`${INJECT_KEY_LORE}_${i}`, '', PROMPT_TYPES.IN_PROMPT, 0);
+        // 本聊天设定：每条可有自己的位置/深度/顺序，按三者分组
         if (s.lore.injectEnabled) {
-            const groups = buildLoreInjectionGroups().slice(0, 8);
-            groups.forEach((g, i) => {
-                c.setExtensionPrompt(`${INJECT_KEY_LORE}_${i}`,
-                    `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`,
-                    positionKeyToEnum(g.position), Number(g.depth) || 0);
+            buildLoreInjectionGroups().slice(0, 12).forEach((g, i) => {
+                setInjection(`lore${i}`, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`,
+                    g.position, g.depth, g.order);
             });
         }
 
-        // 总结注入
+        // 历史总结
         if (s.summary.injectEnabled) {
             const txt = renderAllSummariesText();
-            if (txt) c.setExtensionPrompt(INJECT_KEY_SUMMARY, `[剧情档案（历史总结，供你保持连贯性，不要在正文中直接复述本段）：\n${txt}]`, positionKeyToEnum(s.summary.injectPosition), Number(s.summary.injectDepth) || 0);
-            else c.setExtensionPrompt(INJECT_KEY_SUMMARY, '', PROMPT_TYPES.IN_PROMPT, 0);
-        } else {
-            c.setExtensionPrompt(INJECT_KEY_SUMMARY, '', PROMPT_TYPES.IN_PROMPT, 0);
+            if (txt) setInjection('summary', `[剧情档案（历史总结，供你保持连贯性，不要在正文中直接复述本段）：\n${txt}]`,
+                s.summary.injectPosition, s.summary.injectDepth, s.summary.injectOrder);
         }
 
-        // 剧情推演注入
+        // 剧情推演
         if (s.plot.injectEnabled) {
             const text = buildPlotInjectionText();
-            if (text) {
-                c.setExtensionPrompt(INJECT_KEY_PLOT, text, positionKeyToEnum(s.plot.injectPosition), Number(s.plot.injectDepth) || 0);
-            } else {
-                c.setExtensionPrompt(INJECT_KEY_PLOT, '', PROMPT_TYPES.IN_PROMPT, 0);
-            }
-        } else {
-            c.setExtensionPrompt(INJECT_KEY_PLOT, '', PROMPT_TYPES.IN_PROMPT, 0);
+            if (text) setInjection('plot', text, s.plot.injectPosition, s.plot.injectDepth, s.plot.injectOrder);
         }
     }
 
@@ -3899,13 +3926,14 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
                       <div class="ow-field-label">注入位置</div>
                       <div class="ow-row">
-                        <select class="ow-select ow-lore-pos">
+                        <select class="ow-select ow-lore-epos">
                           <option value="" ${!e.position ? 'selected' : ''}>跟随模块设置</option>
-                          <option value="IN_PROMPT" ${e.position === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
-                          <option value="IN_CHAT" ${e.position === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
-                          <option value="BEFORE_PROMPT" ${e.position === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>
+                          ${positionOptionsHtml(e.position)}
                         </select>
-                        <label>深度 <input type="number" class="ow-input ow-num ow-lore-depth" min="0" value="${e.depth ?? ''}" placeholder="—"></label>
+                        <label class="ow-eposnum" ${isDepthPosition(e.position) ? '' : 'style="display:none;"'}>深度
+                          <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? ''}" placeholder="—"></label>
+                        <label class="ow-eposnum" ${(e.position && !isDepthPosition(e.position)) ? '' : 'style="display:none;"'}>顺序
+                          <input type="number" class="ow-input ow-num ow-lore-eorder" min="0" value="${e.order ?? ''}" placeholder="—"></label>
                       </div>
                     </div>
                   </div>`;
@@ -3932,11 +3960,27 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $list.on('input', '.ow-lore-content', function () { const e = find(this); if (e) { e.content = $(this).val(); saveChatData(); updateInjections(); } });
         $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
-        $list.on('change', '.ow-lore-pos', function () { const e = find(this); if (e) { e.position = $(this).val() || null; saveChatData(); updateInjections(); } });
-        $list.on('change', '.ow-lore-depth', function () {
+        $list.on('change', '.ow-lore-epos', function () {
+            const e = find(this); if (!e) return;
+            e.position = $(this).val() || null;
+            saveChatData(); updateInjections();
+            const $row = $(this).closest('.ow-row');
+            const depthMode = isDepthPosition(e.position);
+            $row.find('.ow-eposnum').each(function () {
+                const isDepth = $(this).find('input').hasClass('ow-lore-edepth');
+                $(this).toggle(!!e.position && (depthMode ? isDepth : !isDepth));
+            });
+        });
+        $list.on('change', '.ow-lore-edepth', function () {
             const e = find(this); if (!e) return;
             const v = $(this).val();
             e.depth = v === '' ? null : Math.max(0, Number(v) || 0);
+            saveChatData(); updateInjections();
+        });
+        $list.on('change', '.ow-lore-eorder', function () {
+            const e = find(this); if (!e) return;
+            const v = $(this).val();
+            e.order = v === '' ? null : Math.max(0, Number(v) || 0);
             saveChatData(); updateInjections();
         });
         $list.on('change', '.ow-lore-type', function () { const e = find(this); if (e) { e.type = $(this).val(); saveChatData(); renderLorePanel($panel); } });
@@ -4582,15 +4626,23 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-muted" style="font-size:11.5px;margin-top:4px;">中文约 1 字 ≈ 1 token，仅供量级参考。超过 4000 会标黄、8000 标红——那时建议关掉几项注入，或把总结压缩一轮。</div>`);
     }
 
+    /** 一行"注入位置 + 深度/顺序"控件：聊天中显示深度，角色定义前/后显示顺序 */
+    function posRow(idPrefix, pos, depth, order) {
+        const depthMode = isDepthPosition(pos);
+        return `
+          <select class="ow-select ow-pos-select" id="${idPrefix}_pos">${positionOptionsHtml(pos)}</select>
+          <label class="ow-posnum" ${depthMode ? '' : 'style="display:none;"'}>深度
+            <input type="number" class="ow-input ow-num" id="${idPrefix}_depth" min="0" value="${depth ?? 0}"></label>
+          <label class="ow-posnum" ${depthMode ? 'style="display:none;"' : ''}>顺序
+            <input type="number" class="ow-input ow-num" id="${idPrefix}_order" min="0" value="${order ?? 100}"></label>`;
+    }
+
     function renderSettingsPanel($panel) {
         const s = settings();
         const so = s.offscreen;
         const tblAuto = so.triggerMode === 'auto';
         const tblFollow = tblAuto && so.autoMode === 'follow';
-        const posOptions = (sel) => `
-            <option value="IN_PROMPT" ${sel === 'IN_PROMPT' ? 'selected' : ''}>提示词顶部</option>
-            <option value="IN_CHAT" ${sel === 'IN_CHAT' ? 'selected' : ''}>聊天记录中（按深度）</option>
-            <option value="BEFORE_PROMPT" ${sel === 'BEFORE_PROMPT' ? 'selected' : ''}>提示词最前</option>`;
+
         const html = `
         <div class="ow-group">
           <div class="ow-group-title"><i class="fa-solid fa-puzzle-piece"></i> 组件</div>
@@ -4619,8 +4671,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 注入组件结果</label>
-            <select class="ow-select" id="ow_inject_pos">${posOptions(s.injectPosition)}</select>
-            <label>深度 <input type="number" class="ow-input ow-num" id="ow_inject_depth" min="0" value="${s.injectDepth}"></label>
+            ${posRow('ow_inject', s.injectPosition, s.injectDepth, s.injectOrder)}
           </div>
         </div>
 
@@ -4654,8 +4705,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 注入表格内容</label>
-            <select class="ow-select" id="ow_off_inject_pos">${posOptions(s.offscreen.injectPosition)}</select>
-            <label>深度 <input type="number" class="ow-input ow-num" id="ow_off_inject_depth" min="0" value="${s.offscreen.injectDepth}"></label>
+            ${posRow('ow_off_inject', s.offscreen.injectPosition, s.offscreen.injectDepth, s.offscreen.injectOrder)}
           </div>
         </div>
 
@@ -4679,8 +4729,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
-            <select class="ow-select" id="ow_plot_inject_pos">${posOptions(s.plot.injectPosition)}</select>
-            <label>深度 <input type="number" class="ow-input ow-num" id="ow_plot_inject_depth" min="0" value="${s.plot.injectDepth}"></label>
+            ${posRow('ow_plot_inject', s.plot.injectPosition, s.plot.injectDepth, s.plot.injectOrder)}
           </div>
           <div class="ow-muted">世界书发送范围跟随下方「世界书」模块的设定。</div>
         </div>
@@ -4689,8 +4738,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-group-title"><i class="fa-solid fa-scroll"></i> 本聊天设定</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label>
-            <select class="ow-select" id="ow_lore_pos">${posOptions(s.lore.injectPosition)}</select>
-            <label>深度 <input type="number" class="ow-input ow-num" id="ow_lore_depth" min="0" value="${s.lore.injectDepth}"></label>
+            ${posRow('ow_lore', s.lore.injectPosition, s.lore.injectDepth, s.lore.injectOrder)}
           </div>
           <div class="ow-row">
             <label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label>
@@ -4727,8 +4775,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-field-label">注入正文</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_sum_inject" ${s.summary.injectEnabled ? 'checked' : ''}> 注入历史总结</label>
-            <select class="ow-select" id="ow_sum_inject_pos">${posOptions(s.summary.injectPosition)}</select>
-            <label>深度 <input type="number" class="ow-input ow-num" id="ow_sum_inject_depth" min="0" value="${s.summary.injectDepth}"></label>
+            ${posRow('ow_sum_inject', s.summary.injectPosition, s.summary.injectDepth, s.summary.injectOrder)}
           </div>
         </div>
 
@@ -4781,11 +4828,21 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.html(html);
         renderUpdateSection($panel);
         renderApiPresets($panel);
+
+        // 位置切到"聊天中"显示深度，切到"角色定义前/后"显示顺序
+        $panel.on('change', '.ow-pos-select', function () {
+            const $row = $(this).closest('.ow-row');
+            const depthMode = isDepthPosition($(this).val());
+            $row.find('.ow-posnum').each(function () {
+                $(this).toggle($(this).find('input').attr('id').endsWith(depthMode ? '_depth' : '_order'));
+            });
+        });
         renderInjectionOverview($panel);
         $panel.find('#ow_inject_refresh').on('click', () => renderInjectionOverview($panel));
         $panel.find('#ow_lore_inject').on('change', function () { s.lore.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); renderInjectionOverview($panel); });
         $panel.find('#ow_lore_pos').on('change', function () { s.lore.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_lore_depth').on('change', function () { s.lore.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_lore_order').on('change', function () { s.lore.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
         $panel.find('#ow_lore_scan').on('change', function () { s.lore.scanDepth = Math.max(1, Number($(this).val()) || 10); saveSettings(); updateInjections(); });
         bindModuleApiRows($panel);
 
@@ -4796,6 +4853,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_sum_inject_pos').on('change', function () { s.summary.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_sum_inject_depth').on('change', function () { s.summary.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_sum_inject_order').on('change', function () { s.summary.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
         $panel.find('#ow_check_update').on('click', async function () {
             const $btn = $(this);
@@ -4851,6 +4909,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_plot_inject').on('change', function () { s.plot.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_plot_inject_pos').on('change', function () { s.plot.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_plot_inject_depth').on('change', function () { s.plot.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_plot_inject_order').on('change', function () { s.plot.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
         $panel.find('#ow_open_ext_manager').on('click', function () {
             // 尝试打开酒馆自带的扩展管理器（不同版本入口 id 略有差异，逐个尝试）
             const candidates = ['#extensionsMenuButton', '#extensions_button', '#rm_extensions_block', '#extensions_details'];
@@ -4867,10 +4926,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_inject_widgets').on('change', function () { s.injectWidgets = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_inject_pos').on('change', function () { s.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_inject_depth').on('change', function () { s.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_inject_order').on('change', function () { s.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
         $panel.find('#ow_off_inject').on('change', function () { s.offscreen.injectTables = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_off_inject_pos').on('change', function () { s.offscreen.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_off_inject_depth').on('change', function () { s.offscreen.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
+        $panel.find('#ow_off_inject_order').on('change', function () { s.offscreen.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
 
         $panel.find('input[name="ow_theme_mode"]').on('change', function () {
