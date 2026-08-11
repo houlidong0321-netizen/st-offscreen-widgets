@@ -926,3 +926,11 @@
 
 .ow-preview-collapsed .ow-result-frame { display: none; }
 .ow-preview-collapsed .ow-result-head { position: static; }
+
+/* ---- 设置分组折叠 ---- */
+.ow-group-title { cursor: pointer; user-select: none; }
+.ow-group-title span:first-of-type { flex: 0 0 auto; }
+.ow-group-caret { font-size: 11px; opacity: 0.5; }
+.ow-group-collapsed .ow-group-title { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.ow-group-collapsed .ow-group-body { display: none; }
+.ow-group-body { padding-top: 4px; }

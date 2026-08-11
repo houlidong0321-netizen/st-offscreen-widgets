@@ -11,17 +11,10 @@
     const MODULE_NAME = 'offscreen_widgets';
     const ctx = () => SillyTavern.getContext();
 
-    // ------------------------------------------------------------------
-    // Git 仓库信息 / 更新检查
-    // 酒馆用 <script type="module"> 方式加载扩展入口文件（见酒馆源码 extensions.js 的
-    // addExtensionScript），module 脚本不会设置 document.currentScript（始终是 null），
-    // 但可以用 import.meta.url 可靠地拿到自己在磁盘上的安装路径，从而推导出调用酒馆内置的
-    // /api/extensions/version、/api/extensions/update 接口所需要的 extensionName 参数
-    // ——酒馆前端把这个参数拼成"third-party/<文件夹名>"后去掉字面量"third-party"这几个字符
-    // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
-    // ------------------------------------------------------------------
+    // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
+    // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.8.0';
+    const EXT_VERSION = '2.9.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -157,24 +150,10 @@
     // 注意：酒馆对"角色定义前/后"的多条注入是按注入键名 Object.keys().sort() 排序的，
     // depth 只对"聊天中"生效。所以"顺序"必须编码进键名里（补零后参与字典序）。
     const PROMPT_TYPES = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
-    // 【重要】酒馆世界书的 ↑Char / ↓Char 对应的是 wiBefore / wiAfter 插槽，
-    // 那两个插槽是世界书条目专用的，扩展注入进不去。扩展只能用 anchorBefore / anchorAfter。
-    // 默认上下文模板（default/content/settings.json 的 story_string）甚至没有包含
-    // anchorBefore/anchorAfter 这两个变量，所以在默认模板下这两个位置不会被渲染出来——
-    // 这就是"改顺序没反应"的原因。可靠的位置是"聊天中"。
-    const POSITION_LABELS = {
-        BEFORE_PROMPT: '提示词最前（anchorBefore，部分模板不支持）',
-        IN_PROMPT: '角色定义后（anchorAfter，部分模板不支持）',
-        IN_CHAT: '聊天中（按深度，推荐）',
-    };
-    const isDepthPosition = (pos) => pos === 'IN_CHAT';
-
-    /** 生成与酒馆一致的位置下拉选项 */
-    function positionOptionsHtml(sel) {
-        return ['BEFORE_PROMPT', 'IN_PROMPT', 'IN_CHAT']
-            .map((k) => `<option value="${k}" ${sel === k ? 'selected' : ''}>${POSITION_LABELS[k]}</option>`)
-            .join('');
-    }
+    // 注入统一使用"聊天中 + 深度"。
+    // 另外两个插槽（anchorBefore/anchorAfter）在酒馆默认上下文模板里根本没有对应变量，
+    // 注入进去不会被渲染，因此不提供。
+    const INJECT_POSITION = PROMPT_TYPES.IN_CHAT;
 
     // 已注册的注入键，用于在重新注入前清干净（键名会随顺序变化）
     const registeredInjectKeys = new Set();
@@ -186,13 +165,11 @@
      * @param {number} depth    仅"聊天中"生效
      * @param {number} order    仅"角色定义前/后"生效，数字越小越靠前
      */
-    function setInjection(baseName, text, position, depth, order) {
+    function setInjection(baseName, text, depth) {
         const c = ctx();
-        const ord = String(Math.max(0, Number(order) || 0)).padStart(4, '0');
-        const key = `${MODULE_NAME}_${ord}_${baseName}`;
+        const key = `${MODULE_NAME}_${baseName}`;
         registeredInjectKeys.add(key);
-        c.setExtensionPrompt(key, text || '', PROMPT_TYPES[position] ?? PROMPT_TYPES.IN_CHAT,
-            isDepthPosition(position) ? (Number(depth) || 0) : 0);
+        c.setExtensionPrompt(key, text || '', INJECT_POSITION, Number(depth) || 0);
     }
 
     function clearAllInjections() {
@@ -206,10 +183,7 @@
     const INJECT_KEY_SUMMARY = `${MODULE_NAME}_summary`;
     const INJECT_KEY_LORE = `${MODULE_NAME}_lore`;
 
-    // ------------------------------------------------------------------
-    // 日志诊断模块：记录每一步关键动作（发送了什么/收到了什么/解析是否成功），
-    // 仅保存在内存中（刷新页面会清空），供出问题时导出/复制给开发者排查。
-    // ------------------------------------------------------------------
+    // 日志：只存内存（刷新即清空），出问题时可复制给开发者排查。
     const MAX_LOGS = 300;
     const logs = [];
     let $logPanel = null; // 当前打开的日志面板（若存在），用于实时刷新
@@ -259,12 +233,9 @@
         widgets: [],
         triggerMode: 'manual', // 'manual' | 'auto'
         historyDepth: 5,
-        includeCharBook: false,
         includeWorldInfo: false,
         injectWidgets: false,
-        injectPosition: 'IN_CHAT',
         injectDepth: 0,
-        injectOrder: 100,
         offscreen: {
             enabled: false,
             triggerMode: 'manual',  // 'manual' | 'auto'
@@ -272,9 +243,7 @@
             floorInterval: 10,      // autoMode='floor' 时生效
             historyDepth: 5,        // autoMode='follow' 时跟随组件的设置
             injectTables: false,
-            injectPosition: 'IN_CHAT',
-            injectDepth: 0,
-            injectOrder: 110,
+                injectDepth: 0,
         },
         api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '' },
         // 各模块用哪套 API：'system'=跟随酒馆，'preset'=指定预设
@@ -316,9 +285,7 @@
             compressMode: 'manual',  // 'manual' | 'auto'
             compressLag: 5,          // 自动：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…
             injectEnabled: false,
-            injectPosition: 'IN_CHAT',
-            injectDepth: 2,
-            injectOrder: 90,
+                injectDepth: 2,
         },
         // 剧情推演
         plot: {
@@ -326,9 +293,7 @@
             historyDepth: 20,
             minEvents: 10,
             injectEnabled: true,
-            injectPosition: 'IN_CHAT',
-            injectDepth: 1,
-            injectOrder: 120,
+                injectDepth: 1,
             sendCurrent: false, // 生成时是否把当前推演一并发给模型（默认不发）
             directions: defaultPlotDirections(),
         },
@@ -694,11 +659,7 @@
         return parts.join('\n\n');
     }
 
-    // ------------------------------------------------------------------
-    // 本聊天专属设定
-    // 存在 chatMetadata 里 —— 只有当前这个聊天看得到，换个聊天/换个角色都不会串，
-    // 也不会像写进角色卡世界书那样让所有聊天都受影响。
-    // ------------------------------------------------------------------
+    // 本聊天专属设定：存在 chatMetadata，只对当前聊天生效，不影响角色卡世界书。
     const LORE_TYPES = [
         { id: 'setting', name: '世界设定' },
         { id: 'npc', name: 'NPC' },
@@ -742,12 +703,9 @@
 
         const groups = new Map();
         for (const e of active) {
-            const pos = e.position || 'IN_CHAT';
-            const dep = e.depth ?? 0;
-            const ord = e.order ?? 100;
-            const key = `${pos}::${dep}::${ord}`;
-            if (!groups.has(key)) groups.set(key, { position: pos, depth: Number(dep) || 0, order: Number(ord) || 0, items: [] });
-            groups.get(key).items.push(e);
+            const dep = Number(e.depth) || 0;
+            if (!groups.has(dep)) groups.set(dep, { depth: dep, items: [] });
+            groups.get(dep).items.push(e);
         }
         return [...groups.values()].map((g) => {
             const byType = {};
@@ -758,8 +716,8 @@
                 if (!arr?.length) continue;
                 parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
             }
-            return { position: g.position, depth: g.depth, order: g.order, text: parts.join('\n\n') };
-        }).filter((g) => g.text).sort((a, b) => a.order - b.order);
+            return { depth: g.depth, text: parts.join('\n\n') };
+        }).filter((g) => g.text).sort((a, b) => a.depth - b.depth);
     }
 
     /** 合并成一段纯文本（注入总览用） */
@@ -767,13 +725,7 @@
         return buildLoreInjectionGroups().map((g) => g.text).join('\n\n');
     }
 
-    // ------------------------------------------------------------------
-    // 总结模块
-    // 设计要点：正文里"现成的每章摘要"由扩展用正则抠出来存档，模型**不负责搬运摘要正文**，
-    // 只负责输出结构（转场怎么分、高光挑哪段、有哪些物理锚点、锚点绑到哪几章）。
-    // 最终文档由扩展按模板拼装，摘要正文直接取自存档——这样"无损搬运"是代码保证的，
-    // 而不是靠提示词去请求模型别改写。
-    // ------------------------------------------------------------------
+    // 总结模块：模型按模板直接产出完整档案文本，扩展原样保存，可重新生成 / 压缩 / 还原。
 
     /** 章 = 一次 AI 回复。返回 [{chapter, msgId, mes}]（chapter 从 1 递增） */
     function listChapters() {
@@ -1088,11 +1040,8 @@
         return cd.summary.bigSummaries.map((b) => renderBigSummary(b)).join('\n\n');
     }
 
-    // ------------------------------------------------------------------
-    // 剧情推演：生成一张"网状事件矩阵"，每个事件是宏观剧情篇章而非单个回合，
-    // 事件之间按用户的最终抉择跳转（分支明确指向某个事件编号）。
-    // 正文里事件结束时会带一个隐藏标记，扩展扫描到后自动把未走的分支置灰并推进。
-    // ------------------------------------------------------------------
+    // 剧情推演：网状事件矩阵。事件=宏观篇章，分支按情感倾向跳转。
+    // 正文出现隐藏标记后，扩展自动置灰未走分支并推进到下一事件。
     const PLOT_MARKER_RE = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/i;
     const PLOT_MARKER_RE_G = /<!--\s*EGO_PLOT\s*:\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z])\s*-->/gi;
 
@@ -1471,26 +1420,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // 获取当前"已绑定/已激活"的世界书清单：全局勾选激活的世界书（读取酒馆世界书面板的
     // 多选框 #world_info，因为该激活列表未通过 getContext() 暴露）、当前角色绑定的主世界书、
     // 当前聊天绑定的聊天书。三者取并集去重。
-    // 角色卡内嵌世界书（character_book）不是一本独立的世界书文件，
-    // loadWorldInfo 读不到它，所以在条目管理里用这个虚拟书名单独归组，
-    // 让它的每个条目也能像普通世界书条目一样被逐条开关。
-    const CHAR_BOOK_KEY = '__character_book__';
-    const CHAR_BOOK_LABEL = '角色卡内嵌世界书';
-
-    // 取出角色卡内嵌世界书的条目，统一成 {uid,label,content,disabledInST} 结构
-    function getCharBookEntries() {
-        const c = ctx();
-        const book = c.characters?.[c.characterId]?.data?.character_book;
-        if (!book?.entries?.length) return [];
-        return book.entries.map((e, i) => ({
-            uid: String(e.id ?? e.uid ?? i),
-            label: e.comment || (Array.isArray(e.keys) ? e.keys.join('，') : '') || `条目#${i + 1}`,
-            content: e.content || '',
-            // V2 角色卡规范用 enabled=false 表示禁用，部分卡沿用世界书的 disable=true
-            disabledInST: e.enabled === false || e.disable === true,
-        }));
-    }
-
     function getBoundWorldInfoBookNames() {
         const c = ctx();
         const names = new Set();
@@ -1506,98 +1435,45 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return [...names].filter(Boolean);
     }
 
-    // ------------------------------------------------------------------
-    // 统一收集所有可用的世界书条目，并按内容去重。
-    // 关键背景：酒馆导入角色卡时，importEmbeddedWorldInfo() 会把卡里的
-    // data.character_book 转存成一本独立世界书文件，并通过 data.extensions.world
-    // 绑定回角色——但卡里原来的 character_book 不会被清除。于是同一批内容会同时
-    // 存在于"独立世界书"和"卡内嵌书"两处。若两处都收，就会重复发送、浪费 token。
-    // 因此这里以独立世界书为准，卡内嵌书中内容已出现过的条目直接跳过。
-    // ------------------------------------------------------------------
-    // 某条目是否要发送：优先用用户在「世界书」标签页里的手动覆盖，
-    // 没有覆盖时跟随该条目在酒馆/角色卡里的启用状态。
+    // 某条目是否要发送：优先用手动覆盖，没有则跟随它在酒馆里的启用状态
     function isWorldInfoEntrySendEnabled(s, bookName, uidStr, disabledInST) {
-        const key = `${bookName}::${uidStr}`;
-        const override = s.worldInfoOverrides[key];
+        const override = s.worldInfoOverrides[`${bookName}::${uidStr}`];
         return override !== undefined ? override : !disabledInST;
     }
 
-    function normContentKey(str) {
-        return String(str || '').replace(/\s+/g, '').trim();
-    }
-
-    async function collectAllLoreEntries() {
+    async function fetchWorldInfoEntriesForManagement() {
         const c = ctx();
         const out = [];
-        const seen = new Set();
-
         for (const bookName of getBoundWorldInfoBookNames()) {
             try {
                 const book = await c.loadWorldInfo(bookName);
-                const entries = book?.entries ? Object.values(book.entries) : [];
-                for (const e of entries) {
-                    const content = e.content || '';
+                for (const e of (book?.entries ? Object.values(book.entries) : [])) {
                     out.push({
-                        source: 'world',
                         book: bookName,
                         uid: String(e.uid),
                         label: e.comment || (Array.isArray(e.key) ? e.key.join('，') : '') || `条目#${e.uid}`,
-                        content,
+                        content: e.content || '',
                         disabledInST: !!e.disable,
                     });
-                    if (content.trim()) seen.add(normContentKey(content));
                 }
             } catch (err) {
                 log('warn', 'system', `读取世界书「${bookName}」失败：${err.message || err}`, err);
             }
         }
-
-        const embedded = getCharBookEntries();
-        const uniqueEmbedded = embedded.filter((e) => !e.content.trim() || !seen.has(normContentKey(e.content)));
-        const dupCount = embedded.length - uniqueEmbedded.length;
-        if (dupCount > 0) {
-            log('debug', 'system',
-                `角色卡内嵌世界书有 ${dupCount}/${embedded.length} 条与已绑定的独立世界书内容重复，已自动去重（酒馆导入角色卡时会把内嵌书转存为独立世界书，但卡里仍保留一份副本）。`);
-        }
-        for (const e of uniqueEmbedded) {
-            out.push({ source: 'charbook', book: CHAR_BOOK_KEY, uid: e.uid, label: e.label, content: e.content, disabledInST: e.disabledInST });
-        }
         return out;
-    }
-
-    // 管理列表用（设置页「世界书」标签页）
-    async function fetchWorldInfoEntriesForManagement() {
-        return collectAllLoreEntries();
     }
 
     async function gatherWorldInfo() {
         const s = settings();
-        const all = await collectAllLoreEntries();
-        return buildLoreText(all.filter((e) => e.source === 'world'), s, '世界书/聊天书');
-    }
-
-    async function gatherCharBook() {
-        const s = settings();
-        const all = await collectAllLoreEntries();
-        return buildLoreText(all.filter((e) => e.source === 'charbook'), s, '角色卡内嵌世界书');
-    }
-
-    function buildLoreText(entries, s, labelForLog) {
-        const sent = [];
-        const skipped = [];
+        const entries = await fetchWorldInfoEntriesForManagement();
+        const sent = [], skipped = [];
         let text = '';
         for (const e of entries) {
-            if (!isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)) {
-                skipped.push(e.label);
-                continue;
-            }
+            if (!isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)) { skipped.push(e.label); continue; }
             sent.push(e.label);
-            const bookLabel = e.book === CHAR_BOOK_KEY ? CHAR_BOOK_LABEL : e.book;
-            text += `【${bookLabel} - ${e.label}】\n${e.content}\n\n`;
+            text += `【${e.book} - ${e.label}】\n${e.content}\n\n`;
         }
-        if (entries.length) {
-            log('debug', 'system', `${labelForLog} 条目筛选：发送 ${sent.length} 条，跳过 ${skipped.length} 条`, { 已发送: sent, 已跳过: skipped });
-        }
+        if (entries.length) log('debug', 'system', `世界书条目筛选：发送 ${sent.length} 条，跳过 ${skipped.length} 条`, { 已发送: sent, 已跳过: skipped });
         return text.trim();
     }
 
@@ -1608,7 +1484,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         extras.history = gatherHistory(depth, floorOffset);
         extras.floorRange = computeFloorRange(depth, floorOffset);
         if (s.includeWorldInfo) extras.worldInfo = await gatherWorldInfo();
-        if (s.includeCharBook) extras.charBook = await gatherCharBook();
         return extras;
     }
 
@@ -1820,13 +1695,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         updateInjections();
     }
 
-    // ------------------------------------------------------------------
-    // 后台任务管理：生成流程必须独立于界面存活。
-    // 之前 UI 直接 await 生成流程，弹窗一关、DOM 被移除后 finally 里的
-    // 界面操作会连带影响流程感知，用户看起来就是"关掉界面就不生成了"。
-    // 现在统一走这里：任务挂在模块级变量上，与弹窗生命周期完全解耦，
-    // 关闭界面照常跑完，并在开始/结束时用 toast 通知。
-    // ------------------------------------------------------------------
+    // 后台任务：与弹窗生命周期解耦，关掉界面也会跑完，开始/结束各提示一次。
     const bgTask = { running: false, label: '', startedAt: 0, promise: null };
 
     function isGenerating() {
@@ -2030,36 +1899,32 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const cd = chatData();
             const text = s.widgets.filter((w) => w.enabled)
                 .map((w) => cd.widgetResults[w.id]?.html).filter(Boolean).join('\n\n');
-            if (text) setInjection('widgets', `[以下是与当前场景相关的附加参考素材，不要在正文中直接复述或提及其存在：\n${text}]`,
-                s.injectPosition, s.injectDepth, s.injectOrder);
+            if (text) setInjection('widgets', `[以下是与当前场景相关的附加参考素材，不要在正文中直接复述或提及其存在：\n${text}]`, s.injectDepth);
         }
 
         // 表格
         if (s.offscreen.enabled && s.offscreen.injectTables) {
             const text = renderOffscreenAsPlainText(chatData().offscreen);
-            if (text) setInjection('tables', `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`,
-                s.offscreen.injectPosition, s.offscreen.injectDepth, s.offscreen.injectOrder);
+            if (text) setInjection('tables', `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`, s.offscreen.injectDepth);
         }
 
         // 本聊天设定：每条可有自己的位置/深度/顺序，按三者分组
         if (s.lore.injectEnabled) {
             buildLoreInjectionGroups().slice(0, 12).forEach((g, i) => {
-                setInjection(`lore${i}`, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`,
-                    g.position, g.depth, g.order);
+                setInjection(`lore${i}`, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`, g.depth);
             });
         }
 
         // 历史总结
         if (s.summary.injectEnabled) {
             const txt = renderAllSummariesText();
-            if (txt) setInjection('summary', `[剧情档案（历史总结，供你保持连贯性，不要在正文中直接复述本段）：\n${txt}]`,
-                s.summary.injectPosition, s.summary.injectDepth, s.summary.injectOrder);
+            if (txt) setInjection('summary', `[剧情档案（历史总结，供你保持连贯性，不要在正文中直接复述本段）：\n${txt}]`, s.summary.injectDepth);
         }
 
         // 剧情推演
         if (s.plot.injectEnabled) {
             const text = buildPlotInjectionText();
-            if (text) setInjection('plot', text, s.plot.injectPosition, s.plot.injectDepth, s.plot.injectOrder);
+            if (text) setInjection('plot', text, s.plot.injectDepth);
         }
     }
 
@@ -2381,10 +2246,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-tab" data-tab="summary">总结</div>
               <div class="ow-tab" data-tab="lore">设定</div>
               <div class="ow-tab" data-tab="favorites">收藏夹</div>
-              <div class="ow-tab" data-tab="worldinfo">世界书</div>
-              <div class="ow-tab" data-tab="prompts">提示词</div>
               <div class="ow-tab" data-tab="settings">设置</div>
-              <div class="ow-tab" data-tab="log">日志<span class="ow-log-badge" id="ow_log_badge" style="display:none;"></span></div>
             </div>
             <div class="ow-panel active" data-panel="widgets"></div>
             <div class="ow-panel" data-panel="offscreen"></div>
@@ -2392,10 +2254,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <div class="ow-panel" data-panel="summary"></div>
             <div class="ow-panel" data-panel="lore"></div>
             <div class="ow-panel" data-panel="favorites"></div>
-            <div class="ow-panel" data-panel="worldinfo"></div>
-            <div class="ow-panel" data-panel="prompts"></div>
             <div class="ow-panel" data-panel="settings"></div>
-            <div class="ow-panel" data-panel="log"></div>
           </div>
         </div>`;
         // 挂到 <html> 而不是 <body>：窄屏时酒馆会给 body 加
@@ -2438,8 +2297,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             ['summary', renderSummaryPanel],
             ['lore', renderLorePanel],
             ['favorites', renderFavoritesPanel],
-            ['worldinfo', renderWorldInfoPanel],
-            ['prompts', renderPromptsPanel],
             ['settings', renderSettingsPanel],
         ];
         for (const [name, fn] of panels) {
@@ -2452,7 +2309,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                     <span class="ow-muted">其他面板不受影响。详细堆栈见「日志」标签页。</span></div>`);
             }
         }
-        $logPanel = $modal.find('.ow-panel[data-panel="log"]');
+        $logPanel = $modal.find('#ow_log_section');
         renderLogEntries($logPanel);
         refreshGeneratingIndicator();
         log('info', 'ui', '主界面已打开');
@@ -3725,7 +3582,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                         <input type="checkbox" class="ow-lore-on" ${e.enabled !== false ? 'checked' : ''}><span class="ow-switch-track"></span>
                       </label>
                       <span class="ow-widget-name" data-action="lore-toggle">${escapeHtml(e.name || '未命名')}</span>
-                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'}${POSITION_LABELS[e.position || 'IN_CHAT'] ? ` · ${(e.position || 'IN_CHAT') === 'IN_CHAT' ? `深度${e.depth ?? 0}` : `顺序${e.order ?? 100}`}` : ''}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
+                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'} · 深度${e.depth ?? 0}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
                       <span class="ow-spacer"></span>
                       <button class="ow-btn ow-danger" data-action="lore-del"><i class="fa-solid fa-trash"></i></button>
                     </div>
@@ -3740,13 +3597,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       <textarea class="ow-textarea ow-lore-content" style="min-height:120px;">${escapeHtml(e.content || '')}</textarea>
                       <div class="ow-field-label">关键词（可选，逗号分隔；留空＝常驻注入）</div>
                       <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
-                      <div class="ow-field-label">注入位置</div>
+                      <div class="ow-field-label">注入深度</div>
                       <div class="ow-row">
-                        <select class="ow-select ow-lore-epos">${positionOptionsHtml(e.position || 'IN_CHAT')}</select>
-                        <label class="ow-eposnum" ${isDepthPosition(e.position || 'IN_CHAT') ? '' : 'style="display:none;"'}>深度
-                          <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? 0}"></label>
-                        <label class="ow-eposnum" ${isDepthPosition(e.position || 'IN_CHAT') ? 'style="display:none;"' : ''}>顺序
-                          <input type="number" class="ow-input ow-num ow-lore-eorder" min="0" value="${e.order ?? 100}"></label>
+                        <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? 0}">
+                        <span class="ow-muted">数字越小越靠近最新消息</span>
                       </div>
                     </div>
                   </div>`;
@@ -3756,7 +3610,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         }
 
         $panel.find('#ow_lore_add').on('click', function () {
-            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true, position: 'IN_CHAT', depth: 0, order: 100 });
+            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true, depth: 0 });
             saveChatData(); updateInjections(); renderLorePanel($panel);
         });
 
@@ -3773,27 +3627,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $list.on('input', '.ow-lore-content', function () { const e = find(this); if (e) { e.content = $(this).val(); saveChatData(); updateInjections(); } });
         $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
-        $list.on('change', '.ow-lore-epos', function () {
-            const e = find(this); if (!e) return;
-            e.position = $(this).val();
-            saveChatData(); updateInjections();
-            const $row = $(this).closest('.ow-row');
-            const depthMode = isDepthPosition(e.position);
-            $row.find('.ow-eposnum').each(function () {
-                const isDepth = $(this).find('input').hasClass('ow-lore-edepth');
-                $(this).toggle(depthMode ? isDepth : !isDepth);
-            });
-        });
         $list.on('change', '.ow-lore-edepth', function () {
             const e = find(this); if (!e) return;
-            const v = $(this).val();
-            e.depth = v === '' ? null : Math.max(0, Number(v) || 0);
-            saveChatData(); updateInjections();
-        });
-        $list.on('change', '.ow-lore-eorder', function () {
-            const e = find(this); if (!e) return;
-            const v = $(this).val();
-            e.order = v === '' ? null : Math.max(0, Number(v) || 0);
+            e.depth = Math.max(0, Number($(this).val()) || 0);
             saveChatData(); updateInjections();
         });
         $list.on('change', '.ow-lore-type', function () { const e = find(this); if (e) { e.type = $(this).val(); saveChatData(); renderLorePanel($panel); } });
@@ -4100,7 +3936,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const $list = $panel.find('#ow_wi_entry_list');
         $list.html('<div class="ow-empty">加载中…</div>');
         let bookNames = [];
-        const charBookCount = getCharBookEntries().length;
         try {
             bookNames = getBoundWorldInfoBookNames();
         } catch (err) {
@@ -4108,9 +3943,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             $list.html('<div class="ow-empty">识别世界书时出错，详见日志标签页。</div>');
             return;
         }
-        const srcLabel = [...bookNames, ...(charBookCount ? [`${CHAR_BOOK_LABEL}(${charBookCount}条)`] : [])];
-        $panel.find('#ow_wi_book_names').text(srcLabel.length ? srcLabel.join('、') : '（未识别到已激活的世界书/聊天书）');
-        if (!bookNames.length && !charBookCount) {
+        $panel.find('#ow_wi_book_names').text(bookNames.length ? bookNames.join('、') : '（未识别到已激活的世界书/聊天书）');
+        if (!bookNames.length) {
             $list.html('<div class="ow-empty">没有识别到激活的世界书，也没有绑定聊天书。<br>请先在酒馆「世界书」面板勾选要启用的世界书，或为当前聊天绑定聊天书。</div>');
             return;
         }
@@ -4133,14 +3967,13 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         let html = '';
         for (const [book, list] of Object.entries(byBook)) {
             const onCount = list.filter((e) => isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST)).length;
-            const isCharBook = book === CHAR_BOOK_KEY;
-            const shownName = isCharBook ? CHAR_BOOK_LABEL : book;
+            const shownName = book;
             html += `
             <div class="ow-widget-card" data-book="${escapeHtml(book)}">
               <div class="ow-widget-card-head">
-                <i class="fa-solid ${isCharBook ? 'fa-id-card' : 'fa-book'}" style="opacity:.55;"></i>
+                <i class="fa-solid fa-book" style="opacity:.55;"></i>
                 <span class="ow-widget-name">${escapeHtml(shownName)}</span>
-                ${isCharBook ? '<span class="ow-muted ow-widget-meta">受「设置→世界书→角色卡内嵌世界书」总开关控制</span>' : ''}
+
                 <span class="ow-muted ow-widget-meta">${onCount}/${list.length} 发送</span>
                 <span class="ow-spacer"></span>
                 <button class="ow-btn" data-action="wi-all" data-book="${escapeHtml(book)}">全选</button>
@@ -4423,15 +4256,23 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-muted" style="font-size:11.5px;margin-top:4px;">中文约 1 字 ≈ 1 token，仅供量级参考。超过 4000 会标黄、8000 标红——那时建议关掉几项注入，或把总结压缩一轮。</div>`);
     }
 
-    /** 一行"注入位置 + 深度/顺序"控件：聊天中显示深度，角色定义前/后显示顺序 */
-    function posRow(idPrefix, pos, depth, order) {
-        const depthMode = isDepthPosition(pos);
+    /** 注入深度输入框（位置统一为"聊天中"） */
+    function depthRow(idPrefix, depth) {
+        return `<label>深度 <input type="number" class="ow-input ow-num" id="${idPrefix}_depth" min="0" value="${depth ?? 0}"></label>
+          <span class="ow-muted">数字越小越靠近最新消息</span>`;
+    }
+
+    /** 可折叠分组外壳 */
+    function group(id, icon, title, bodyHtml, open = false) {
         return `
-          <select class="ow-select ow-pos-select" id="${idPrefix}_pos">${positionOptionsHtml(pos)}</select>
-          <label class="ow-posnum" ${depthMode ? '' : 'style="display:none;"'}>深度
-            <input type="number" class="ow-input ow-num" id="${idPrefix}_depth" min="0" value="${depth ?? 0}"></label>
-          <label class="ow-posnum" ${depthMode ? 'style="display:none;"' : ''}>顺序
-            <input type="number" class="ow-input ow-num" id="${idPrefix}_order" min="0" value="${order ?? 100}"></label>`;
+        <div class="ow-group ${open ? '' : 'ow-group-collapsed'}" data-group="${id}">
+          <div class="ow-group-title" data-action="group-toggle">
+            <i class="fa-solid ${icon}"></i><span>${title}</span>
+            <span class="ow-spacer"></span>
+            <i class="fa-solid fa-chevron-${open ? 'down' : 'right'} ow-group-caret"></i>
+          </div>
+          <div class="ow-group-body">${bodyHtml}</div>
+        </div>`;
     }
 
     function renderSettingsPanel($panel) {
@@ -4440,196 +4281,153 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const tblAuto = so.triggerMode === 'auto';
         const tblFollow = tblAuto && so.autoMode === 'follow';
 
-        const html = `
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-puzzle-piece"></i> 组件</div>
+        const html = [
+          group('api', 'fa-plug', 'API 预设',
+            `<div class="ow-muted" style="margin-bottom:6px;">维护多套 API，各模块在自己的分组里选择。Key 明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+             <div id="ow_api_presets"></div>
+             <div class="ow-row"><button class="ow-btn ow-primary" id="ow_api_add">+ 新建预设</button></div>`, true),
 
-          <div class="ow-field-label">生成方式</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动</label>
-            <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
-          </div>
-          <div class="ow-sub-fields" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'}">
-            <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
-            <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 每
-              <input type="number" class="ow-input ow-num" id="ow_auto_widget_floor_n" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成一次</label>
-            <label>楼层触发时回避最新
-              <input type="number" class="ow-input ow-num" id="ow_floor_backoff" min="0" value="${s.autoTriggers.floorBackoff}"> 层</label>
-            <div class="ow-muted" style="font-size:11.5px;">留出重 roll 的余地：刚生成的那几层可能被你重写，回避后不会白读。组件与表格的楼层触发共用此设置。</div>
-          </div>
+          group('widgets', 'fa-puzzle-piece', '组件', `
+            <div class="ow-field-label">生成方式</div>
+            <div class="ow-row">
+              <label><input type="radio" name="ow_trigger" value="manual" ${s.triggerMode === 'manual' ? 'checked' : ''}> 手动</label>
+              <label><input type="radio" name="ow_trigger" value="auto" ${s.triggerMode === 'auto' ? 'checked' : ''}> 自动</label>
+            </div>
+            <div class="ow-sub-fields" id="ow_auto_trigger_fields" style="${s.triggerMode === 'auto' ? '' : 'display:none;'}">
+              <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
+              <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 每
+                <input type="number" class="ow-input ow-num" id="ow_auto_widget_floor_n" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成一次</label>
+              <label>楼层触发时回避最新
+                <input type="number" class="ow-input ow-num" id="ow_floor_backoff" min="0" value="${s.autoTriggers.floorBackoff}"> 层</label>
+              <div class="ow-muted" style="font-size:11.5px;">回避是为了给重 roll 留余地，组件与表格共用此设置。</div>
+            </div>
+            <div class="ow-field-label">上下文</div>
+            <div class="ow-row"><label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label></div>
+            ${moduleApiRow('widgets', '使用的 API')}
+            <div class="ow-field-label">注入正文</div>
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 注入组件结果</label>
+              ${depthRow('ow_inject', s.injectDepth)}
+            </div>`),
 
-          <div class="ow-field-label">上下文</div>
-          <div class="ow-row">
-            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label>
-          </div>
+          group('tables', 'fa-table-list', '表格', `
+            <div class="ow-row"><label><input type="checkbox" id="ow_off_enabled_set" ${so.enabled ? 'checked' : ''}> 启用表格生成</label></div>
+            <div class="ow-field-label">生成方式</div>
+            <div class="ow-row">
+              <label><input type="radio" name="ow_off_trigger" value="manual" ${!tblAuto ? 'checked' : ''}> 手动</label>
+              <label><input type="radio" name="ow_off_trigger" value="auto" ${tblAuto ? 'checked' : ''}> 自动</label>
+            </div>
+            <div class="ow-sub-fields ${tblAuto ? '' : 'ow-disabled'}">
+              <label><input type="radio" name="ow_off_automode" value="follow" ${so.autoMode === 'follow' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 跟随组件一起生成</label>
+              <label><input type="radio" name="ow_off_automode" value="floor" ${so.autoMode === 'floor' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 每
+                <input type="number" class="ow-input ow-num" id="ow_off_floor_n" min="1" value="${so.floorInterval}" ${tblAuto && so.autoMode === 'floor' ? '' : 'disabled'}>楼层自动生成一次</label>
+            </div>
+            <div class="ow-field-label">上下文</div>
+            <div class="ow-row ${tblFollow ? 'ow-disabled' : ''}">
+              <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${so.historyDepth}" ${tblFollow ? 'disabled' : ''}> 楼聊天记录</label>
+              ${tblFollow ? '<span class="ow-muted">已跟随组件设置</span>' : ''}
+            </div>
+            ${moduleApiRow('tables', '使用的 API', tblFollow, tblFollow ? '已跟随组件设置' : '')}
+            <div class="ow-field-label">注入正文</div>
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_off_inject" ${so.injectTables ? 'checked' : ''}> 注入表格内容</label>
+              ${depthRow('ow_off_inject', so.injectDepth)}
+            </div>`),
 
-          ${moduleApiRow('widgets', '使用的 API')}
+          group('plot', 'fa-code-branch', '剧情推演', `
+            <div class="ow-field-label">上下文</div>
+            <div class="ow-row"><label>获取最近 <input type="number" class="ow-input ow-num" id="ow_plot_history" min="0" value="${s.plot.historyDepth}"> 楼聊天记录</label></div>
+            <div class="ow-row"><label>至少生成 <input type="number" class="ow-input ow-num" id="ow_plot_min" min="2" value="${s.plot.minEvents}"> 个事件节点</label></div>
+            <div class="ow-field-label">生成</div>
+            <div class="ow-row"><label><input type="checkbox" id="ow_plot_send_current" ${s.plot.sendCurrent ? 'checked' : ''}> 生成时发送当前推演</label></div>
+            <div class="ow-muted" style="font-size:11.5px;">关：重新生成全新矩阵。开：把现有矩阵发给模型续写。</div>
+            ${moduleApiRow('plot', '使用的 API')}
+            <div class="ow-field-label">注入正文</div>
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
+              ${depthRow('ow_plot_inject', s.plot.injectDepth)}
+            </div>`),
 
-          <div class="ow-field-label">注入正文</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_inject_widgets" ${s.injectWidgets ? 'checked' : ''}> 注入组件结果</label>
-            ${posRow('ow_inject', s.injectPosition, s.injectDepth, s.injectOrder)}
-          </div>
-        </div>
+          group('summary', 'fa-layer-group', '总结', `
+            <div class="ow-row"><label><input type="checkbox" id="ow_sum_enabled" ${s.summary.enabled ? 'checked' : ''}> 启用总结功能</label></div>
+            <div class="ow-field-label">压缩</div>
+            <div class="ow-row">
+              <label><input type="radio" name="ow_sum_cmode" value="manual" ${s.summary.compressMode === 'manual' ? 'checked' : ''}> 手动</label>
+              <label><input type="radio" name="ow_sum_cmode" value="auto" ${s.summary.compressMode === 'auto' ? 'checked' : ''}> 自动</label>
+              <label>差值 <input type="number" class="ow-input ow-num" id="ow_sum_lag" min="1" value="${s.summary.compressLag}" ${s.summary.compressMode === 'auto' ? '' : 'disabled'}></label>
+            </div>
+            <div class="ow-muted" style="font-size:11.5px;">差值 5 = 出现第 5 次总结时压缩第 1 次，依此类推。压缩只动叙述，高光原话与物品锚点一字不改。</div>
+            ${moduleApiRow('summary', '使用的 API')}
+            <div class="ow-field-label">注入正文</div>
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_sum_inject" ${s.summary.injectEnabled ? 'checked' : ''}> 注入历史总结</label>
+              ${depthRow('ow_sum_inject', s.summary.injectDepth)}
+            </div>`),
 
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-table-list"></i> 表格生成</div>
+          group('lore', 'fa-scroll', '设定', `
+            <div class="ow-row"><label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label></div>
+            <div class="ow-row"><label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label></div>
+            <div class="ow-muted" style="font-size:11.5px;">条目与各自的注入深度在「设定」标签页里管理。内容只存在当前聊天。</div>`),
 
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_off_enabled_set" ${s.offscreen.enabled ? 'checked' : ''}> 启用表格功能</label>
-          </div>
+          group('worldinfo', 'fa-book', '世界书', `
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书 / 聊天书条目</label>
+            </div>
+            <div class="ow-row">
+              <button class="ow-btn" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 刷新条目</button>
+              <button class="ow-btn" id="ow_wi_reset">恢复默认</button>
+              <span class="ow-muted">来源：<span id="ow_wi_book_names">—</span></span>
+            </div>
+            <div class="ow-muted" style="font-size:11.5px;">默认跟随条目在酒馆中的启用状态；此处改动只影响本扩展。</div>
+            <div id="ow_wi_entry_list"></div>`),
 
-          <div class="ow-field-label">生成方式</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_off_trigger" value="manual" ${!tblAuto ? 'checked' : ''}> 手动</label>
-            <label><input type="radio" name="ow_off_trigger" value="auto" ${tblAuto ? 'checked' : ''}> 自动</label>
-          </div>
-          <div class="ow-sub-fields ${tblAuto ? '' : 'ow-disabled'}" id="ow_off_auto_fields">
-            <label><input type="radio" name="ow_off_automode" value="follow" ${so.autoMode === 'follow' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 跟随组件一起生成</label>
-            <label><input type="radio" name="ow_off_automode" value="floor" ${so.autoMode === 'floor' ? 'checked' : ''} ${tblAuto ? '' : 'disabled'}> 每
-              <input type="number" class="ow-input ow-num" id="ow_off_floor_n" min="1" value="${so.floorInterval}" ${tblAuto && so.autoMode === 'floor' ? '' : 'disabled'}>楼层自动生成一次</label>
-            ${so.autoMode === 'floor' && tblAuto ? `<div class="ow-muted" style="font-size:11.5px;">读取时会回避最新 ${s.autoTriggers.floorBackoff} 层（在「组件」分组里调整），留出重 roll 余地。</div>` : ''}
-          </div>
+          group('prompts', 'fa-pen-nib', '提示词', `<div id="ow_prompts_section"></div>`),
 
-          <div class="ow-field-label">上下文</div>
-          <div class="ow-row ${tblFollow ? 'ow-disabled' : ''}" id="ow_off_ctx_row">
-            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${so.historyDepth}" ${tblFollow ? 'disabled' : ''}> 楼聊天记录</label>
-            ${tblFollow ? '<span class="ow-muted ow-follow-note">已跟随组件设置</span>' : ''}
-          </div>
+          group('log', 'fa-list-check', '日志', `<div id="ow_log_section"></div>`),
 
-          ${moduleApiRow('tables', '使用的 API', tblFollow, tblFollow ? '已跟随组件设置' : '')}
+          group('overview', 'fa-gauge-high', '注入总览',
+            `<div id="ow_inject_overview"></div><div class="ow-row"><button class="ow-btn" id="ow_inject_refresh"><i class="fa-solid fa-rotate"></i> 刷新</button></div>`),
 
-          <div class="ow-field-label">注入正文</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_off_inject" ${s.offscreen.injectTables ? 'checked' : ''}> 注入表格内容</label>
-            ${posRow('ow_off_inject', s.offscreen.injectPosition, s.offscreen.injectDepth, s.offscreen.injectOrder)}
-          </div>
-        </div>
+          group('theme', 'fa-palette', '主题', `
+            <div class="ow-row">
+              <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
+              <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
+            </div>
+            <div class="ow-sub-fields" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'}">
+              <textarea class="ow-textarea" id="ow_theme_css" style="min-height:90px;">${escapeHtml(s.theme.customCss)}</textarea>
+              <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
+            </div>`),
 
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-code-branch"></i> 剧情推演</div>
-          <div class="ow-field-label">上下文</div>
-          <div class="ow-row">
-            <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_plot_history" min="0" value="${s.plot.historyDepth}"> 楼聊天记录</label>
-          </div>
-          <div class="ow-row">
-            <label>至少生成 <input type="number" class="ow-input ow-num" id="ow_plot_min" min="2" value="${s.plot.minEvents}"> 个事件节点</label>
-          </div>
-          <div class="ow-field-label">生成</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_plot_send_current" ${s.plot.sendCurrent ? 'checked' : ''}> 生成时发送当前推演</label>
-          </div>
-          <div class="ow-muted" style="padding-left:2px;">关：重新生成一份全新矩阵（对当前不满意时用）。开：把现有矩阵发给模型续写（剧情已走完、想接着往下推时用）。</div>
+          group('about', 'fa-circle-info', '关于 / 更新', `
+            <div class="ow-row"><span class="ow-muted">Ego 小助手 v${EXT_VERSION}</span></div>
+            <div class="ow-row">
+              <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;"><i class="fa-brands fa-github"></i> 仓库</a>
+              <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
+              <button class="ow-btn" id="ow_open_ext_manager"><i class="fa-solid fa-gear"></i> 扩展管理器</button>
+              <button class="ow-btn" id="ow_diag_geometry"><i class="fa-solid fa-ruler-combined"></i> 显示诊断</button>
+            </div>
+            <div id="ow_update_status" class="ow-hint">尚未检查</div>`),
+        ].join('');
 
-          ${moduleApiRow('plot', '使用的 API')}
-
-          <div class="ow-field-label">注入正文</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_plot_inject" ${s.plot.injectEnabled ? 'checked' : ''}> 注入当前事件与分支</label>
-            ${posRow('ow_plot_inject', s.plot.injectPosition, s.plot.injectDepth, s.plot.injectOrder)}
-          </div>
-          <div class="ow-muted">世界书发送范围跟随下方「世界书」模块的设定。</div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-scroll"></i> 本聊天设定</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label>
-          </div>
-          <div class="ow-muted" style="font-size:11.5px;">注入位置在「设定」标签页里逐条设置。</div>
-          <div class="ow-row">
-            <label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label>
-          </div>
-          <div class="ow-muted" style="font-size:11.5px;">条目在「设定」标签页里管理。内容只存在当前聊天，不会影响其他聊天或角色卡。</div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-gauge-high"></i> 注入总览</div>
-          <div id="ow_inject_overview"></div>
-          <div class="ow-row"><button class="ow-btn" id="ow_inject_refresh"><i class="fa-solid fa-rotate"></i> 刷新</button></div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-layer-group"></i> 总结</div>
-          <div class="ow-row"><label><input type="checkbox" id="ow_sum_enabled" ${s.summary.enabled ? 'checked' : ''}> 启用总结功能</label></div>
-
-          <div class="ow-field-label">压缩</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_sum_cmode" value="manual" ${s.summary.compressMode === 'manual' ? 'checked' : ''}> 手动</label>
-            <label><input type="radio" name="ow_sum_cmode" value="auto" ${s.summary.compressMode === 'auto' ? 'checked' : ''}> 自动</label>
-            <label>差值 <input type="number" class="ow-input ow-num" id="ow_sum_lag" min="1" value="${s.summary.compressLag}" ${s.summary.compressMode === 'auto' ? '' : 'disabled'}></label>
-          </div>
-          <div class="ow-muted" style="font-size:11.5px;">差值 5 = 出现第 5 次总结时压缩第 1 次，第 6 次时压缩第 2 次，依此类推。压缩只动叙述，高光对话与物理锚点一字不改。</div>
-
-          ${moduleApiRow('summary', '使用的 API')}
-
-          <div class="ow-field-label">注入正文</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_sum_inject" ${s.summary.injectEnabled ? 'checked' : ''}> 注入历史总结</label>
-            ${posRow('ow_sum_inject', s.summary.injectPosition, s.summary.injectDepth, s.summary.injectOrder)}
-          </div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-book"></i> 世界书</div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书 / 聊天书条目</label>
-          </div>
-          <div class="ow-row">
-            <label><input type="checkbox" id="ow_include_cb" ${s.includeCharBook ? 'checked' : ''}> 随行发送角色卡内嵌世界书</label>
-          </div>
-          <div class="ow-hint">具体发送哪些书、哪些条目，在「世界书」标签页里逐条开关。</div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-plug"></i> API 预设</div>
-          <div class="ow-muted" style="margin-bottom:6px;">在这里维护多套 API，各模块在自己的分组里选择用哪一套。Key 以明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
-          <div id="ow_api_presets"></div>
-          <div class="ow-row"><button class="ow-btn ow-primary" id="ow_api_add">+ 新建预设</button></div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-palette"></i> 主题</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
-            <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
-          </div>
-          <div class="ow-sub-fields" id="ow_custom_theme_fields" style="${s.theme.mode === 'custom' ? '' : 'display:none;'}">
-            <textarea class="ow-textarea" id="ow_theme_css" style="min-height:90px;" placeholder=".ow-modal { }">${escapeHtml(s.theme.customCss)}</textarea>
-            <div class="ow-row"><button class="ow-btn ow-primary" id="ow_theme_save">保存并应用</button></div>
-          </div>
-        </div>
-
-        <div class="ow-group">
-          <div class="ow-group-title"><i class="fa-solid fa-circle-info"></i> 关于 / 更新</div>
-          <div class="ow-row">
-            <span class="ow-muted">Ego 小助手 v${EXT_VERSION}</span>
-          </div>
-          <div class="ow-row">
-            <a href="${REPO_URL.replace(/\.git$/, '')}" target="_blank" rel="noopener noreferrer" class="ow-btn" style="text-decoration:none;">
-              <i class="fa-brands fa-github"></i> 仓库
-            </a>
-            <button class="ow-btn" id="ow_check_update"><i class="fa-solid fa-rotate"></i> 检查更新</button>
-            <button class="ow-btn" id="ow_open_ext_manager"><i class="fa-solid fa-gear"></i> 打开扩展管理器</button>
-            <button class="ow-btn" id="ow_diag_geometry"><i class="fa-solid fa-ruler-combined"></i> 界面显示诊断</button>
-          </div>
-          <div id="ow_update_status" class="ow-hint">尚未检查</div>
-        </div>
-        `;
         $panel.html(html);
         renderUpdateSection($panel);
+
+        // 分组折叠
+        $panel.off('click', '[data-action="group-toggle"]').on('click', '[data-action="group-toggle"]', function () {
+            const $g = $(this).closest('.ow-group');
+            $g.toggleClass('ow-group-collapsed');
+            const open = !$g.hasClass('ow-group-collapsed');
+            $g.find('.ow-group-caret').attr('class', `fa-solid fa-chevron-${open ? 'down' : 'right'} ow-group-caret`);
+            if (open) {
+                const id = $g.data('group');
+                if (id === 'worldinfo') loadAndRenderWorldInfoEntries($panel);
+                if (id === 'prompts') renderPromptsPanel($panel.find('#ow_prompts_section'));
+                if (id === 'log') { $logPanel = $panel.find('#ow_log_section'); renderLogEntries($logPanel); }
+                if (id === 'overview') renderInjectionOverview($panel);
+            }
+        });
         renderApiPresets($panel);
 
-        // 位置切到"聊天中"显示深度，切到"角色定义前/后"显示顺序
-        $panel.on('change', '.ow-pos-select', function () {
-            const $row = $(this).closest('.ow-row');
-            const depthMode = isDepthPosition($(this).val());
-            $row.find('.ow-posnum').each(function () {
-                $(this).toggle($(this).find('input').attr('id').endsWith(depthMode ? '_depth' : '_order'));
-            });
-        });
-        renderInjectionOverview($panel);
-        $panel.find('#ow_inject_refresh').on('click', () => renderInjectionOverview($panel));
         $panel.find('#ow_lore_inject').on('change', function () { s.lore.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); renderInjectionOverview($panel); });
         $panel.find('#ow_lore_scan').on('change', function () { s.lore.scanDepth = Math.max(1, Number($(this).val()) || 10); saveSettings(); updateInjections(); });
         bindModuleApiRows($panel);
@@ -4638,9 +4436,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('input[name="ow_sum_cmode"]').on('change', function () { s.summary.compressMode = $(this).val(); saveSettings(); renderSettingsPanel($panel); });
         $panel.find('#ow_sum_lag').on('change', function () { s.summary.compressLag = Math.max(1, Number($(this).val()) || 5); saveSettings(); });
         $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
-        $panel.find('#ow_sum_inject_pos').on('change', function () { s.summary.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_sum_inject_depth').on('change', function () { s.summary.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
-        $panel.find('#ow_sum_inject_order').on('change', function () { s.summary.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
         $panel.find('#ow_check_update').on('click', async function () {
             const $btn = $(this);
@@ -4694,9 +4490,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_plot_min').on('change', function () { s.plot.minEvents = Math.max(2, Number($(this).val()) || 2); saveSettings(); });
         $panel.find('#ow_plot_send_current').on('change', function () { s.plot.sendCurrent = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_plot_inject').on('change', function () { s.plot.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
-        $panel.find('#ow_plot_inject_pos').on('change', function () { s.plot.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_plot_inject_depth').on('change', function () { s.plot.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
-        $panel.find('#ow_plot_inject_order').on('change', function () { s.plot.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
         $panel.find('#ow_open_ext_manager').on('click', function () {
             // 尝试打开酒馆自带的扩展管理器（不同版本入口 id 略有差异，逐个尝试）
             const candidates = ['#extensionsMenuButton', '#extensions_button', '#rm_extensions_block', '#extensions_details'];
@@ -4708,17 +4502,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_include_wi').on('change', function () { s.includeWorldInfo = $(this).is(':checked'); saveSettings(); });
-        $panel.find('#ow_include_cb').on('change', function () { s.includeCharBook = $(this).is(':checked'); saveSettings(); });
 
         $panel.find('#ow_inject_widgets').on('change', function () { s.injectWidgets = $(this).is(':checked'); saveSettings(); updateInjections(); });
-        $panel.find('#ow_inject_pos').on('change', function () { s.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_inject_depth').on('change', function () { s.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
-        $panel.find('#ow_inject_order').on('change', function () { s.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
         $panel.find('#ow_off_inject').on('change', function () { s.offscreen.injectTables = $(this).is(':checked'); saveSettings(); updateInjections(); });
-        $panel.find('#ow_off_inject_pos').on('change', function () { s.offscreen.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
         $panel.find('#ow_off_inject_depth').on('change', function () { s.offscreen.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
-        $panel.find('#ow_off_inject_order').on('change', function () { s.offscreen.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
 
 
         $panel.find('input[name="ow_theme_mode"]').on('change', function () {
