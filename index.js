@@ -21,7 +21,7 @@
     // （保留紧跟其后的斜杠），本处按同样规则复现，避免请求路径拼错导致 404。
     // ------------------------------------------------------------------
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.7.0';
+    const EXT_VERSION = '2.8.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -157,10 +157,15 @@
     // 注意：酒馆对"角色定义前/后"的多条注入是按注入键名 Object.keys().sort() 排序的，
     // depth 只对"聊天中"生效。所以"顺序"必须编码进键名里（补零后参与字典序）。
     const PROMPT_TYPES = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
+    // 【重要】酒馆世界书的 ↑Char / ↓Char 对应的是 wiBefore / wiAfter 插槽，
+    // 那两个插槽是世界书条目专用的，扩展注入进不去。扩展只能用 anchorBefore / anchorAfter。
+    // 默认上下文模板（default/content/settings.json 的 story_string）甚至没有包含
+    // anchorBefore/anchorAfter 这两个变量，所以在默认模板下这两个位置不会被渲染出来——
+    // 这就是"改顺序没反应"的原因。可靠的位置是"聊天中"。
     const POSITION_LABELS = {
-        BEFORE_PROMPT: '角色定义前',
-        IN_PROMPT: '角色定义后',
-        IN_CHAT: '聊天中（按深度）',
+        BEFORE_PROMPT: '提示词最前（anchorBefore，部分模板不支持）',
+        IN_PROMPT: '角色定义后（anchorAfter，部分模板不支持）',
+        IN_CHAT: '聊天中（按深度，推荐）',
     };
     const isDepthPosition = (pos) => pos === 'IN_CHAT';
 
@@ -294,9 +299,6 @@
         // 本聊天专属设定（只在当前聊天生效，不会污染角色卡世界书）
         lore: {
             injectEnabled: true,
-            injectPosition: 'IN_PROMPT',
-            injectDepth: 0,
-            injectOrder: 50,
             scanDepth: 10,   // 关键词触发时向前扫描多少层聊天
         },
         // 总结
@@ -458,6 +460,17 @@
 
     function saveChatData() {
         ctx().saveMetadataDebounced();
+    }
+
+    /** 立即落盘（不走防抖）。在可能触发酒馆重载/保存聊天的操作前后调用，防止未保存数据被冲掉。 */
+    async function flushChatData() {
+        try {
+            const c = ctx();
+            if (typeof c.saveMetadata === 'function') { await c.saveMetadata(); return true; }
+        } catch (err) {
+            log('warn', 'system', `强制保存扩展数据失败：${err.message || err}`);
+        }
+        return false;
     }
 
     function uid() {
@@ -729,9 +742,9 @@
 
         const groups = new Map();
         for (const e of active) {
-            const pos = e.position || s.lore.injectPosition;
-            const dep = e.depth ?? s.lore.injectDepth;
-            const ord = e.order ?? s.lore.injectOrder;
+            const pos = e.position || 'IN_CHAT';
+            const dep = e.depth ?? 0;
+            const ord = e.order ?? 100;
             const key = `${pos}::${dep}::${ord}`;
             if (!groups.has(key)) groups.set(key, { position: pos, depth: Number(dep) || 0, order: Number(ord) || 0, items: [] });
             groups.get(key).items.push(e);
@@ -775,119 +788,6 @@
         return out;
     }
 
-    /** 从摘要文本里读出 `[Chapter_X]` 标签中的章号；没有返回 null */
-    function parseChapterTag(text) {
-        const m = /`?\[\s*Chapter[_\s]*(\d+)\s*\]`?/i.exec(String(text || ''));
-        return m ? Number(m[1]) : null;
-    }
-
-    /** 用配置的规则从一条回复里抠出现成摘要，抠不到返回 null */
-    function extractSummaryFrom(mes) {
-        const s = settings();
-        for (const rule of (s.summary.detectPatterns || [])) {
-            if (rule.enabled === false || !rule.pattern) continue;
-            try {
-                const re = new RegExp(rule.pattern, 'i');
-                const m = re.exec(mes);
-                if (m && m[1] && m[1].trim()) {
-                    return { text: m[1].trim(), rule: rule.name || rule.id };
-                }
-            } catch (err) {
-                log('warn', 'parse', `摘要识别规则「${rule.name || rule.id}」正则有误：${err.message}`);
-            }
-        }
-        return null;
-    }
-
-    /** 扫描全部章节，重建摘要索引（纯代码，不经模型） */
-    function rescanSummaryIndex() {
-        const cd = chatData();
-        const chapters = listChapters();
-        const prevByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
-        // 导入的历史记录不依附于当前消息，必须原样保留
-        const imported = cd.summary.index.filter((x) => x.source === 'imported');
-        const byCh = new Map(imported.map((x) => [x.chapter, x]));
-
-        const missing = [];
-        let pos = 0;
-        for (const ch of chapters) {
-            pos += 1;
-            const found = extractSummaryFrom(ch.mes);
-            // 章号优先取摘要里写明的 `[Chapter_X]`；没有才按出场顺序推算。
-            // 这样重 roll、删楼、导入旧记录都不会让章号错位。
-            const tagged = found ? parseChapterTag(found.text) : null;
-            const chapter = tagged || pos;
-            if (found) {
-                byCh.set(chapter, { chapter, msgId: ch.msgId, text: found.text.trim(), source: 'native', rule: found.rule, tagged: !!tagged });
-            } else {
-                const prev = prevByCh.get(chapter);
-                if (prev && (prev.source === 'generated' || prev.source === 'imported') ) {
-                    byCh.set(chapter, { ...prev, msgId: ch.msgId });
-                } else if (!byCh.has(chapter)) {
-                    byCh.set(chapter, { chapter, msgId: ch.msgId, text: '', source: 'missing' });
-                    missing.push(chapter);
-                }
-            }
-        }
-        const index = [...byCh.values()].sort((a, b) => a.chapter - b.chapter);
-        cd.summary.index = index;
-        cd.summary.scannedAt = Date.now();
-        saveChatData();
-        const nat = index.filter((x) => x.source === 'native').length;
-        const imp = index.filter((x) => x.source === 'imported').length;
-        const taggedN = index.filter((x) => x.tagged).length;
-        log('info', 'system',
-            `摘要索引已重建：当前 ${chapters.length} 条回复，索引 ${index.length} 章（现成 ${nat}${imp ? ` · 导入 ${imp}` : ''}${taggedN ? ` · 其中 ${taggedN} 章章号取自 [Chapter_X] 标签` : ''}）` +
-            (missing.length ? `，缺失 ${missing.length} 章：${missing.join('、')}` : '，无缺失'),
-            { missing });
-        return { total: chapters.length, indexed: index.length, missing };
-    }
-
-    /**
-     * 导入历史总结：把以前手动存在世界书里的摘要粘进来。
-     * 按 `[Chapter_X]` 标签切分；没有标签的整段算作一条，由调用方指定起始章号。
-     */
-    function parseImportedSummaries(raw, startChapter = 1) {
-        const text = String(raw || '').replace(/\r\n/g, '\n').trim();
-        if (!text) return [];
-        const out = [];
-        // 用 [Chapter_X] 作为切分锚点
-        const re = /`?\[\s*Chapter[_\s]*(\d+)\s*\]`?/gi;
-        const hits = [];
-        let m;
-        while ((m = re.exec(text))) hits.push({ idx: m.index, ch: Number(m[1]) });
-        if (hits.length) {
-            hits.forEach((h, i) => {
-                const end = i + 1 < hits.length ? hits[i + 1].idx : text.length;
-                const seg = text.slice(h.idx, end).trim();
-                if (seg) out.push({ chapter: h.ch, text: seg });
-            });
-        } else {
-            // 没有标签：按空行分段，依次编号
-            const paras = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
-            paras.forEach((pTxt, i) => out.push({ chapter: startChapter + i, text: pTxt }));
-        }
-        return out;
-    }
-
-    function importSummaries(raw, { startChapter = 1, overwrite = true } = {}) {
-        const cd = chatData();
-        const parsed = parseImportedSummaries(raw, startChapter);
-        if (!parsed.length) return { added: 0, skipped: 0, total: 0 };
-        const byCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
-        let added = 0, skipped = 0;
-        for (const item of parsed) {
-            const exist = byCh.get(item.chapter);
-            if (exist && exist.source !== 'missing' && !overwrite) { skipped += 1; continue; }
-            byCh.set(item.chapter, { chapter: item.chapter, msgId: exist?.msgId ?? null, text: item.text, source: 'imported' });
-            added += 1;
-        }
-        cd.summary.index = [...byCh.values()].sort((a, b) => a.chapter - b.chapter);
-        saveChatData();
-        log('info', 'system', `导入历史摘要：解析出 ${parsed.length} 条，写入 ${added} 条${skipped ? `，跳过已存在 ${skipped} 条` : ''}（章号范围 ${parsed[0].chapter}–${parsed[parsed.length - 1].chapter}）`);
-        return { added, skipped, total: parsed.length };
-    }
-
     /** 已被大总结覆盖到的最大章号 */
     /** 已被大总结覆盖到的最大章号 */
     function lastSummarizedChapter() {
@@ -895,57 +795,66 @@
         return cd.summary.bigSummaries.reduce((mx, b) => Math.max(mx, Number(b.toCh) || 0), 0);
     }
 
-    const DEFAULT_SUMMARY_SYSTEM_PROMPT = `你是一个剧情档案编排器。你的任务**不是撰写摘要**，而是为已有的章节摘要做结构化编排。
+    const DEFAULT_SUMMARY_SYSTEM_PROMPT = `你是一个剧情档案编排器。你的任务是把已有的各章摘要**原样搬运**并按场景重新编排，不是重新撰写。
 
-【最重要的约束】
-- 每一章的摘要正文**已经存在**，由程序保管，会在最终文档里自动填入。你**绝对不要复述、改写或输出任何章节摘要的正文**。
-- 你只输出"结构"：怎么分转场、每个转场区间挑哪一段高光对话、有哪些物理锚点、锚点绑定到哪几章。
-- 章节顺序由程序按章号排列，你不需要也不允许改变顺序。
+【核心硬性约束：纯粹的搬运工与时间线守护者】
+1. 绝对的无损复制：所谓"摘要"，100% 特指每一章正文里**已经生成好的现成摘要**（末尾/开头的摘要块）。
+2. 严禁重构与打乱顺序：绝对禁止再去读正文自行总结新摘要（除非该章确实没有现成摘要）。
+   绝对禁止改变章节原本的先后顺序，必须严格按第1章、第2章、第3章的线性顺序搬运。若原摘要为外语，直译为中文后再搬运。
+3. 严禁遗漏：范围内每一章的现成摘要都必须出现在结果里。
 
-【第一步：转场划分】
-- 只有剧情发生**物理空间转移**时（如从A房间到B房间）才划分新的转场区间。同一地点内的多章归入同一区间。
-- 每个区间要写：场景名称、时间（尽量对应到具体日期与时段）、覆盖的章号范围。
-- 下方会给出【已有场景标签】。若该地点已经存在，**必须复用其 \`[Scene_X]\` 标签**，不要另起名字；确实是新地点才留空由程序分配。
+【第一步：线性摘要搬运与场景锚点定标】
+- 逐章检索，按时间顺序排列。
+- 只有剧情发生**物理空间转移**时（如从A房间到B房间），才在列表前方插入一个【转场标题】，包含场景名称与时间。
+- 在转场标题下方，无损搬运该场景下发生的所有现成摘要。
+- 若下方给出了【已有场景标签】，同一地点必须复用其 \`[Scene_X]\` 标签。
 
-【第二步：高光对话提取】
-- 针对每个转场区间，回到正文原文中寻找最具张力或推动力的**连续互动**，以剧本格式提取。
-- **一行 = 一个角色的一句台词 + 一个短动作**。严格照这个样子写：
+【第二步：高光剧本提取】
+- 针对每个转场区间，回到正文原文中寻找最具张力或推动力的连续互动。
+- **一行 = 一个角色的一句台词 + 一个短动作**，严格照这个样子写：
       安琳："上车。" (转身时，深褐色的皮草边缘在潮湿的空气中划出一道沉闷的弧度。)
       况野："好姐姐，你走慢点，小狗没打伞，又要淋湿了。" (换上一副没皮没脸的笑，语调黏糊，三两步追上。)
-- **只输出 3-5 行**（是 3-5 行台词，不是 3-5 段正文）。
-- **对白**：必须是角色说出口的那一句话，逐字原文，不许改写、不许合并两句、不许加省略号省略中间。
-- **动作**：只写这个角色**说这句话的那一瞬间**的肢体、表情或语气，从原文里摘取最贴近的那一个短句即可，
-  **控制在 40 字以内**。
-- **严禁**把整段正文、整章内容、旁白、心理描写或多句台词塞进一行；
-  **严禁**把这一区间所有说过的话堆在一起；**严禁**把别的角色的动作写进这一行。
+- **只输出 3-5 行**（是 3-5 行台词，不是 3-5 段正文）。剧情需连续，一个区间仅限一段。
+- **对白**：角色说出口的那一句，逐字原文，不许改写、不许合并两句。
+- **动作**：只写说这句话那一瞬间的肢体/表情/语气，从原文摘取最贴近的短句，**40 字以内**。
+- **严禁**把整段正文、整章内容、旁白或多句台词塞进一行；严禁把该区间所有台词堆在一起。
   括号里出现两个以上句号，或明显是成段的场景描写，都属于错误。
 - 反例（禁止这样写）：
       ✗ 安琳："上车。" (雨下得很大。况野站在原地没有动。他想起三年前的那个晚上……整段正文照抄)
       ✗ 安琳："上车。你怎么还不走？我说了多少次了？" ← 多句合并
-- 一个区间**只准一段**（即只准这 3-5 行）。剧情必须连续。
-- 若该区间确实没有值得记录的高光互动，dialogue 填 null——**宁缺毋滥，不要为了填满而硬凑**。
-- 必须注明这段对话出自第几章。
+- 若该区间没有值得记录的高光互动，写"无"——宁缺毋滥。
 
-【第三步：物理锚点】
-- 记录该区间产生的、对后续有影响的【不可忽略物理因素】（信物、伤口、证据、遗留物等），过于日常的省略。
-- 必须是正文明确提到的，禁止想象。写清：名称、来源、当前位置；若为伤情注明预计好转/消失的时间节点。
-- 下方会给出【已有物品标签】，同一物品必须复用其 \`[Item_Anchor_X]\` 标签。
-- 没有就填空数组。
+【第三步：关键物理实体影响】
+- 每个转场区间，总结产生且对后续有影响的【不可忽略物理因素】（信物、伤口等），过于日常的省略。
+- 必须是正文明确提到的，禁止想象。写清来源、当前存在位置；若为伤情注明好转/消失时间节点。
+- 若下方给出了【已有物品标签】，同一物品必须复用其 \`[Item_Anchor_X]\` 标签。没有则写"无"。
 
-【第四步：锚点关联】
-- 指明每个高光对话、每个物理锚点分别关联到哪几个章号，便于日后回溯它发生在什么情境里。
+【第四步：锚点关联代码化】
+- 用 \`[Dialogue_Anchor_X]\`、\`[Item_Anchor_X]\` 标签，与第一步中具体的【第X章摘要】双向绑定，
+  使得日后提及某个锚点时能立刻知道它发生在哪一章的情境中。
 
-【输出格式】
-只输出一个 JSON 对象，不要输出 Markdown 代码块围栏或解释文字：
-{"sections":[{
-  "sceneTag":"\`[Scene_1]\` 或留空",
-  "sceneName":"地点名称",
-  "time":"具体日期与时段",
-  "chapters":[1,2,3],
-  "dialogue":{"fromChapter":2,"lines":[{"speaker":"角色名","quote":"该角色说出口的那一句话（逐字原文）","action":"说这句话时的一个短动作，40字以内"}]},
-  "itemAnchors":[{"tag":"\`[Item_Anchor_1]\` 或留空","name":"物品名","origin":"来源","location":"当前位置","note":"伤情时间节点等","chapters":[2]}]
-}]}
-dialogue 没有时填 null。`;
+【输出格式模板（严格按此结构输出，不要用代码块包裹，不要加任何解释）】
+<大总结(第X-Y章)>
+
+- 【转场标题一】：（具体地点名称） - 时间：（具体日期和时间段）
+  - 核心锚点：
+    - 高光对话 \`[Dialogue_Anchor_1]\`：
+        角色A："{对白正文摘抄}" ({动作正文摘抄})
+        角色B："{对白正文摘抄}" ({动作正文摘抄})
+    - 不可忽略物理因素 \`[Item_Anchor_1]\`：1. {物品名称}（{来源说明}，置于{当前位置}，若为伤情注明好转/消失时间节点）
+  - 线性摘要搬运记录：
+    - \`[Chapter_A]\`：{原版现成摘要内容，非中文请翻译} (关联锚点：\`[Dialogue_Anchor_1]\`、\`[Item_Anchor_1]\`)
+    - \`[Chapter_B]\`：{原版现成摘要内容}
+
+- 【转场标题二】：（新地点名称） - 时间：（时间段）
+  - 核心锚点：
+    - 高光对话 \`[Dialogue_Anchor_2]\`：
+        ……
+    - 不可忽略物理因素：无
+  - 线性摘要搬运记录：
+    - \`[Chapter_C]\`：{原版现成摘要内容} (关联锚点：\`[Dialogue_Anchor_2]\`)
+
+</大总结(第X-Y章)>`;
 
     const DEFAULT_SUMMARY_COMPRESS_PROMPT = `你要压缩一份剧情档案里的**叙述部分**。
 
@@ -989,127 +898,78 @@ dialogue 没有时填 null。`;
         return parts.join('\n\n');
     }
 
-    /** 校验模型摘录的台词是否真的在原文里 */
-    function verifyDialogue(section, chaptersMap) {
-        if (!section.dialogue || !Array.isArray(section.dialogue.lines)) return;
-        const norm = (t) => String(t || '').replace(/[\s\u3000]/g, '')
-            .replace(/["""']/g, '"').replace(/[，,]/g, ',').replace(/[。．.]/g, '.');
-        const chIds = section.dialogue.fromChapter ? [section.dialogue.fromChapter] : (section.chapters || []);
-        const pool = chIds.map((n) => norm(chaptersMap.get(Number(n)) || '')).join('||');
-        for (const line of section.dialogue.lines) {
-            const q = norm(line.quote);
-            line.verified = !!(q && pool.includes(q));
-            // 兜底：模型有时会把整段正文塞进括号里的动作，或把多句台词并成一句。
-            // 提示词已经明令禁止，这里再做一道长度检查，超标就标出来让人过目。
-            line.tooLong = (String(line.action || '').length > 60) || (String(line.quote || '').length > 120);
-        }
-        const bad = section.dialogue.lines.filter((l) => !l.verified).length;
-        const longN = section.dialogue.lines.filter((l) => l.tooLong).length;
-        if (longN) {
-            log('warn', 'parse',
-                `高光对话：有 ${longN} 行的动作或台词过长，模型可能把整段正文塞进来了（已在文档里标注，可编辑或重新生成该区间）`,
-                section.dialogue.lines.filter((l) => l.tooLong).map((l) => `${l.speaker}：${String(l.quote).slice(0, 30)}… (动作${String(l.action).length}字)`));
-        }
-        if (bad) {
-            log('warn', 'parse',
-                `高光对话校验：有 ${bad} 句在原文中找不到，可能被模型改写或杜撰（已在界面标红，可点"重挑"重新生成该区间）`,
-                section.dialogue.lines.filter((l) => !l.verified).map((l) => l.quote));
-        }
+    function buildSummaryUserPromptV2(fromCh, toCh) {
+        const parts = [];
+        const scenes = (chatData().offscreen.tables?.sceneTable || [])
+            .map((r) => `${r.tag} ${r.name}`).filter((x) => x.trim());
+        const items = (chatData().offscreen.tables?.itemAnchorTable || [])
+            .map((r) => `${r.tag} ${r.name}`).filter((x) => x.trim());
+        if (scenes.length) parts.push(`【已有场景标签（同一地点必须复用）】\n${scenes.join('\n')}`);
+        if (items.length) parts.push(`【已有物品标签（同一物品必须复用）】\n${items.join('\n')}`);
+        parts.push(`【本次整理范围】第 ${fromCh} 章 至 第 ${toCh} 章`);
+
+        const chapters = listChapters().filter((c) => c.chapter >= fromCh && c.chapter <= toCh);
+        const raw = chapters.map((c) => `===== 第${c.chapter}章 =====\n${c.mes.slice(0, 8000)}`).join('\n\n');
+        parts.push(`【各章原文（含每章末尾已生成的现成摘要，请直接搬运那些摘要，不要重写）】\n${raw}`);
+        return parts.join('\n\n');
     }
 
     async function generateBigSummary() {
         const s = settings();
         const cd = chatData();
-        const scan = rescanSummaryIndex();
-
         const from = lastSummarizedChapter() + 1;
-        const to = cd.summary.index.reduce((mx, x) => Math.max(mx, x.chapter), 0);
+        const to = listChapters().length;
         if (to < from) throw new Error(`没有新章节可总结（已总结到第 ${from - 1} 章，当前共 ${to} 章）`);
 
-        // 缺摘要的章节：按设置补写或跳过
-        const missingInRange = cd.summary.index.filter((x) => x.chapter >= from && x.chapter <= to && x.source === 'missing');
-        if (missingInRange.length) {
-            if (s.summary.onMissing === 'generate') {
-                log('info', 'system', `第 ${missingInRange.map((x) => x.chapter).join('、')} 章没有现成摘要，将由模型补写并标记 ⚠️`);
-                const chat0 = ctx().chat || [];
-                const chMap = new Map(cd.summary.index.map((x) => [x.chapter, x.msgId != null ? String(chat0[x.msgId]?.mes || '') : '']));
-                for (const rec of missingInRange) {
-                    try {
-                        const txt = await callModel(
-                            '你是剧情摘要助手。只输出这一章的简明摘要正文本身，不要标题、不要解释、不要代码块。控制在 150 字以内。',
-                            `【本章正文】\n${String(chMap.get(rec.chapter) || '').slice(0, 8000)}`,
-                            `补写摘要:第${rec.chapter}章`, 'summary');
-                        rec.text = stripCodeFence(txt).trim();
-                        rec.source = 'generated';
-                    } catch (err) {
-                        log('warn', 'system', `第 ${rec.chapter} 章摘要补写失败：${err.message || err}`);
-                    }
-                }
-                saveChatData();
-            } else {
-                log('warn', 'system', `第 ${missingInRange.map((x) => x.chapter).join('、')} 章没有现成摘要，按设置已跳过（可到设置里改为自动补写）`);
-            }
-        }
-
-        log('info', 'system', `开始编排大总结：第 ${from}–${to} 章`);
-        const raw = await callModel(s.prompts.summarySystemPrompt, buildSummaryUserPrompt(from, to), `大总结 ${from}-${to}`, 'summary');
-        const parsed = tryParseJsonRobust(raw, '大总结');
-        if (!parsed || !Array.isArray(parsed.sections)) {
-            throw new Error('未能从模型响应中解析出 sections 数组，本次未写入。详见日志。');
-        }
-
-        const chatA = ctx().chat || [];
-        const chMap = new Map(cd.summary.index.map((x) => [x.chapter, x.msgId != null ? String(chatA[x.msgId]?.mes || '') : '']));
-        const sections = parsed.sections.map((sec) => {
-            const out = {
-                sceneTag: String(sec.sceneTag || '').trim(),
-                sceneName: String(sec.sceneName || '').trim(),
-                time: String(sec.time || '').trim(),
-                chapters: (Array.isArray(sec.chapters) ? sec.chapters : []).map(Number).filter((n) => n >= from && n <= to).sort((a, b) => a - b),
-                dialogue: sec.dialogue && Array.isArray(sec.dialogue.lines) && sec.dialogue.lines.length ? {
-                    fromChapter: Number(sec.dialogue.fromChapter) || null,
-                    lines: sec.dialogue.lines.map((l) => ({
-                        speaker: String(l.speaker || '').trim(),
-                        quote: String(l.quote || '').trim(),
-                        action: String(l.action || '').trim(),
-                        verified: false,
-                    })),
-                } : null,
-                itemAnchors: (Array.isArray(sec.itemAnchors) ? sec.itemAnchors : []).map((it) => ({
-                    tag: String(it.tag || '').trim(),
-                    name: String(it.name || '').trim(),
-                    origin: String(it.origin || '').trim(),
-                    location: String(it.location || '').trim(),
-                    note: String(it.note || '').trim(),
-                    chapters: (Array.isArray(it.chapters) ? it.chapters : []).map(Number).filter(Boolean),
-                })),
-            };
-            verifyDialogue(out, chMap);
-            return out;
-        }).filter((x) => x.chapters.length);
-
-        // 自动补全缺失的锚点编号
-        let dlgN = cd.summary.bigSummaries.reduce((n, b) => n + b.sections.filter((x) => x.dialogue).length, 0);
-        sections.forEach((sec) => { if (sec.dialogue) { dlgN += 1; sec.dialogue.tag = `\`[Dialogue_Anchor_${dlgN}]\``; } });
+        log('info', 'system', `开始整理大总结：第 ${from}–${to} 章`);
+        const raw = await callModel(s.prompts.summarySystemPrompt, buildSummaryUserPromptV2(from, to), `大总结 ${from}-${to}`, 'summary');
+        const text = stripCodeFence(raw).trim();
+        if (!text) throw new Error('模型返回为空，本次未写入。');
 
         const big = {
             id: `sum_${Date.now().toString(36)}`,
             fromCh: from, toCh: to,
             createdAt: Date.now(),
-            sections,
-            level: 1,          // 1=原始；2=已单条压缩
+            imported: false,
+            rawText: text,
+            sections: [],
+            level: 1,
             compressedAt: null,
         };
         cd.summary.bigSummaries.push(big);
+        cd.summary.bigSummaries.sort((a, b) => a.fromCh - b.fromCh);
         saveChatData();
         updateInjections();
-        log('info', 'system', `大总结完成：第 ${from}–${to} 章，${sections.length} 个转场区间`);
-
+        log('info', 'system', `大总结完成：第 ${from}–${to} 章，${text.length} 字`);
+        await flushChatData();
         if (s.summary.compressMode === 'auto') maybeAutoCompress();
         return big;
     }
 
-    /** 自动压缩：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…（滑窗差值） */
+    /** 重新生成某条大总结（章号范围不变，覆盖原内容） */
+    async function regenerateBigSummary(bigId) {
+        const s = settings();
+        const cd = chatData();
+        const big = cd.summary.bigSummaries.find((b) => b.id === bigId);
+        if (!big) throw new Error('找不到这条总结');
+        log('info', 'system', `重新生成大总结：第 ${big.fromCh}–${big.toCh} 章`);
+        const raw = await callModel(s.prompts.summarySystemPrompt, buildSummaryUserPromptV2(big.fromCh, big.toCh), `重生成 ${big.fromCh}-${big.toCh}`, 'summary');
+        const text = stripCodeFence(raw).trim();
+        if (!text) throw new Error('模型返回为空，原内容保持不变。');
+        big.rawText = text;
+        big.imported = false;
+        big.level = 1;
+        big.compressedAt = null;
+        delete big.compressedText;
+        big.createdAt = Date.now();
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `已重新生成第 ${big.fromCh}–${big.toCh} 章的大总结`);
+        await flushChatData();
+        return big;
+    }
+
+    /** 自动压缩：出现第 N 次总结时压缩第 1 次    /** 自动压缩：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…（滑窗差值） */
     function maybeAutoCompress() {
         const s = settings();
         const cd = chatData();
@@ -1133,7 +993,7 @@ dialogue 没有时填 null。`;
 
         // 粘贴导入的大总结是一整块文本，里面混着高光原话与物理锚点。
         // 压缩时必须额外交代"只压叙述、原话一字不改"，并保留原文以便还原。
-        if (big.imported) {
+        {
             const guard = `${s.prompts.summaryCompressPrompt}
 
 【针对整块档案的额外规则（最高优先级）】
@@ -1148,7 +1008,8 @@ dialogue 没有时填 null。`;
             big.compressedAt = Date.now();
             saveChatData();
             updateInjections();
-            log('info', 'system', `已压缩导入的总结（第 ${big.fromCh}–${big.toCh} 章）。原文已保留，可随时还原。`);
+            log('info', 'system', `已压缩总结（第 ${big.fromCh}–${big.toCh} 章）。原文已保留，可随时还原。`);
+            await flushChatData();
             return;
         }
         const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
@@ -1217,54 +1078,9 @@ dialogue 没有时填 null。`;
 
     /** 按你的模板把一条大总结渲染成文本；摘要正文直接取自扩展存档 */
     function renderBigSummary(big, { compressed = null } = {}) {
-        // 粘贴导入的大总结：原样保存原文，压缩后另存，随时可还原
-        if (big.imported) {
-            const useC = compressed === null ? (big.level >= 2) : compressed;
-            return (useC && big.compressedText) ? big.compressedText : (big.rawText || '');
-        }
-        const cd = chatData();
-        const idxByCh = new Map(cd.summary.index.map((x) => [x.chapter, x]));
-        const useCompressed = compressed === null ? (big.level >= 2) : compressed;
-        const L = [`<大总结(第${big.fromCh}-${big.toCh}章)>`];
-        big.sections.forEach((sec, i) => {
-            L.push('');
-            L.push(`- 【转场标题${i + 1}】：${sec.sceneName}${sec.sceneTag ? ` ${sec.sceneTag}` : ''} - 时间：${sec.time || '—'}`);
-            L.push('  - 核心锚点：');
-            if (sec.dialogue) {
-                L.push(`    - 高光对话 ${sec.dialogue.tag || ''}${sec.dialogue.fromChapter ? `（出自第${sec.dialogue.fromChapter}章 \`[Chapter_${sec.dialogue.fromChapter}]\`）` : ''}：`);
-                for (const ln of sec.dialogue.lines) {
-                    const mark = (ln.verified === false ? ' ⚠️原文未匹配' : '') + (ln.tooLong ? ' ⚠️过长(疑似整段照抄)' : '');
-                    L.push(`        ${ln.speaker}："${ln.quote}"${ln.action ? ` (${ln.action})` : ''}${mark}`);
-                }
-            } else {
-                L.push('    - 高光对话：无');
-            }
-            if (sec.itemAnchors.length) {
-                sec.itemAnchors.forEach((it, k) => {
-                    L.push(`    - 不可忽略物理因素 ${it.tag || ''}：${k + 1}. ${it.name}（${it.origin}，置于${it.location}${it.note ? `，${it.note}` : ''}）${it.chapters?.length ? ` 关联：${it.chapters.map((n) => `\`[Chapter_${n}]\``).join('、')}` : ''}`);
-                });
-            } else {
-                L.push('    - 不可忽略物理因素：无');
-            }
-            L.push('  - 线性摘要搬运记录：');
-            if (useCompressed && sec.compressed) {
-                L.push(`    - \`[Chapter_${sec.chapters[0]}-${sec.chapters[sec.chapters.length - 1]}]\`（已压缩）：${sec.compressed}`);
-            } else {
-                for (const n of sec.chapters) {
-                    const r = idxByCh.get(n);
-                    const flag = r?.source === 'generated' ? ' ⚠️扩展补写'
-                        : r?.source === 'missing' ? ' ⚠️缺失'
-                        : r?.source === 'imported' ? ' （导入）' : '';
-                    const anchors = [];
-                    if (sec.dialogue && sec.dialogue.fromChapter === n && sec.dialogue.tag) anchors.push(sec.dialogue.tag);
-                    for (const it of sec.itemAnchors) if (it.chapters?.includes(n) && it.tag) anchors.push(it.tag);
-                    L.push(`    - \`[Chapter_${n}]\`${flag}：${r?.text || '（无摘要）'}${anchors.length ? ` (关联锚点：${anchors.join('、')})` : ''}`);
-                }
-            }
-        });
-        L.push('');
-        L.push(`</大总结(第${big.fromCh}-${big.toCh}章)>`);
-        return L.join('\n');
+        // 大总结统一以整块文本保存（模型直接产出 / 粘贴导入），压缩后另存，随时可还原
+        const useC = compressed === null ? (big.level >= 2) : compressed;
+        return (useC && big.compressedText) ? big.compressedText : (big.rawText || '');
     }
 
     function renderAllSummariesText() {
@@ -3909,7 +3725,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                         <input type="checkbox" class="ow-lore-on" ${e.enabled !== false ? 'checked' : ''}><span class="ow-switch-track"></span>
                       </label>
                       <span class="ow-widget-name" data-action="lore-toggle">${escapeHtml(e.name || '未命名')}</span>
-                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'}${e.position ? ' · 自定位置' : ''}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
+                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'}${POSITION_LABELS[e.position || 'IN_CHAT'] ? ` · ${(e.position || 'IN_CHAT') === 'IN_CHAT' ? `深度${e.depth ?? 0}` : `顺序${e.order ?? 100}`}` : ''}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
                       <span class="ow-spacer"></span>
                       <button class="ow-btn ow-danger" data-action="lore-del"><i class="fa-solid fa-trash"></i></button>
                     </div>
@@ -3926,14 +3742,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
                       <div class="ow-field-label">注入位置</div>
                       <div class="ow-row">
-                        <select class="ow-select ow-lore-epos">
-                          <option value="" ${!e.position ? 'selected' : ''}>跟随模块设置</option>
-                          ${positionOptionsHtml(e.position)}
-                        </select>
-                        <label class="ow-eposnum" ${isDepthPosition(e.position) ? '' : 'style="display:none;"'}>深度
-                          <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? ''}" placeholder="—"></label>
-                        <label class="ow-eposnum" ${(e.position && !isDepthPosition(e.position)) ? '' : 'style="display:none;"'}>顺序
-                          <input type="number" class="ow-input ow-num ow-lore-eorder" min="0" value="${e.order ?? ''}" placeholder="—"></label>
+                        <select class="ow-select ow-lore-epos">${positionOptionsHtml(e.position || 'IN_CHAT')}</select>
+                        <label class="ow-eposnum" ${isDepthPosition(e.position || 'IN_CHAT') ? '' : 'style="display:none;"'}>深度
+                          <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? 0}"></label>
+                        <label class="ow-eposnum" ${isDepthPosition(e.position || 'IN_CHAT') ? 'style="display:none;"' : ''}>顺序
+                          <input type="number" class="ow-input ow-num ow-lore-eorder" min="0" value="${e.order ?? 100}"></label>
                       </div>
                     </div>
                   </div>`;
@@ -3943,7 +3756,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         }
 
         $panel.find('#ow_lore_add').on('click', function () {
-            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true });
+            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true, position: 'IN_CHAT', depth: 0, order: 100 });
             saveChatData(); updateInjections(); renderLorePanel($panel);
         });
 
@@ -3962,13 +3775,13 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
         $list.on('change', '.ow-lore-epos', function () {
             const e = find(this); if (!e) return;
-            e.position = $(this).val() || null;
+            e.position = $(this).val();
             saveChatData(); updateInjections();
             const $row = $(this).closest('.ow-row');
             const depthMode = isDepthPosition(e.position);
             $row.find('.ow-eposnum').each(function () {
                 const isDepth = $(this).find('input').hasClass('ow-lore-edepth');
-                $(this).toggle(!!e.position && (depthMode ? isDepth : !isDepth));
+                $(this).toggle(depthMode ? isDepth : !isDepth);
             });
         });
         $list.on('change', '.ow-lore-edepth', function () {
@@ -3999,18 +3812,15 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const sm = cd.summary;
         const chapters = listChapters();
         const done = lastSummarizedChapter();
-        const nativeN = sm.index.filter((x) => x.source === 'native').length;
-        const missN = sm.index.filter((x) => x.source === 'missing').length;
+        const to0 = chapters.length;
 
         $panel.html(`
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_sum_gen"><i class="fa-solid fa-layer-group"></i> 大总结</button>
-            <button class="ow-btn" id="ow_sum_rescan"><i class="fa-solid fa-magnifying-glass"></i> 重新扫描摘要</button>
-            <span class="ow-muted">共 ${chapters.length} 章 · 已总结至第 ${done} 章 · 识别摘要 ${nativeN}${missN ? ` · 缺失 ${missN}` : ''}</span>
+            <span class="ow-muted">共 ${chapters.length} 章 · 已总结至第 ${done} 章${to0 > done ? ` · 待整理 ${to0 - done} 章` : ''}</span>
           </div>
           <span>
-            <button class="ow-btn" id="ow_sum_import_btn"><i class="fa-solid fa-file-import"></i> 导入章节摘要</button>
             <button class="ow-btn" id="ow_sum_impbig_btn"><i class="fa-solid fa-file-lines"></i> 导入大总结</button>
             <button class="ow-btn" id="ow_sum_hide_btn"><i class="fa-solid fa-eye-slash"></i> 隐藏楼层</button>
           </span>
@@ -4019,19 +3829,19 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
         const $list = $panel.find('#ow_sum_list');
         if (!sm.bigSummaries.length) {
-            $list.html(`<div class="ow-empty">还没有大总结。<br><span class="ow-muted">扩展会先用正则把正文里现成的每章摘要抠出来存档，模型只负责编排结构（转场/高光/物品锚点），摘要正文由扩展原样填入，不经模型改写。</span></div>`);
+            $list.html(`<div class="ow-empty">还没有大总结。<br><span class="ow-muted">点「大总结」，模型会把范围内各章现成的摘要按场景编排成档案。生成后可自行审核，不满意点「重新生成」。</span></div>`);
         } else {
             $list.html(sm.bigSummaries.map((b, i) => {
-                const badDlg = b.sections.reduce((n, sec) => n + (sec.dialogue?.lines.filter((l) => l.verified === false).length || 0), 0);
                 return `
               <div class="ow-widget-card ow-collapsed" data-sid="${escapeHtml(b.id)}">
                 <div class="ow-widget-card-head">
                   <span class="ow-caret" data-action="sum-toggle"><i class="fa-solid fa-chevron-right"></i></span>
                   <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} 章</span>
-                  <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : `${b.sections.length} 区间`} · ${b.level >= 2 ? '已压缩' : '原始'}${badDlg ? ` · <span style="color:#e5787d;">${badDlg} 句待核</span>` : ''}</span>
+                  <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : '模型生成'} · ${b.level >= 2 ? '已压缩' : '原始'} · ${(b.rawText || '').length} 字</span>
                   <span class="ow-spacer"></span>
+                  ${b.imported ? '' : `<button class="ow-btn ow-gen-btn" data-action="sum-regen" title="重新生成这一段（章号范围不变，覆盖原内容）"><i class="fa-solid fa-arrows-rotate"></i> 重新生成</button>`}
                   ${b.level < 2
-                    ? `<button class="ow-btn" data-action="sum-compress" title="压缩叙述（高光原话与物品锚点一字不改）"><i class="fa-solid fa-compress"></i> 压缩</button>`
+                    ? `<button class="ow-btn ow-gen-btn" data-action="sum-compress" title="压缩叙述（高光原话与物品锚点一字不改）"><i class="fa-solid fa-compress"></i> 压缩</button>`
                     : `<button class="ow-btn" data-action="sum-restore" title="还原为未压缩（原始数据一直保留）"><i class="fa-solid fa-rotate-left"></i> 还原</button>`}
                   <button class="ow-btn" data-action="sum-copy" title="复制文本"><i class="fa-regular fa-copy"></i></button>
                   <button class="ow-btn ow-danger" data-action="sum-del" title="删除"><i class="fa-solid fa-trash"></i></button>
@@ -4044,13 +3854,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         }
 
         $panel.find('#ow_sum_gen').on('click', () => startBackgroundTask('大总结', () => generateBigSummary()));
-        $panel.find('#ow_sum_rescan').on('click', function () {
-            const r = rescanSummaryIndex();
-            toast(`扫描完成：${r.total} 章，缺失 ${r.missing.length} 章`, r.missing.length ? 'warning' : 'success');
-            renderSummaryPanel($panel);
-        });
         $panel.find('#ow_sum_hide_btn').on('click', () => openHideDialog($panel));
-        $panel.find('#ow_sum_import_btn').on('click', () => openImportDialog($panel));
         $panel.find('#ow_sum_impbig_btn').on('click', () => openImportBigDialog($panel));
 
         $list.on('click', '[data-action="sum-toggle"]', function () {
@@ -4062,6 +3866,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const id = $(this).closest('.ow-widget-card').data('sid');
             if (!confirm('压缩这条总结的叙述部分？高光对话与物理锚点不会被改动，原始每章摘要也完整保留。')) return;
             startBackgroundTask('压缩总结', async () => { await compressBigSummary(id); });
+        });
+        $list.on('click', '[data-action="sum-regen"]', function () {
+            const id = $(this).closest('.ow-widget-card').data('sid');
+            const b = sm.bigSummaries.find((x) => x.id === id);
+            if (!b || !confirm(`重新生成第 ${b.fromCh}–${b.toCh} 章的大总结？当前内容会被覆盖。`)) return;
+            startBackgroundTask(`重新生成 ${b.fromCh}-${b.toCh}`, () => regenerateBigSummary(id));
         });
         $list.on('click', '[data-action="sum-restore"]', function () {
             const id = $(this).closest('.ow-widget-card').data('sid');
@@ -4145,60 +3955,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
     }
 
-    // ---------------- 导入历史总结子弹窗 ----------------
-    function openImportDialog($sumPanel) {
-        const $ov = $(`
-        <div class="ow-sub-overlay">
-          <div class="ow-sub-modal" style="height:auto;max-height:88vh;width:min(680px,93vw);">
-            <div class="ow-modal-header">
-              <div class="ow-modal-title">导入历史总结</div>
-              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
-            </div>
-            <div class="ow-sub-body">
-              <div class="ow-hint">把你以前存在世界书里的摘要整段粘进来即可。<br>
-              带 <code>\`[Chapter_X]\`</code> 标签的会**按标签自动分章**，章号以标签为准；没有标签的按空行分段，从下面指定的起始章号依次编号。</div>
-              <textarea class="ow-textarea" id="ow_imp_text" style="min-height:240px;" placeholder="\`[Chapter_1]\`2024.10.24 20:00-21:00 玄关 两人重逢，气氛紧绷。&#10;&#10;\`[Chapter_2]\`2024.10.24 21:00-21:40 车厢 两人前往医院，一路无话。"></textarea>
-              <div class="ow-row" style="margin-top:8px;">
-                <label>无标签时起始章号 <input type="number" class="ow-input ow-num" id="ow_imp_start" min="1" value="1"></label>
-                <label><input type="checkbox" id="ow_imp_overwrite" checked> 覆盖同章号的已有摘要</label>
-              </div>
-              <div class="ow-row">
-                <button class="ow-btn" id="ow_imp_preview">预览解析结果</button>
-                <span class="ow-spacer"></span>
-                <button class="ow-btn ow-primary" id="ow_imp_do">确认导入</button>
-              </div>
-              <div id="ow_imp_result"></div>
-            </div>
-          </div>
-        </div>`).appendTo(document.documentElement);
-
-        const close = () => { $ov.remove(); renderSummaryPanel($sumPanel); };
-        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
-        $ov.find('.ow-sub-close').on('click', close);
-
-        const getOpts = () => ({
-            startChapter: Math.max(1, Number($ov.find('#ow_imp_start').val()) || 1),
-            overwrite: $ov.find('#ow_imp_overwrite').is(':checked'),
-        });
-
-        $ov.find('#ow_imp_preview').on('click', function () {
-            const parsed = parseImportedSummaries($ov.find('#ow_imp_text').val(), getOpts().startChapter);
-            const $r = $ov.find('#ow_imp_result');
-            if (!parsed.length) { $r.html('<div class="ow-empty">没解析出任何条目，检查一下粘贴内容。</div>'); return; }
-            $r.html(`<div class="ow-section-title">解析出 ${parsed.length} 条（第 ${parsed[0].chapter}–${parsed[parsed.length - 1].chapter} 章）</div>
-              <pre class="ow-preview-box">${escapeHtml(parsed.map((x) => `[第${x.chapter}章] ${x.text.slice(0, 120)}${x.text.length > 120 ? '…' : ''}`).join('\n'))}</pre>`);
-        });
-
-        $ov.find('#ow_imp_do').on('click', function () {
-            const raw = $ov.find('#ow_imp_text').val();
-            if (!String(raw || '').trim()) { toast('请先粘贴内容', 'warning'); return; }
-            const r = importSummaries(raw, getOpts());
-            if (!r.total) { toast('没解析出任何条目', 'warning'); return; }
-            toast(`已导入 ${r.added} 条${r.skipped ? `，跳过 ${r.skipped} 条` : ''}`, 'success');
-            close();
-        });
-    }
-
     // ---------------- 隐藏楼层子弹窗 ----------------
     function openHideDialog($sumPanel) {
         const cd = chatData();
@@ -4212,11 +3968,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-sub-body">
-              <div class="ow-hint">手动指定区间，不会自动隐藏任何东西。隐藏只是把消息标记为不参与上下文，随时可以恢复。<br>
-              当前共 ${total} 层${suggest > 1 ? `，建议可隐藏至第 ${suggest} 层（保留最近 20 层）` : ''}。</div>
+              <div class="ow-hint">手动指定区间，不会自动隐藏任何东西。走的是酒馆自带的 <code>/hide</code> / <code>/unhide</code>，
+              与你用斜杠命令或 QR 的效果完全一致，随时可恢复。<br>
+              楼层号即酒馆的消息 ID（<b>从 0 开始</b>，与 <code>/hide 0-33</code> 的写法一致）。当前共 ${total} 条消息，最大 ID 为 ${Math.max(0, total - 1)}。${suggest > 1 ? `建议可隐藏到 ${suggest - 1}（保留最近 20 条）。` : ''}</div>
               <div class="ow-row">
-                <label>从第 <input type="number" class="ow-input ow-num" id="ow_hide_from" min="1" value="1"> 层</label>
-                <label>到第 <input type="number" class="ow-input ow-num" id="ow_hide_to" min="1" value="${suggest > 1 ? suggest : 1}"> 层</label>
+                <label>从 <input type="number" class="ow-input ow-num" id="ow_hide_from" min="0" value="0"></label>
+                <label>到 <input type="number" class="ow-input ow-num" id="ow_hide_to" min="0" value="${suggest > 1 ? suggest - 1 : 0}"></label>
               </div>
               <div class="ow-row">
                 <button class="ow-btn ow-primary" id="ow_hide_do"><i class="fa-solid fa-eye-slash"></i> 隐藏该区间</button>
@@ -4237,7 +3994,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (!cd.summary.hidden.length) { $l.html('<div class="ow-muted">暂无</div>'); return; }
             $l.html(cd.summary.hidden.map((h, i) => `
               <div class="ow-row" data-idx="${i}">
-                <span>第 ${h.from}–${h.to} 层 <span class="ow-muted">${new Date(h.at).toLocaleString()}</span></span>
+                <span>${h.from}–${h.to} <span class="ow-muted">${new Date(h.at).toLocaleString()}</span></span>
                 <span class="ow-spacer"></span>
                 <button class="ow-btn" data-action="unhide-one">恢复</button>
               </div>`).join(''));
@@ -4245,21 +4002,61 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         renderHidden();
 
         const applyHide = async (hide) => {
-            const from = Math.max(1, Number($ov.find('#ow_hide_from').val()) || 1);
-            const to = Math.min(total, Number($ov.find('#ow_hide_to').val()) || 1);
-            if (to < from) { toast('结束楼层不能小于起始楼层', 'warning'); return; }
+            const from = Math.max(0, Number($ov.find('#ow_hide_from').val()) || 0);
+            const to = Number($ov.find('#ow_hide_to').val());
+            if (!(to >= from)) { toast('结束楼层不能小于起始楼层', 'warning'); return; }
             const c = ctx();
-            let n = 0;
-            for (let i = from - 1; i <= to - 1; i++) {
-                if (c.chat[i]) { c.chat[i].is_system = hide; n++; }
+
+            // 【关键】先把扩展自己的数据落盘。
+            // 隐藏会触发酒馆保存/重绘聊天，而我们的 saveChatData 是防抖的，
+            // 没落盘的大总结、表格、推演进度会在那一刻丢失（之前就是这么丢的）。
+            try {
+                if (typeof c.saveMetadata === 'function') await c.saveMetadata();
+                log('debug', 'system', '隐藏操作前已强制保存扩展数据');
+            } catch (err) {
+                log('warn', 'system', `保存扩展数据失败，已中止隐藏操作以免丢数据：${err.message || err}`);
+                toast('保存扩展数据失败，已取消本次操作', 'error');
+                return;
             }
-            // 让酒馆重绘消息列表
-            try { await c.reloadCurrentChat?.(); } catch (e) { /* 部分版本没有此方法 */ }
+
+            const cmd = `/${hide ? 'hide' : 'unhide'} ${from}-${to}`;
+            let ok = false;
+            // 优先走酒馆自己的 /hide /unhide —— 与 QR 完全同一条路径，行为一致
+            try {
+                if (typeof c.executeSlashCommandsWithOptions === 'function') {
+                    await c.executeSlashCommandsWithOptions(cmd, { handleParserErrors: true });
+                    ok = true;
+                } else if (typeof c.executeSlashCommands === 'function') {
+                    await c.executeSlashCommands(cmd);
+                    ok = true;
+                }
+            } catch (err) {
+                log('warn', 'system', `调用 ${cmd} 失败，改用兜底实现：${err.message || err}`);
+            }
+
+            // 兜底：复刻酒馆 hideChatMessageRange 的做法
+            // （改 is_system + 同步 DOM 的 is_system 属性 + 正常保存；绝不 reload）
+            if (!ok) {
+                let n = 0;
+                for (let id = from; id <= to; id++) {
+                    const msg = c.chat?.[id];
+                    if (!msg) continue;
+                    msg.is_system = hide;
+                    const $block = $(`.mes[mesid="${id}"]`);
+                    if ($block.length) $block.attr('is_system', String(hide));
+                    n++;
+                }
+                try { await c.saveChat?.(); } catch (err) { log('warn', 'system', `保存聊天失败：${err.message || err}`); }
+                log('info', 'system', `兜底实现处理了 ${n} 条消息`);
+            }
+
             if (hide) cd.summary.hidden.push({ from, to, at: Date.now() });
             else cd.summary.hidden = cd.summary.hidden.filter((h) => !(h.from === from && h.to === to));
             saveChatData();
-            log('info', 'system', `${hide ? '隐藏' : '恢复'}了第 ${from}–${to} 层，共 ${n} 条消息`);
-            toast(`${hide ? '已隐藏' : '已恢复'} ${n} 条消息${hide ? '（可随时恢复）' : ''}`, 'success');
+            try { if (typeof c.saveMetadata === 'function') await c.saveMetadata(); } catch (e) { /* 已尽力 */ }
+
+            log('info', 'system', `${hide ? '隐藏' : '恢复'}了消息 ${from}-${to}（${ok ? `经由酒馆 ${cmd}` : '兜底实现'}）`);
+            toast(`${hide ? '已隐藏' : '已恢复'} ${from}-${to}${hide ? '（可随时恢复）' : ''}`, 'success');
             renderHidden();
         };
         $ov.find('#ow_hide_do').on('click', () => applyHide(true));
@@ -4738,8 +4535,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           <div class="ow-group-title"><i class="fa-solid fa-scroll"></i> 本聊天设定</div>
           <div class="ow-row">
             <label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label>
-            ${posRow('ow_lore', s.lore.injectPosition, s.lore.injectDepth, s.lore.injectOrder)}
           </div>
+          <div class="ow-muted" style="font-size:11.5px;">注入位置在「设定」标签页里逐条设置。</div>
           <div class="ow-row">
             <label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label>
           </div>
@@ -4755,12 +4552,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         <div class="ow-group">
           <div class="ow-group-title"><i class="fa-solid fa-layer-group"></i> 总结</div>
           <div class="ow-row"><label><input type="checkbox" id="ow_sum_enabled" ${s.summary.enabled ? 'checked' : ''}> 启用总结功能</label></div>
-
-          <div class="ow-field-label">摘要缺失时</div>
-          <div class="ow-row">
-            <label><input type="radio" name="ow_sum_missing" value="generate" ${s.summary.onMissing === 'generate' ? 'checked' : ''}> 让模型补写并标 ⚠️</label>
-            <label><input type="radio" name="ow_sum_missing" value="skip" ${s.summary.onMissing === 'skip' ? 'checked' : ''}> 跳过并列出章号</label>
-          </div>
 
           <div class="ow-field-label">压缩</div>
           <div class="ow-row">
@@ -4840,14 +4631,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         renderInjectionOverview($panel);
         $panel.find('#ow_inject_refresh').on('click', () => renderInjectionOverview($panel));
         $panel.find('#ow_lore_inject').on('change', function () { s.lore.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); renderInjectionOverview($panel); });
-        $panel.find('#ow_lore_pos').on('change', function () { s.lore.injectPosition = $(this).val(); saveSettings(); updateInjections(); });
-        $panel.find('#ow_lore_depth').on('change', function () { s.lore.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
-        $panel.find('#ow_lore_order').on('change', function () { s.lore.injectOrder = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
         $panel.find('#ow_lore_scan').on('change', function () { s.lore.scanDepth = Math.max(1, Number($(this).val()) || 10); saveSettings(); updateInjections(); });
         bindModuleApiRows($panel);
 
         $panel.find('#ow_sum_enabled').on('change', function () { s.summary.enabled = $(this).is(':checked'); saveSettings(); });
-        $panel.find('input[name="ow_sum_missing"]').on('change', function () { s.summary.onMissing = $(this).val(); saveSettings(); });
         $panel.find('input[name="ow_sum_cmode"]').on('change', function () { s.summary.compressMode = $(this).val(); saveSettings(); renderSettingsPanel($panel); });
         $panel.find('#ow_sum_lag').on('change', function () { s.summary.compressLag = Math.max(1, Number($(this).val()) || 5); saveSettings(); });
         $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
