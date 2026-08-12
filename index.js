@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.9.0';
+    const EXT_VERSION = '2.9.1';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -273,6 +273,7 @@
         // 总结
         summary: {
             enabled: false,
+            countMode: 'floor',   // 'floor'=按楼层（消息ID） | 'chapter'=按正文里的 [Chapter_X] 标签
             // 识别正文里"现成摘要"的规则（可自行增删/改写正则）
             detectPatterns: [
                 { id: 'abstract', name: '<abstract_format>…</abstract_format>', pattern: '<abstract_format>([\\s\\S]*?)</abstract_format>', enabled: true },
@@ -727,24 +728,71 @@
 
     // 总结模块：模型按模板直接产出完整档案文本，扩展原样保存，可重新生成 / 压缩 / 还原。
 
-    /** 章 = 一次 AI 回复。返回 [{chapter, msgId, mes}]（chapter 从 1 递增） */
-    function listChapters() {
-        const chat = ctx().chat || [];
-        const out = [];
-        let n = 0;
-        chat.forEach((m, i) => {
-            if (m.is_user || m.is_system) return;
-            n += 1;
-            out.push({ chapter: n, msgId: i, mes: String(m.mes || '') });
-        });
-        return out;
+    /**
+     * 计数单元。两种模式：
+     *  floor   —— 按楼层（消息 ID，与 /hide 一致）。包含被隐藏的消息，
+     *             否则隐藏已总结的旧楼层后，总数会缩水到比"已总结"还小，就再也总结不了了。
+     *  chapter —— 按正文里的 `[Chapter_X]` 标签，取每条消息中最后出现的那个编号。
+     */
+    function parseChapterTag(text) {
+        const re = /`?\[\s*Chapter[_\s]*(\d+)\s*\]`?/gi;
+        let m, last = null;
+        while ((m = re.exec(String(text || '')))) last = Number(m[1]);
+        return last;
     }
 
+    function countMode() {
+        return settings().summary.countMode === 'chapter' ? 'chapter' : 'floor';
+    }
+    function unitName() {
+        return countMode() === 'chapter' ? '章' : '楼';
+    }
+
+    /** 返回 [{chapter, msgId, mes}]；chapter 在 floor 模式下即消息 ID */
+    function listChapters() {
+        const chat = ctx().chat || [];
+        const mode = countMode();
+        const out = [];
+        chat.forEach((m, i) => {
+            const mes = String(m.mes || '');
+            if (mode === 'floor') {
+                // 不过滤 is_system：隐藏的楼层依然占楼层号
+                out.push({ chapter: i, msgId: i, mes });
+            } else {
+                if (m.is_user) return;
+                const tag = parseChapterTag(mes);
+                if (tag != null) out.push({ chapter: tag, msgId: i, mes });
+            }
+        });
+        return out.sort((a, b) => a.chapter - b.chapter);
+    }
+
+    /** 当前最大计数单元号 */
+    function maxChapter() {
+        const list = listChapters();
+        return list.length ? list[list.length - 1].chapter : 0;
+    }
+
+    /** 已被大总结覆盖到的最大章号 */    /** 已被大总结覆盖到的最大章号 */
     /** 已被大总结覆盖到的最大章号 */
-    /** 已被大总结覆盖到的最大章号 */
+    /**
+     * 已总结到的最大编号。返回 null 表示"还没总结过任何内容"。
+     * 不能用 0 代表"没总结过"——楼层模式是 0 起算的，那样会漏掉第 0 楼。
+     */
     function lastSummarizedChapter() {
-        const cd = chatData();
-        return cd.summary.bigSummaries.reduce((mx, b) => Math.max(mx, Number(b.toCh) || 0), 0);
+        const list = chatData().summary.bigSummaries;
+        if (!list.length) return null;
+        return list.reduce((mx, b) => Math.max(mx, Number(b.toCh) || 0), 0);
+    }
+
+    /** 下一次总结应当从哪个编号开始 */
+    function nextSummaryStart() {
+        const last = lastSummarizedChapter();
+        if (last !== null) return last + 1;
+        // 没总结过：楼层模式从 0 起，章节模式从最小的章号起
+        if (countMode() === 'floor') return 0;
+        const list = listChapters();
+        return list.length ? list[0].chapter : 1;
     }
 
     const DEFAULT_SUMMARY_SYSTEM_PROMPT = `你是一个剧情档案编排器。你的任务是把已有的各章摘要**原样搬运**并按场景重新编排，不是重新撰写。
@@ -858,10 +906,11 @@
             .map((r) => `${r.tag} ${r.name}`).filter((x) => x.trim());
         if (scenes.length) parts.push(`【已有场景标签（同一地点必须复用）】\n${scenes.join('\n')}`);
         if (items.length) parts.push(`【已有物品标签（同一物品必须复用）】\n${items.join('\n')}`);
-        parts.push(`【本次整理范围】第 ${fromCh} 章 至 第 ${toCh} 章`);
+        const u = unitName();
+        parts.push(`【本次整理范围】第 ${fromCh} ${u} 至 第 ${toCh} ${u}`);
 
         const chapters = listChapters().filter((c) => c.chapter >= fromCh && c.chapter <= toCh);
-        const raw = chapters.map((c) => `===== 第${c.chapter}章 =====\n${c.mes.slice(0, 8000)}`).join('\n\n');
+        const raw = chapters.map((c) => `===== 第${c.chapter}${u} =====\n${c.mes.slice(0, 8000)}`).join('\n\n');
         parts.push(`【各章原文（含每章末尾已生成的现成摘要，请直接搬运那些摘要，不要重写）】\n${raw}`);
         return parts.join('\n\n');
     }
@@ -869,11 +918,12 @@
     async function generateBigSummary() {
         const s = settings();
         const cd = chatData();
-        const from = lastSummarizedChapter() + 1;
-        const to = listChapters().length;
-        if (to < from) throw new Error(`没有新章节可总结（已总结到第 ${from - 1} 章，当前共 ${to} 章）`);
+        const u = unitName();
+        const from = nextSummaryStart();
+        const to = maxChapter();
+        if (to < from) throw new Error(`没有新内容可总结（已总结到第 ${from - 1} ${u}，当前最大为第 ${to} ${u}）`);
 
-        log('info', 'system', `开始整理大总结：第 ${from}–${to} 章`);
+        log('info', 'system', `开始整理大总结：第 ${from}–${to} ${u}（计数方式：${countMode() === 'chapter' ? '按章节标签' : '按楼层'}）`);
         const raw = await callModel(s.prompts.summarySystemPrompt, buildSummaryUserPromptV2(from, to), `大总结 ${from}-${to}`, 'summary');
         const text = stripCodeFence(raw).trim();
         if (!text) throw new Error('模型返回为空，本次未写入。');
@@ -892,7 +942,7 @@
         cd.summary.bigSummaries.sort((a, b) => a.fromCh - b.fromCh);
         saveChatData();
         updateInjections();
-        log('info', 'system', `大总结完成：第 ${from}–${to} 章，${text.length} 字`);
+        log('info', 'system', `大总结完成：第 ${from}–${to} ${u}，${text.length} 字`);
         await flushChatData();
         if (s.summary.compressMode === 'auto') maybeAutoCompress();
         return big;
@@ -1008,7 +1058,7 @@
         const cd = chatData();
         const text = String(rawText || '').trim();
         if (!text) throw new Error('内容为空');
-        const from = Math.max(1, Number(fromCh) || 1);
+        const from = Math.max(0, Number(fromCh) || 0);
         const to = Math.max(from, Number(toCh) || from);
         const big = {
             id: `sum_${Date.now().toString(36)}`,
@@ -1122,27 +1172,35 @@
 - 允许事件之间回环跳转（如事件05的某分支回到事件02），但必须保证**从任何一个事件出发，
   沿着任意分支走下去，都能在有限步内抵达 OPEN 或 END**，不能存在只在几个事件间无限打转的闭环。
 
-【分支条件的写法（极其重要，写错会导致剧情永远卡住）】
-- 这是 AI 角色扮演，不是让用户点选项。**绝对不要把分支条件写成某个具体动作**
-  （如"若用户当众下跪道歉""若用户砸碎了那只杯子"）——用户很可能永远不会做那个特定动作，
-  剧情就会永远卡在这个事件里出不去。
-- 分支条件必须落在**用户的情绪与情感倾向**上，判定依据是用户言行中透出的态度，而不是某个指定行为。
-- 一个事件的两条分支必须是**情感方向相反**的一组，并且要**穷尽式覆盖**：
-  任何一种用户反应都应该能被归入其中一边，不留中间地带。
+【分支的写法（极其重要，写错会导致剧情卡死或跑偏）】
+- 分支是**这个事件的结局走向**，不是用户的某个具体动作，也不是情绪描写。
 - 正确示范：
-  · 分支A：若用户表现出**靠近与接纳**的情感倾向——软化、心疼、妥协、想要挽留、愿意共担（无论以何种方式表达）
-  · 分支B：若用户表现出**疏离与抗拒**的情感倾向——冷淡、防备、愤怒、划清界限、选择自保（无论以何种方式表达）
-- 错误示范（禁止这样写）：
-  · ✗ "若用户答应了求婚" ✗ "若用户在三天内回到老宅" ✗ "若用户交出那份文件"
-- 每条分支都要写清是"哪一类情感倾向"，并加上"无论以何种方式表达"之类的兜底措辞，
-  让判定看的是情感基调而非具体动作。
+    [事件01] {{user}} 撞见 {{char}} 在酒吧喝多了
+      结果A：{{user}} 把 {{char}} 带回了家 → 指向 [事件02]
+      结果B：{{user}} 没有带 {{char}} 回家 → 指向 [事件03]
+    [事件02] 带回家之后
+      结果A：两人爆发争吵 → …
+      结果B：两人陷入冷战 → …
+    [事件03] 没带回家之后（写 {{char}} 因此遭遇了什么，以及 {{user}} 要不要理会）
+      结果A：{{user}} 主动过问 → …
+      结果B：{{user}} 置之不理 → …
+- **分支数量不限于 2 条**：有几种合理走向就写几条（2-4 条为宜），并且必须**穷尽覆盖**——
+  任何一种可能的发展都应落进某一条，不留缝隙。若确有"什么都没做"这类走向，也要单列一条。
+- **只写故事结果，不写描述**：禁止写穿着、表情、语气、情绪形容、心理活动、环境氛围。
+  那些是正文该写的，推演只规定"故事往哪走"。
+  ✗ 错误：结果A：{{user}} 红着眼眶心软了，颤抖着扶起对方
+  ✓ 正确：结果A：{{user}} 把对方扶回家
+- **导火索与事件过程可以慢慢铺垫**，用多少轮都行；但**分支只在最终结果确定的那一轮才算触发**。
+  在结果尚未落定前，剧情锁死在当前事件内继续推进，不要提前跳转。
+- 每条分支都必须写明指向哪个事件编号（或 OPEN / END）。
 
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
 {"events":[{"id":"01","title":"事件代号","core":"戏剧核心：本事件旨在催生/改变的情感张力",
 "trigger":"导火索(起)：如何在正文中自然触发","branches":[
-{"key":"A","condition":"若用户表现出XX类情感倾向（无论以何种方式表达）","next":"02"},
-{"key":"B","condition":"若用户表现出与之相反的XX类情感倾向（无论以何种方式表达）","next":"03"}]}]}
+{"key":"A","condition":"该事件的一种结局走向（只写故事结果，不写描述）","next":"02"},
+{"key":"B","condition":"另一种结局走向","next":"03"}]}]}
+每个事件的 branches 可以有 2-4 条，覆盖所有合理走向。
 id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。
 next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开放结局）、或 "END"（仅在指定 HE/BE 时可用）。`;
 
@@ -1156,8 +1214,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 运行法则：
 - 本事件是一个宏观篇章，需要经历多轮互动才能收束。在用户的行为真正满足下面某条终局分支条件之前，
   请持续在本事件内部深化细节、对话与拉扯，不要急于推进，按当前对话的自然速率行进。
-- 分支判定看的是**用户言行透出的情感倾向**（靠近/疏离、软化/强硬等），不是某个具体动作；
-  只要情感基调明确落向某一边，即可判定该分支成立，不要死等某个特定行为发生。
+- 分支判定看的是**这个事件最终走向了哪个结果**。结果尚未落定前，继续在当前事件内推进，不要提前跳转；
+  一旦某条分支描述的结果在正文中确实达成，即判定该分支成立。
 - 每次回复前在后台比对用户输入：若判定其情感倾向真正满足了某条终局分支条件，则在本次正文的末尾
   以自然叙事手法无痕引入下一事件的导火索，并在正文最末尾追加一行隐藏标记：
   {{marker_example}}
@@ -1693,6 +1751,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             throw err;
         }
         updateInjections();
+    }
+
+    // 组件预览的折叠状态：记在 localStorage，下次打开保持上次的样子
+    const PREVIEW_FOLD_KEY = 'ego_preview_collapsed';
+    function loadFoldState() {
+        try { return new Set(JSON.parse(localStorage.getItem(PREVIEW_FOLD_KEY) || '[]')); }
+        catch (e) { return new Set(); }
+    }
+    function saveFoldState(set) {
+        try { localStorage.setItem(PREVIEW_FOLD_KEY, JSON.stringify([...set])); } catch (e) { /* 忽略 */ }
     }
 
     // 后台任务：与弹窗生命周期解耦，关掉界面也会跑完，开始/结束各提示一次。
@@ -2549,6 +2617,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $results.empty();
 
         bindPreviewAutoResize();
+        const folded = loadFoldState();
         const withResults = s.widgets.filter((w) => cd.widgetResults[w.id]);
         if (!withResults.length) {
             $results.append('<div class="ow-empty">还没有生成结果。点「生成全部组件」，或在右上角「组件列表」里新建/单独生成。</div>');
@@ -2557,10 +2626,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         for (const w of withResults) {
             const result = cd.widgetResults[w.id];
             $results.append(`
-              <div class="ow-result-frame-wrap" data-id="${w.id}">
+              <div class="ow-result-frame-wrap${folded.has(w.id) ? ' ow-preview-collapsed' : ''}" data-id="${w.id}">
                 <div class="ow-result-head">
                   <span class="ow-result-title">
-                    <span class="ow-caret ow-result-caret" data-action="toggle-preview" title="收起/展开"><i class="fa-solid fa-chevron-down"></i></span>
+                    <span class="ow-caret ow-result-caret" data-action="toggle-preview" title="收起/展开"><i class="fa-solid fa-chevron-${folded.has(w.id) ? 'right' : 'down'}"></i></span>
                     <b>${escapeHtml(w.name)}</b>
                     <span class="ow-muted">${result.error ? '⚠️ 失败' : new Date(result.updatedAt).toLocaleString()}${result.floorRange?.count ? ` · 读至${escapeHtml(formatFloorRange(result.floorRange))}` : ''}</span>
                   </span>
@@ -2569,6 +2638,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       <i class="${isFavorited(w.id) ? 'fa-solid' : 'fa-regular'} fa-star"></i>
                     </button>
                     <button class="ow-btn" data-action="fullscreen" data-id="${w.id}" title="全屏"><i class="fa-solid fa-expand"></i></button>
+                    <button class="ow-btn ow-danger" data-action="del-result" data-id="${w.id}" title="删除这条结果（组件定义保留）"><i class="fa-solid fa-trash"></i></button>
                     <button class="ow-btn" data-action="view-raw" data-id="${w.id}">源码</button>
                     <button class="ow-btn ow-gen-btn" data-action="regen-one" data-id="${w.id}">重新生成</button>
                   </span>
@@ -2582,6 +2652,19 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             $wrap.toggleClass('ow-preview-collapsed');
             const collapsed = $wrap.hasClass('ow-preview-collapsed');
             $(this).find('i').attr('class', collapsed ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
+            const set = loadFoldState();
+            if (collapsed) set.add($wrap.data('id')); else set.delete($wrap.data('id'));
+            saveFoldState(set);
+        });
+
+        $results.off('click', '[data-action="del-result"]').on('click', '[data-action="del-result"]', function () {
+            const id = $(this).data('id');
+            const w = settings().widgets.find((x) => x.id === id);
+            if (!confirm(`删除「${w?.name || '该组件'}」的这条生成结果？组件定义会保留，可随时重新生成。`)) return;
+            delete chatData().widgetResults[id];
+            saveChatData();
+            updateInjections();
+            renderWidgetResults($panel);
         });
 
         $results.off('click', '[data-action="view-raw"]').on('click', '[data-action="view-raw"]', function () {
@@ -3646,15 +3729,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const s = settings();
         const cd = chatData();
         const sm = cd.summary;
-        const chapters = listChapters();
-        const done = lastSummarizedChapter();
-        const to0 = chapters.length;
+        const doneRaw = lastSummarizedChapter();
+        const done = doneRaw === null ? '—' : doneRaw;
+        const to0 = maxChapter();
+        const u = unitName();
 
         $panel.html(`
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
             <button class="ow-btn ow-primary ow-gen-btn" id="ow_sum_gen"><i class="fa-solid fa-layer-group"></i> 大总结</button>
-            <span class="ow-muted">共 ${chapters.length} 章 · 已总结至第 ${done} 章${to0 > done ? ` · 待整理 ${to0 - done} 章` : ''}</span>
+            <span class="ow-muted">当前最大第 ${to0} ${u} · 已总结至第 ${done} ${u}${doneRaw === null || to0 > doneRaw ? ` · 待整理 ${to0 - (doneRaw === null ? nextSummaryStart() - 1 : doneRaw)} ${u}` : ''}</span>
           </div>
           <span>
             <button class="ow-btn" id="ow_sum_impbig_btn"><i class="fa-solid fa-file-lines"></i> 导入大总结</button>
@@ -3672,7 +3756,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-widget-card ow-collapsed" data-sid="${escapeHtml(b.id)}">
                 <div class="ow-widget-card-head">
                   <span class="ow-caret" data-action="sum-toggle"><i class="fa-solid fa-chevron-right"></i></span>
-                  <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} 章</span>
+                  <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} ${u}</span>
                   <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : '模型生成'} · ${b.level >= 2 ? '已压缩' : '原始'} · ${(b.rawText || '').length} 字</span>
                   <span class="ow-spacer"></span>
                   ${b.imported ? '' : `<button class="ow-btn ow-gen-btn" data-action="sum-regen" title="重新生成这一段（章号范围不变，覆盖原内容）"><i class="fa-solid fa-arrows-rotate"></i> 重新生成</button>`}
@@ -3706,7 +3790,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $list.on('click', '[data-action="sum-regen"]', function () {
             const id = $(this).closest('.ow-widget-card').data('sid');
             const b = sm.bigSummaries.find((x) => x.id === id);
-            if (!b || !confirm(`重新生成第 ${b.fromCh}–${b.toCh} 章的大总结？当前内容会被覆盖。`)) return;
+            if (!b || !confirm(`重新生成第 ${b.fromCh}–${b.toCh} ${u} 的大总结？当前内容会被覆盖。`)) return;
             startBackgroundTask(`重新生成 ${b.fromCh}-${b.toCh}`, () => regenerateBigSummary(id));
         });
         $list.on('click', '[data-action="sum-restore"]', function () {
@@ -3725,7 +3809,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $list.on('click', '[data-action="sum-del"]', function () {
             const id = $(this).closest('.ow-widget-card').data('sid');
             const b = sm.bigSummaries.find((x) => x.id === id);
-            if (!b || !confirm(`删除第 ${b.fromCh}–${b.toCh} 章的总结？（每章原始摘要索引不受影响）`)) return;
+            if (!b || !confirm(`删除第 ${b.fromCh}–${b.toCh} ${u} 的总结？`)) return;
             sm.bigSummaries = sm.bigSummaries.filter((x) => x.id !== id);
             saveChatData(); updateInjections(); renderSummaryPanel($panel);
         });
@@ -3734,7 +3818,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
     // ---------------- 导入大总结子弹窗 ----------------
     function openImportBigDialog($sumPanel) {
-        const done = lastSummarizedChapter();
+        const done = lastSummarizedChapter() ?? 0;
         const $ov = $(`
         <div class="ow-sub-overlay">
           <div class="ow-sub-modal" style="height:auto;max-height:88vh;width:min(700px,93vw);">
@@ -3743,13 +3827,13 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-sub-body">
-              <div class="ow-hint">把你已经写好的整份大总结粘进来，指定它覆盖第几章到第几章即可。<br>
+              <div class="ow-hint">把你已经写好的整份大总结粘进来，指定它覆盖的范围即可（单位同当前计数方式）。<br>
               导入的内容会**原样保存**，注入正文时按原文发送。压缩时会额外交代模型只压缩叙述、
               高光原话与物理锚点逐字保留，并且原文一直留着，随时可以还原。</div>
               <div class="ow-row">
-                <label>覆盖 第 <input type="number" class="ow-input ow-num" id="ow_ib_from" min="1" value="${done + 1}"> 章</label>
-                <label>到 第 <input type="number" class="ow-input ow-num" id="ow_ib_to" min="1" value="${done + 1}"> 章</label>
-                <span class="ow-muted">当前已总结至第 ${done} 章</span>
+                <label>覆盖 第 <input type="number" class="ow-input ow-num" id="ow_ib_from" min="0" value="${done + 1}"></label>
+                <label>到 第 <input type="number" class="ow-input ow-num" id="ow_ib_to" min="0" value="${done + 1}"></label>
+                <span class="ow-muted">当前已总结至第 ${done}</span>
               </div>
               <div class="ow-field-label">大总结全文</div>
               <textarea class="ow-textarea" id="ow_ib_text" style="min-height:280px;" placeholder="&lt;大总结(第1-20章)&gt;
@@ -4199,7 +4283,13 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $box.off('input', '.ow-api-url').on('input', '.ow-api-url', function () { const p = find(this); if (p) { p.url = $(this).val().trim(); saveSettings(); } });
         $box.off('input', '.ow-api-key').on('input', '.ow-api-key', function () { const p = find(this); if (p) { p.key = $(this).val(); saveSettings(); } });
-        $box.off('change', '.ow-api-model').on('change', '.ow-api-model', function () { const p = find(this); if (p) { p.model = $(this).val(); saveSettings(); } });
+        $box.off('change', '.ow-api-model').on('change', '.ow-api-model', function () {
+            const p = find(this); if (!p) return;
+            p.model = $(this).val();
+            saveSettings();
+            // 立即刷新卡片右侧的模型显示（以前要退出重进才更新）
+            $(this).closest('.ow-widget-card').find('.ow-widget-meta').text(p.model || '未选模型');
+        });
         $box.off('click', '[data-action="api-del"]').on('click', '[data-action="api-del"]', function () {
             const p = find(this);
             if (!p || !confirm(`删除预设「${p.name}」？正在使用它的模块会回退为跟随酒馆。`)) return;
@@ -4213,7 +4303,14 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const p = find(this);
             if (!p?.url) { toast('请先填写 URL', 'warning'); return; }
             const $b = $(this); $b.prop('disabled', true).text('拉取中…');
-            try { const l = await fetchCustomModelList(p); toast(`拉取到 ${l.length} 个模型`, 'success'); renderApiPresets($panel); }
+            try {
+                const l = await fetchCustomModelList(p);
+                toast(`拉取到 ${l.length} 个模型`, 'success');
+                renderApiPresets($panel);
+                // 重绘后把这张卡展开回来，免得用户还要再点一次
+                const $card = $panel.find(`.ow-widget-card[data-pid="${p.id}"]`);
+                $card.removeClass('ow-collapsed').find('.ow-caret i').attr('class', 'fa-solid fa-chevron-down');
+            }
             catch (err) { toast(`拉取失败：${err.message || err}`, 'error'); }
             finally { $b.prop('disabled', false).text('拉取模型'); }
         });
@@ -4350,6 +4447,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
           group('summary', 'fa-layer-group', '总结', `
             <div class="ow-row"><label><input type="checkbox" id="ow_sum_enabled" ${s.summary.enabled ? 'checked' : ''}> 启用总结功能</label></div>
+            <div class="ow-field-label">计数方式</div>
+            <div class="ow-row">
+              <label><input type="radio" name="ow_sum_count" value="floor" ${s.summary.countMode !== 'chapter' ? 'checked' : ''}> 按楼层</label>
+              <label><input type="radio" name="ow_sum_count" value="chapter" ${s.summary.countMode === 'chapter' ? 'checked' : ''}> 按章节标签</label>
+            </div>
+            <div class="ow-muted" style="font-size:11.5px;">按楼层＝用酒馆消息 ID 计数（含已隐藏楼层，隐藏旧楼层不会影响进度）。按章节＝识别正文里的 [Chapter_X] 标签。</div>
             <div class="ow-field-label">压缩</div>
             <div class="ow-row">
               <label><input type="radio" name="ow_sum_cmode" value="manual" ${s.summary.compressMode === 'manual' ? 'checked' : ''}> 手动</label>
@@ -4433,6 +4536,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         bindModuleApiRows($panel);
 
         $panel.find('#ow_sum_enabled').on('change', function () { s.summary.enabled = $(this).is(':checked'); saveSettings(); });
+        $panel.find('input[name="ow_sum_count"]').on('change', function () {
+            s.summary.countMode = $(this).val();
+            saveSettings();
+            if ($modal) renderSummaryPanel($modal.find('.ow-panel[data-panel="summary"]'));
+        });
         $panel.find('input[name="ow_sum_cmode"]').on('change', function () { s.summary.compressMode = $(this).val(); saveSettings(); renderSettingsPanel($panel); });
         $panel.find('#ow_sum_lag').on('change', function () { s.summary.compressLag = Math.max(1, Number($(this).val()) || 5); saveSettings(); });
         $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
