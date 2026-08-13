@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '2.9.1';
+    const EXT_VERSION = '3.0.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -301,12 +301,11 @@
         // 世界书/聊天书发送设置：key 形如 "书名::条目uid" -> true/false（用户在本扩展内的手动覆盖）；
         // 没有覆盖记录的条目，默认发送状态跟随该条目在酒馆世界书编辑器里的"启用/禁用"开关。
         worldInfoOverrides: {},
+        // 反控制：把本扩展里的条目开关写回酒馆世界书本身
+        wiReverseControl: { enabled: false, autoApply: true },
         // 自动触发的细分开关：除了"检测到正文闭合标签"，还支持按楼层数（消息条数）独立触发
         // 组件生成与表格生成，两者的间隔互不影响。
         autoTriggers: {
-            // 楼层自动触发时，回避最新的这几层不读——酒馆可以重 roll，
-            // 刚出的那条很可能被重写，读进去就白读了，留一轮余地。
-            floorBackoff: 2,
             onContentTag: true,
             widgetsByFloor: { enabled: false, interval: 5 },
             offscreenByFloor: { enabled: false, interval: 10 },
@@ -400,6 +399,7 @@
                 delete off[legacyKey];
             }
         }
+        if (!c.chatMetadata[MODULE_NAME].wiState) c.chatMetadata[MODULE_NAME].wiState = {};
         // 本聊天专属设定
         if (!c.chatMetadata[MODULE_NAME].lore) {
             c.chatMetadata[MODULE_NAME].lore = { entries: [] };
@@ -415,12 +415,13 @@
         if (!Array.isArray(sm.hidden)) sm.hidden = [];
         // 剧情推演状态
         if (!c.chatMetadata[MODULE_NAME].plot) {
-            c.chatMetadata[MODULE_NAME].plot = { events: [], currentId: '', deadBranches: {}, path: [], updatedAt: null };
+            c.chatMetadata[MODULE_NAME].plot = { events: [], currentId: '', deadBranches: {}, path: [], history: [], matrixId: '', startMsgId: null, updatedAt: null };
         }
         const pl = c.chatMetadata[MODULE_NAME].plot;
         if (!Array.isArray(pl.events)) pl.events = [];
         if (!pl.deadBranches) pl.deadBranches = {};
         if (!Array.isArray(pl.path)) pl.path = [];
+        if (!Array.isArray(pl.history)) pl.history = [];
         return c.chatMetadata[MODULE_NAME];
     }
 
@@ -1248,7 +1249,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         parts.push('【通用约束】所有事件必须基于正文与世界书中已经确立的人物、场所、关系推导，禁止凭空引入未出现过的重要角色或设定，禁止改变世界规则。');
         const custom = String(s.plot.customEvents || '').trim();
         if (custom) {
-            parts.push(`【用户指定的必含事件（最高优先级）】\n${custom}\n\n处理要求：以上每一条都**必须**作为独立事件出现在本次矩阵中，不得省略、不得合并、不得改写其核心诉求；\n可以为它们补充戏剧核心、导火索与分支条件，并安排合理的先后顺序与跳转关系。\n若这些事件数量不足要求的节点总数，由你补全其余事件；若已超过，则以用户指定的为准全部保留。`);
+            parts.push(`【用户指定的必含内容（最高优先级）】\n${custom}\n\n处理要求：以上每一条都**必须**在本次矩阵中得到体现，不得省略、不得改写其核心诉求。\n这些条目的形式不限——可能是完整事件、某个分支走向、一句想看到的台词、一个画面、一个想要的结果，或只是一个零碎念头。请你自行判断各条最合适的落点：\n· 能独立成篇的 → 做成一个事件节点；\n· 属于某个事件的结局走向 → 安排成该事件的一条分支；\n· 太零碎的（一句台词/一个画面/一种氛围）→ 补全成完整情节，安置进合适事件的戏剧核心或导火索里；\n· 指定了某个结果 → 让某条分支线最终导向它。\n并把它们合理串进整条故事线，与其余自动生成的事件自然衔接。若数量不足节点总数，由你补全其余事件。`);
         }
         parts.push(`【要求生成的事件节点数量】至少 ${s.plot.minEvents} 个`);
         if (extras.history) parts.push(`【最近聊天记录】\n${extras.history}`);
@@ -1360,10 +1361,28 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             toast(`推演里有 ${issues.deadloop.length} 个事件可能形成死循环，详见日志`, 'warning');
         }
         const cd = chatData();
-        cd.plot.events = events;
-        if (!cd.plot.currentId || !events.some((e) => e.id === cd.plot.currentId)) {
-            cd.plot.currentId = events[0].id;
+        // 备份上一版矩阵，可一键恢复（最多留 3 版）
+        if (cd.plot.events?.length) {
+            cd.plot.history = cd.plot.history || [];
+            cd.plot.history.push({
+                savedAt: Date.now(),
+                events: cd.plot.events,
+                currentId: cd.plot.currentId,
+                deadBranches: cd.plot.deadBranches,
+                path: cd.plot.path,
+                matrixId: cd.plot.matrixId,
+            });
+            while (cd.plot.history.length > 3) cd.plot.history.shift();
         }
+        cd.plot.events = events;
+        // 新矩阵 = 全新进度：置灰状态与已走路径必须清空，
+        // 否则旧矩阵里"事件09进行中"会原封不动地留在新矩阵上。
+        cd.plot.deadBranches = {};
+        cd.plot.path = [];
+        cd.plot.currentId = events[0].id;
+        // 新矩阵换一个 ID：正文里残留的旧矩阵标记不会再被误判为本矩阵的推进
+        cd.plot.matrixId = `m${Date.now().toString(36)}`;
+        cd.plot.startMsgId = (ctx().chat || []).length;
         cd.plot.updatedAt = Date.now();
         saveChatData();
         log('info', 'system', `剧情推演生成完成：${events.length} 个事件节点，当前节点 ${cd.plot.currentId}`);
@@ -1371,15 +1390,48 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return events;
     }
 
+    /** 恢复上一版矩阵（生成新矩阵前会自动备份） */
+    function restorePlotHistory() {
+        const cd = chatData();
+        const h = cd.plot.history;
+        if (!h?.length) return false;
+        const prev = h.pop();
+        // 把当前这版也存进去，方便来回切
+        h.push({
+            savedAt: Date.now(),
+            events: cd.plot.events,
+            currentId: cd.plot.currentId,
+            deadBranches: cd.plot.deadBranches,
+            path: cd.plot.path,
+            matrixId: cd.plot.matrixId,
+        });
+        cd.plot.events = prev.events || [];
+        cd.plot.currentId = prev.currentId || '';
+        cd.plot.deadBranches = prev.deadBranches || {};
+        cd.plot.path = prev.path || [];
+        cd.plot.matrixId = prev.matrixId || '';
+        cd.plot.updatedAt = Date.now();
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `已恢复上一版剧情矩阵（${prev.events?.length || 0} 个事件）`);
+        return true;
+    }
+
     function getPlotEvent(id) {
         return chatData().plot.events.find((e) => e.id === id);
     }
 
     // 扫描正文里的隐藏标记：事件结束 + 走了哪条分支
-    function scanPlotMarker(mesText) {
+    function scanPlotMarker(mesText, msgId) {
         const cd = chatData();
         const pl = cd.plot;
         if (!pl.events.length) return false;
+        // 只认矩阵生成之后产生的消息。否则刚生成新矩阵时，
+        // 会把上一个矩阵留在旧楼层里的结束标记当成本矩阵的推进。
+        if (msgId != null && pl.startMsgId != null && msgId < pl.startMsgId) {
+            log('debug', 'trigger', `消息#${msgId} 早于当前矩阵的起始楼层(${pl.startMsgId})，忽略其中的剧情标记`);
+            return false;
+        }
         let matched = null;
         let m;
         PLOT_MARKER_RE_G.lastIndex = 0;
@@ -1521,6 +1573,67 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return out;
     }
 
+    /**
+     * 反控制世界书：把本扩展里的勾选状态写回酒馆世界书条目的 disable 字段。
+     * 用途：同一张角色卡可能有多条平行线（20岁线/30岁线各一组条目），
+     * 每个聊天各走一条。有了这个，切聊天时不用再手动去世界书里反复开关。
+     * 开关状态存在 chatMetadata，所以每个聊天各记各的。
+     */
+    async function applyReverseWorldInfo({ silent = false } = {}) {
+        const s = settings();
+        const c = ctx();
+        if (typeof c.saveWorldInfo !== 'function') {
+            log('warn', 'system', '当前酒馆版本没有暴露 saveWorldInfo，无法反控制世界书');
+            return { ok: false, changed: 0 };
+        }
+        const cd = chatData();
+        const map = cd.wiState || {};
+        const books = getBoundWorldInfoBookNames();
+        let changed = 0;
+        const detail = [];
+
+        for (const bookName of books) {
+            try {
+                const book = await c.loadWorldInfo(bookName);
+                const entries = book?.entries ? Object.values(book.entries) : [];
+                let dirty = false;
+                for (const e of entries) {
+                    const key = `${bookName}::${e.uid}`;
+                    // 只处理这个聊天里明确设定过的条目，没设定过的不动
+                    if (map[key] === undefined) continue;
+                    const wantDisabled = !map[key];
+                    if (!!e.disable !== wantDisabled) {
+                        e.disable = wantDisabled;
+                        dirty = true;
+                        changed++;
+                        detail.push(`${bookName}/${e.comment || e.uid} → ${wantDisabled ? '关' : '开'}`);
+                    }
+                }
+                if (dirty) await c.saveWorldInfo(bookName, book, true);
+            } catch (err) {
+                log('warn', 'system', `反控制世界书「${bookName}」失败：${err.message || err}`, err);
+            }
+        }
+        if (changed) {
+            try { c.reloadWorldInfoEditor?.(); } catch (e) { /* 编辑器没开就算了 */ }
+            log('info', 'system', `反控制世界书：已按本聊天的设定改动 ${changed} 个条目`, detail);
+        } else if (!silent) {
+            log('info', 'system', '反控制世界书：酒馆里的状态已经和本聊天的设定一致，无需改动');
+        }
+        return { ok: true, changed };
+    }
+
+    /** 把当前扩展里的勾选状态记进本聊天（供反控制使用） */
+    function saveWiStateToChat(entries) {
+        const s = settings();
+        const cd = chatData();
+        cd.wiState = cd.wiState || {};
+        for (const e of entries) {
+            cd.wiState[`${e.book}::${e.uid}`] = isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST);
+        }
+        saveChatData();
+    }
+
     async function gatherWorldInfo() {
         const s = settings();
         const entries = await fetchWorldInfoEntriesForManagement();
@@ -1593,8 +1706,50 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return raw;
     }
 
+    /**
+     * 归一化独立 API 的地址。用户常见的几种写法都兼容：
+     *   https://x.com                      -> https://x.com/v1/chat/completions
+     *   https://x.com/v1                   -> https://x.com/v1/chat/completions
+     *   https://x.com/v1/                  -> 同上
+     *   https://x.com/v1/chat/completions  -> 原样使用
+     */
+    function normalizeApiUrl(rawUrl, endpoint = 'chat/completions') {
+        let u = String(rawUrl || '').trim().replace(/\/+$/, '');
+        if (!u) throw new Error('API 地址为空');
+        if (!/^https?:\/\//i.test(u)) {
+            // 没写协议时补上；页面是 https 就用 https，避免混合内容被浏览器拦掉
+            u = (location.protocol === 'https:' ? 'https://' : 'http://') + u;
+        }
+        if (/\/chat\/completions$/i.test(u)) return endpoint === 'chat/completions' ? u : u.replace(/\/chat\/completions$/i, '/' + endpoint);
+        if (/\/models$/i.test(u)) return u.replace(/\/models$/i, '/' + endpoint);
+        return `${u}/${endpoint}`;
+    }
+
+    /** 把 fetch 的失败翻译成能照着排查的说明 */
+    function explainFetchError(err, url) {
+        const msg = String(err?.message || err);
+        if (!/Failed to fetch|NetworkError|Load failed/i.test(msg)) return msg;
+        const lines = [`无法连接到 ${url}`, '浏览器层面就失败了（没拿到任何 HTTP 响应），常见原因：'];
+        try {
+            const target = new URL(url);
+            if (location.protocol === 'https:' && target.protocol === 'http:') {
+                lines.push('· 【很可能是这个】页面是 HTTPS，但 API 是 HTTP，浏览器会拦截混合内容。请改用 https 的地址。');
+            }
+            if (target.origin !== location.origin) {
+                lines.push('· 【很可能是这个】跨域被 CORS 拦下。浏览器直连第三方 API 需要对方返回 CORS 头；');
+                lines.push('  多数官方 API（OpenAI/Anthropic 等）不允许浏览器直连，只能服务端调用。');
+                lines.push('  解决办法：改用「跟随酒馆」（走酒馆后端转发），或填一个允许 CORS 的中转/本地地址。');
+            }
+        } catch (e) {
+            lines.push('· 地址格式不对，无法解析成合法 URL。');
+        }
+        lines.push('· 地址写错、端口不对，或该服务当前没在运行。');
+        lines.push('（按 F12 打开控制台的 Network 面板可以看到更具体的拦截原因）');
+        return lines.join('\n');
+    }
+
     async function callCustomApi(systemPrompt, userPrompt, preset) {
-        const base = preset.url.replace(/\/+$/, '');
+        const url = normalizeApiUrl(preset.url);
         const headers = { 'Content-Type': 'application/json' };
         if (preset.key) headers['Authorization'] = `Bearer ${preset.key}`;
         const body = JSON.stringify({
@@ -1605,23 +1760,65 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             ],
             stream: false,
         });
-        log('debug', 'request', `独立 API 请求：POST ${base}/chat/completions`, { preset: preset.name, model: preset.model, hasKey: !!preset.key });
-        const res = await fetch(`${base}/chat/completions`, { method: 'POST', headers, body });
+        log('debug', 'request', `独立 API 请求：POST ${url}`, { preset: preset.name, model: preset.model, hasKey: !!preset.key });
+
+        let res;
+        try {
+            res = await fetch(url, { method: 'POST', headers, body });
+        } catch (err) {
+            const detail = explainFetchError(err, url);
+            log('error', 'request', `独立 API「${preset.name}」连接失败\n${detail}`, err);
+            throw new Error(detail);
+        }
         if (!res.ok) {
             const text = await res.text().catch(() => '');
-            throw new Error(`独立 API 请求失败：HTTP ${res.status} ${res.statusText} ${text.slice(0, 300)}`);
+            const hint = res.status === 401 ? '（Key 不对或没填）'
+                : res.status === 404 ? '（地址不对，检查是否少了 /v1）'
+                : res.status === 429 ? '（触发限流）' : '';
+            throw new Error(`独立 API「${preset.name}」返回 HTTP ${res.status} ${res.statusText}${hint} ${text.slice(0, 300)}`);
         }
         const data = await res.json();
         log('debug', 'response', '独立 API 原始返回', data);
-        return data?.choices?.[0]?.message?.content ?? '';
+        const content = data?.choices?.[0]?.message?.content;
+        if (content == null) {
+            log('warn', 'response', '响应里没有 choices[0].message.content，可能该服务不是 OpenAI 兼容格式', data);
+            throw new Error('响应格式不是 OpenAI 兼容的（找不到 choices[0].message.content），详见日志。');
+        }
+        return content;
+    }
+
+    /** 连接测试：发一条最小请求，把问题在设置里就暴露出来 */
+    async function testApiPreset(preset) {
+        const url = normalizeApiUrl(preset.url);
+        const headers = { 'Content-Type': 'application/json' };
+        if (preset.key) headers['Authorization'] = `Bearer ${preset.key}`;
+        let res;
+        try {
+            res = await fetch(url, {
+                method: 'POST', headers,
+                body: JSON.stringify({ model: preset.model || undefined, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1, stream: false }),
+            });
+        } catch (err) {
+            throw new Error(explainFetchError(err, url));
+        }
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            throw new Error(`HTTP ${res.status} ${res.statusText}\n${text.slice(0, 300)}`);
+        }
+        return `连接正常（${url}）`;
     }
 
     async function fetchCustomModelList(preset) {
-        const base = preset.url.replace(/\/+$/, '');
+        const url = normalizeApiUrl(preset.url, 'models');
         const headers = {};
         if (preset.key) headers['Authorization'] = `Bearer ${preset.key}`;
-        const res = await fetch(`${base}/models`, { headers });
-        if (!res.ok) throw new Error(`拉取模型列表失败：HTTP ${res.status}`);
+        let res;
+        try {
+            res = await fetch(url, { headers });
+        } catch (err) {
+            throw new Error(explainFetchError(err, url));
+        }
+        if (!res.ok) throw new Error(`拉取模型列表失败：HTTP ${res.status} ${res.statusText}`);
         const data = await res.json();
         const list = Array.isArray(data?.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
         preset.modelList = list;
@@ -1861,10 +2058,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 const delta = floorNow - (cdT.autoTriggerState.lastOffscreenFloor || 0);
                 log('debug', 'trigger', `[表格楼层触发] 当前第${floorNow}层，距上次已过${delta}层，间隔设置${iv}层`);
                 if (delta >= iv && !isGenerating()) {
-                    const backoff = Math.max(0, Number(s.autoTriggers.floorBackoff) || 0);
-                    log('info', 'trigger', `[表格楼层触发] 达到间隔，开始生成（读取时回避最新 ${backoff} 层，留出重 roll 余地）`);
+                    log('info', 'trigger', '[表格楼层触发] 达到间隔，开始生成');
                     startBackgroundTask('表格生成', async () => {
-                        await generateOffscreen({ floorOffset: backoff });
+                        await generateOffscreen();
                         cdT.autoTriggerState.lastOffscreenFloor = floorNow;
                         saveChatData();
                     });
@@ -1878,7 +2074,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         try {
             const c0 = ctx();
             const mes0 = c0.chat?.[messageId];
-            if (mes0 && !mes0.is_user && !mes0.is_system && scanPlotMarker(mes0.mes)) {
+            if (mes0 && !mes0.is_user && !mes0.is_system && scanPlotMarker(mes0.mes, messageId)) {
                 toast('剧情已推进到下一个事件', 'info');
                 if ($modal) renderPlotPanel($modal.find('.ow-panel[data-panel="plot"]'));
             }
@@ -1933,10 +2129,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 const delta = currentFloor - (at.lastWidgetFloor || 0);
                 log('debug', 'trigger', `[组件楼层触发] 当前楼层${currentFloor}，距上次生成已过${delta}层，间隔设置${interval}层`);
                 if (delta >= interval) {
-                    const backoff = Math.max(0, Number(s.autoTriggers.floorBackoff) || 0);
-                    log('info', 'trigger', `[组件楼层触发] 达到间隔，自动生成组件（读取时回避最新 ${backoff} 层）`);
+                    log('info', 'trigger', '[组件楼层触发] 达到间隔，自动生成组件');
                     try {
-                        await generateAllWidgets({ floorOffset: backoff });
+                        await generateAllWidgets();
                         at.lastWidgetFloor = currentFloor;
                         saveChatData();
                         refreshOpenPanels();
@@ -3272,9 +3467,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             $tree.html(renderPlotTreeHtml(pl));
         }
 
-        $panel.find('#ow_plot_gen').on('click', function () {
-            startBackgroundTask('剧情推演', () => generatePlot());
-        });
+        $panel.find('#ow_plot_gen').on('click', () => openPlotGenDialog($panel));
         $panel.find('#ow_plot_dir_btn').on('click', () => openDirectionsDialog($panel));
         $panel.find('#ow_plot_custom_btn').on('click', () => openCustomEventsDialog($panel));
 
@@ -3310,6 +3503,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             renderPlotPanel($panel);
         });
 
+        $tree.on('click', '[data-action="plot-restore"]', function () {
+            if (!confirm('恢复上一版矩阵？当前这版会被存起来，可以再点一次换回来。')) return;
+            if (restorePlotHistory()) { toast('已恢复上一版矩阵', 'success'); renderPlotPanel($panel); }
+        });
         $tree.on('click', '[data-action="plot-reset"]', function () {
             if (!confirm('清空推演进度（置灰状态与已走路径），事件矩阵保留？')) return;
             pl.deadBranches = {};
@@ -3328,6 +3525,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         let html = `<div class="ow-row" style="margin-bottom:10px;">
             <span class="ow-muted">当前事件：${pl.currentId ? `<b>[事件${escapeHtml(pl.currentId)}]</b>` : '（已抵达结局或未设定）'}</span>
             <span class="ow-spacer"></span>
+            ${pl.history?.length ? '<button class="ow-btn" data-action="plot-restore" title="回到上一版矩阵"><i class="fa-solid fa-clock-rotate-left"></i> 恢复上一版</button>' : ''}
             <button class="ow-btn" data-action="plot-reset">重置进度</button>
         </div><div class="ow-tree">`;
 
@@ -3479,6 +3677,51 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
     }
 
+    // ---------------- 生成推演确认框 ----------------
+    function openPlotGenDialog($plotPanel) {
+        const s = settings();
+        const pl = chatData().plot;
+        const hasCur = pl.events?.length > 0;
+        const dirs = (s.plot.directions || []).filter((d) => d.enabled).map((d) => d.name);
+        const custom = String(s.plot.customEvents || '').trim();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="height:auto;max-height:80vh;width:min(520px,93vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">生成剧情推演</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-row"><span class="ow-muted">发展方向：${dirs.length ? escapeHtml(dirs.join('、')) : '未指定'}</span></div>
+              <div class="ow-row"><span class="ow-muted">自定义内容：${custom ? `已填 ${custom.split(/\n+/).filter(Boolean).length} 条` : '未填'}</span></div>
+              ${hasCur ? `
+              <div class="ow-field-label">当前已有 ${pl.events.length} 个事件的矩阵</div>
+              <div class="ow-col ow-sub-fields">
+                <label><input type="radio" name="ow_pg_mode" value="new" ${s.plot.sendCurrent ? '' : 'checked'}> <b>重新生成</b>　不发送现有矩阵，进度清零</label>
+                <label><input type="radio" name="ow_pg_mode" value="continue" ${s.plot.sendCurrent ? 'checked' : ''}> <b>续写</b>　发送现有矩阵与当前进度，以当前事件为起点往后写</label>
+              </div>
+              <div class="ow-muted" style="font-size:11.5px;margin-top:6px;">生成前会自动备份当前矩阵，可在主界面「恢复上一版」找回。</div>
+              ` : '<div class="ow-muted">还没有矩阵，将直接生成一份新的。</div>'}
+              <div class="ow-row" style="margin-top:14px;justify-content:flex-end;">
+                <button class="ow-btn ow-sub-close">取消</button>
+                <button class="ow-btn ow-primary" id="ow_pg_go">开始生成</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+        const close = () => $ov.remove();
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+        $ov.find('#ow_pg_go').on('click', function () {
+            if (hasCur) {
+                s.plot.sendCurrent = $ov.find('[name="ow_pg_mode"]:checked').val() === 'continue';
+                saveSettings();
+            }
+            close();
+            startBackgroundTask('剧情推演', () => generatePlot());
+        });
+    }
+
     // ---------------- 自定义事件子弹窗 ----------------
     function openCustomEventsDialog($plotPanel) {
         const s = settings();
@@ -3490,10 +3733,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
             </div>
             <div class="ow-sub-body">
-              <div class="ow-hint">按点写，一行一个事件，只写你想要发生什么，不用写分支与细节——模型会补上戏剧核心、导火索与情感分支。<br>
-              这里写的每一条都<b>必须</b>出现在生成的矩阵里；不够设定的节点数时，其余由模型补全。留空则完全由模型自由发挥。</div>
+              <div class="ow-hint">随便写，想到什么写什么——完整事件、半个点子、某句台词、某个画面、想看到的结果、甚至只是"我想让他们吵一架"都行。<br>
+              模型会把这些接住：能当事件的就做成事件，是分支走向的就安排成分支，太零碎的会自动补全成完整情节并串进故事线。<br>
+              这里写的内容<b>必须</b>体现在矩阵里；留空则完全由模型自由发挥。</div>
               <textarea class="ow-textarea" id="ow_custom_events" style="min-height:200px;"
-                placeholder="例如：&#10;两人被困在电梯里一整夜&#10;她发现了他藏了三年的那封信&#10;前任带着孩子突然出现在家门口">${escapeHtml(s.plot.customEvents || '')}</textarea>
+                placeholder="例如：&#10;两人被困在电梯里一整夜&#10;想看他为了她跟家里翻脸&#10;“你根本不懂我要什么”这句话要出现&#10;最后要有一场大雨&#10;让他知道当年的真相">${escapeHtml(s.plot.customEvents || '')}</textarea>
               <div class="ow-row" style="margin-top:10px;justify-content:flex-end;">
                 <button class="ow-btn ow-danger" id="ow_custom_clear">清空</button>
                 <button class="ow-btn ow-primary ow-sub-close">完成</button>
@@ -4080,6 +4324,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const uidStr = String($(this).data('uid'));
             s.worldInfoOverrides[`${book}::${uidStr}`] = $(this).is(':checked');
             saveSettings();
+            const cdw = chatData();
+            cdw.wiState = cdw.wiState || {};
+            cdw.wiState[`${book}::${uidStr}`] = $(this).is(':checked');
+            saveChatData();
             const $card = $(this).closest('.ow-widget-card');
             const total = $card.find('.ow-wi-entry-toggle').length;
             const on = $card.find('.ow-wi-entry-toggle:checked').length;
@@ -4092,11 +4340,15 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 const book = $(this).data('book');
                 const uidStr = String($(this).data('uid'));
                 s.worldInfoOverrides[`${book}::${uidStr}`] = want;
+                const cdw2 = chatData();
+                cdw2.wiState = cdw2.wiState || {};
+                cdw2.wiState[`${book}::${uidStr}`] = want;
                 $(this).prop('checked', want);
             });
             saveSettings();
             const total = $card.find('.ow-wi-entry-toggle').length;
             $card.find('.ow-widget-meta').text(`${want ? total : 0}/${total} 发送`);
+            saveChatData();
         });
     }
 
@@ -4258,6 +4510,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                   <input type="text" class="ow-input ow-api-name" value="${escapeHtml(p.name || '')}">
                   <div class="ow-field-label">URL</div>
                   <input type="text" class="ow-input ow-api-url" value="${escapeHtml(p.url || '')}" placeholder="https://api.openai.com/v1">
+                  <div class="ow-muted" style="font-size:11px;">填到 /v1 即可，扩展会自动补 /chat/completions。注意：浏览器直连第三方 API 常被 CORS 拦截，若失败请改用「跟随酒馆」。</div>
                   <div class="ow-field-label">Key</div>
                   <input type="password" class="ow-input ow-api-key" value="${escapeHtml(p.key || '')}">
                   <div class="ow-field-label">模型</div>
@@ -4267,6 +4520,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                       ${(p.modelList || []).filter((m) => m !== p.model).map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
                     </select>
                     <button class="ow-btn" data-action="api-pull">拉取模型</button>
+                    <button class="ow-btn" data-action="api-test">测试连接</button>
                   </div>
                 </div>
               </div>`).join(''));
@@ -4299,6 +4553,20 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             }
             saveSettings(); renderSettingsPanel($panel);
         });
+        $box.off('click', '[data-action="api-test"]').on('click', '[data-action="api-test"]', async function () {
+            const p = find(this);
+            if (!p?.url) { toast('请先填写 URL', 'warning'); return; }
+            const $b = $(this); $b.prop('disabled', true).text('测试中…');
+            try {
+                const msg = await testApiPreset(p);
+                toast(msg, 'success');
+                log('info', 'request', `API 预设「${p.name}」测试通过：${msg}`);
+            } catch (err) {
+                toast('连接失败，详情见日志分组', 'error');
+                log('error', 'request', `API 预设「${p.name}」测试失败：\n${err.message || err}`);
+            } finally { $b.prop('disabled', false).text('测试连接'); }
+        });
+
         $box.off('click', '[data-action="api-pull"]').on('click', '[data-action="api-pull"]', async function () {
             const p = find(this);
             if (!p?.url) { toast('请先填写 URL', 'warning'); return; }
@@ -4394,9 +4662,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <label><input type="checkbox" id="ow_auto_content_tag" ${s.autoTriggers.onContentTag ? 'checked' : ''}> 检测到 &lt;content&gt; 闭合标签时生成</label>
               <label><input type="checkbox" id="ow_auto_widget_floor" ${s.autoTriggers.widgetsByFloor.enabled ? 'checked' : ''}> 每
                 <input type="number" class="ow-input ow-num" id="ow_auto_widget_floor_n" min="1" value="${s.autoTriggers.widgetsByFloor.interval}">楼层生成一次</label>
-              <label>楼层触发时回避最新
-                <input type="number" class="ow-input ow-num" id="ow_floor_backoff" min="0" value="${s.autoTriggers.floorBackoff}"> 层</label>
-              <div class="ow-muted" style="font-size:11.5px;">回避是为了给重 roll 留余地，组件与表格共用此设置。</div>
             </div>
             <div class="ow-field-label">上下文</div>
             <div class="ow-row"><label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label></div>
@@ -4476,6 +4741,15 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <div class="ow-row">
               <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书 / 聊天书条目</label>
             </div>
+            <div class="ow-field-label">反控制世界书</div>
+            <div class="ow-row">
+              <label><input type="checkbox" id="ow_wi_rc" ${s.wiReverseControl.enabled ? 'checked' : ''}> 启用反控制</label>
+              <label><input type="checkbox" id="ow_wi_rc_auto" ${s.wiReverseControl.autoApply ? 'checked' : ''} ${s.wiReverseControl.enabled ? '' : 'disabled'}> 切换聊天时自动应用</label>
+              <button class="ow-btn ow-primary" id="ow_wi_rc_apply" ${s.wiReverseControl.enabled ? '' : 'disabled'}><i class="fa-solid fa-right-left"></i> 立即应用到酒馆</button>
+            </div>
+            <div class="ow-muted" style="font-size:11.5px;">把下面的勾选状态<b>写回酒馆世界书本身</b>（改的是条目的启用/禁用）。<br>
+            适用于一张角色卡有多条平行线：聊天1走20岁线、聊天2走30岁线，各自勾好后切聊天就自动切换，不用再手动开关。<br>
+            状态按聊天分别保存；只影响你在本扩展里设定过的条目，没动过的不碰。</div>
             <div class="ow-row">
               <button class="ow-btn" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 刷新条目</button>
               <button class="ow-btn" id="ow_wi_reset">恢复默认</button>
@@ -4563,11 +4837,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
         $panel.find('#ow_auto_content_tag').on('change', function () { s.autoTriggers.onContentTag = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_auto_widget_floor').on('change', function () { s.autoTriggers.widgetsByFloor.enabled = $(this).is(':checked'); saveSettings(); });
-        $panel.find('#ow_floor_backoff').on('change', function () {
-            s.autoTriggers.floorBackoff = Math.max(0, Number($(this).val()) || 0);
-            saveSettings();
-            renderSettingsPanel($panel);
-        });
         $panel.find('#ow_auto_widget_floor_n').on('change', function () { s.autoTriggers.widgetsByFloor.interval = Math.max(1, Number($(this).val()) || 1); saveSettings(); });
         $panel.find('#ow_off_enabled_set').on('change', function () {
             s.offscreen.enabled = $(this).is(':checked');
@@ -4609,6 +4878,23 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             toast('没找到扩展管理器入口，请手动打开酒馆左侧「扩展」面板 → Manage extensions', 'warning');
         });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_wi_rc').on('change', function () {
+            s.wiReverseControl.enabled = $(this).is(':checked');
+            saveSettings();
+            renderSettingsPanel($panel);
+        });
+        $panel.find('#ow_wi_rc_auto').on('change', function () { s.wiReverseControl.autoApply = $(this).is(':checked'); saveSettings(); });
+        $panel.find('#ow_wi_rc_apply').on('click', async function () {
+            const $b = $(this); $b.prop('disabled', true);
+            try {
+                const entries = await fetchWorldInfoEntriesForManagement();
+                saveWiStateToChat(entries);
+                const r = await applyReverseWorldInfo();
+                toast(r.ok ? (r.changed ? `已改动酒馆里的 ${r.changed} 个条目` : '酒馆状态已与本聊天设定一致') : '当前酒馆版本不支持，详见日志', r.ok ? 'success' : 'warning');
+            } catch (err) {
+                toast(`应用失败：${err.message || err}`, 'error');
+            } finally { $b.prop('disabled', false); }
+        });
         $panel.find('#ow_include_wi').on('change', function () { s.includeWorldInfo = $(this).is(':checked'); saveSettings(); });
 
         $panel.find('#ow_inject_widgets').on('change', function () { s.injectWidgets = $(this).is(':checked'); saveSettings(); updateInjections(); });
@@ -4663,9 +4949,14 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             waitForMenu();
             const c = ctx();
             c.eventSource.on(c.eventTypes.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
-            c.eventSource.on(c.eventTypes.CHAT_CHANGED, () => {
+            c.eventSource.on(c.eventTypes.CHAT_CHANGED, async () => {
                 log('debug', 'system', '检测到 CHAT_CHANGED，刷新已打开的面板');
                 refreshOpenPanels();
+                const st = settings();
+                if (st.wiReverseControl?.enabled && st.wiReverseControl?.autoApply) {
+                    // 等世界书列表就绪再应用
+                    setTimeout(() => applyReverseWorldInfo({ silent: true }).catch(() => {}), 1200);
+                }
             });
             log('info', 'system', '扩展初始化完成');
             checkExtensionUpdate({ quiet: true }); // 静默检查一次，让菜单角标能在不打开弹窗时也生效
