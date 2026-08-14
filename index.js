@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '3.0.0';
+    const EXT_VERSION = '3.1.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -236,16 +236,19 @@
         includeWorldInfo: false,
         injectWidgets: false,
         injectDepth: 0,
+        floorBackoff: 0,        // 组件：读取时回避最新 N 层（默认 0，组件要读最新的）
         offscreen: {
             enabled: false,
             triggerMode: 'manual',  // 'manual' | 'auto'
             autoMode: 'follow',     // 'follow'=跟随组件 | 'floor'=自选楼层间隔
             floorInterval: 10,      // autoMode='floor' 时生效
-            historyDepth: 5,        // autoMode='follow' 时跟随组件的设置
-            injectTables: false,
-                injectDepth: 0,
+            newChatBehavior: 'ask',  // 'ask'=询问 | 'manual'=转手动 | 'auto'=照常自动
+            historyDepth: 5,
+            floorBackoff: 2,        // 表格：默认回避 2 层，给重 roll 留余地
+            injectTables: true,
+            injectDepth: 3,
         },
-        api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '' },
+        api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '', stream: false },
         // 各模块用哪套 API：'system'=跟随酒馆，'preset'=指定预设
         moduleApi: {
             widgets: { mode: 'system', presetId: '' },
@@ -254,6 +257,7 @@
             summary: { mode: 'system', presetId: '' },
         },
         theme: { mode: 'system', customCss: '' },
+        previewMaxHeight: 'mid', // short|mid|tall|full 预览框高度上限
         prompts: {
             widgetSystemPrompt: DEFAULT_WIDGET_SYSTEM_PROMPT,
             offscreenPreamble: DEFAULT_OFFSCREEN_PREAMBLE,
@@ -284,14 +288,16 @@
             ],
             onMissing: 'generate',   // 'generate' = 让模型补写并标记⚠️ | 'skip' = 跳过并列出章号
             compressMode: 'manual',  // 'manual' | 'auto'
-            compressLag: 5,          // 自动：出现第 N 次总结时压缩第 1 次，第 N+1 次时压缩第 2 次…
-            injectEnabled: false,
-                injectDepth: 2,
+            compressLag: 5,          // 自动：出现第 N 次总结时压缩第 1 次，依此类推
+            floorBackoff: 0,
+            injectEnabled: true,
+            injectDepth: 999,
         },
         // 剧情推演
         plot: {
             customEvents: '',
             historyDepth: 20,
+            floorBackoff: 0,
             minEvents: 10,
             injectEnabled: true,
                 injectDepth: 1,
@@ -387,7 +393,9 @@
             c.chatMetadata[MODULE_NAME].offscreen = emptyOffscreen();
         }
         if (!c.chatMetadata[MODULE_NAME].autoTriggerState) {
-            c.chatMetadata[MODULE_NAME].autoTriggerState = { lastWidgetFloor: 0, lastOffscreenFloor: 0 };
+            // firstSeen=false 表示这个聊天还没被本扩展"接管"过。
+            // 老聊天第一次打开时不该直接自动生成一大堆表格，先按设置询问/转手动。
+            c.chatMetadata[MODULE_NAME].autoTriggerState = { lastWidgetFloor: 0, lastOffscreenFloor: 0, firstSeen: false };
         }
         const off = c.chatMetadata[MODULE_NAME].offscreen;
         // 迁移旧版存档：以前每张表是 offscreen 下的一个平铺数组字段，
@@ -916,6 +924,63 @@
         return parts.join('\n\n');
     }
 
+    /** 方式二：把提示词发进酒馆聊天，用酒馆的预设生成，再从回复里捕获 */
+    async function requestSummaryViaChat() {
+        const s = settings();
+        const c = ctx();
+        const u = unitName();
+        const from = nextSummaryStart();
+        const to = maxChapter();
+        if (to < from) throw new Error(`没有新内容可总结（已总结到第 ${from - 1} ${u}）`);
+
+        const cd = chatData();
+        cd.summary.pending = { from, to, at: Date.now() };
+        saveChatData();
+
+        const ask = `${s.prompts.summarySystemPrompt}
+
+【本次整理范围】第 ${from} ${u} 至 第 ${to} ${u}
+【务必遵守】输出必须以 <大总结(第${from}-${to}${u})> 开头、以 </大总结(第${from}-${to}${u})> 结尾，
+扩展会靠这对标签自动捕获并存档。标签内的每一条摘要都要带上对应的 \`[Chapter_X]\` 标签。`;
+
+        log('info', 'system', `已把总结请求发进聊天（第 ${from}–${to} ${u}），等待回复中…`);
+        const cmd = `/send ${ask.replace(/\n/g, ' ')} | /trigger`;
+        if (typeof c.executeSlashCommandsWithOptions === 'function') {
+            await c.executeSlashCommandsWithOptions(cmd, { handleParserErrors: true });
+        } else if (typeof c.executeSlashCommands === 'function') {
+            await c.executeSlashCommands(cmd);
+        } else {
+            throw new Error('当前酒馆版本不支持斜杠命令调用，请改用「从扩展发送」。');
+        }
+        return { from, to };
+    }
+
+    /** 从 AI 回复里捕获 <大总结(...)>…</大总结(...)>，自动存档 */
+    function capturePendingSummary(mesText) {
+        const cd = chatData();
+        const pend = cd.summary.pending;
+        if (!pend) return false;
+        const m = /<大总结\(([^)]*)\)>([\s\S]*?)<\/大总结\([^)]*\)>/.exec(String(mesText || ''));
+        if (!m) return false;
+        const text = `<大总结(${m[1]})>${m[2]}</大总结(${m[1]})>`;
+        const big = {
+            id: `sum_${Date.now().toString(36)}`,
+            fromCh: pend.from, toCh: pend.to,
+            createdAt: Date.now(),
+            imported: false, viaChat: true,
+            rawText: text,
+            sections: [], level: 1, compressedAt: null,
+        };
+        cd.summary.bigSummaries.push(big);
+        cd.summary.bigSummaries.sort((a, b) => a.fromCh - b.fromCh);
+        delete cd.summary.pending;
+        saveChatData();
+        updateInjections();
+        log('info', 'system', `已从聊天回复中捕获大总结（第 ${pend.from}–${pend.to}），${text.length} 字`);
+        toast(`已捕获大总结并存档（第 ${pend.from}–${pend.to}）`, 'success');
+        return true;
+    }
+
     async function generateBigSummary() {
         const s = settings();
         const cd = chatData();
@@ -1338,7 +1403,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     async function generatePlot() {
         const s = settings();
         log('info', 'system', `开始生成剧情推演矩阵（方向：${plotDirections().join('、') || '未指定'}）`);
-        const extras = await gatherExtras({ historyDepth: s.plot.historyDepth });
+        const extras = await gatherExtras({ historyDepth: s.plot.historyDepth, floorOffset: Number(s.plot.floorBackoff) || 0 });
         const userPrompt = buildPlotUserPrompt(extras);
         const raw = await callModel(s.prompts.plotSystemPrompt, userPrompt, '剧情推演', 'plot');
         const parsed = tryParseJsonRobust(raw, '剧情推演');
@@ -1758,9 +1823,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
                 { role: 'user', content: userPrompt },
             ],
-            stream: false,
+            stream: !!settings().api.stream,
         });
-        log('debug', 'request', `独立 API 请求：POST ${url}`, { preset: preset.name, model: preset.model, hasKey: !!preset.key });
+        log('debug', 'request', `独立 API 请求：POST ${url}（${settings().api.stream ? '流式' : '非流式'}）`, { preset: preset.name, model: preset.model, hasKey: !!preset.key });
 
         let res;
         try {
@@ -1776,6 +1841,27 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 : res.status === 404 ? '（地址不对，检查是否少了 /v1）'
                 : res.status === 429 ? '（触发限流）' : '';
             throw new Error(`独立 API「${preset.name}」返回 HTTP ${res.status} ${res.statusText}${hint} ${text.slice(0, 300)}`);
+        }
+        // 流式：逐块读 SSE 并拼接；非流式：直接解析 JSON
+        if (settings().api.stream) {
+            const text = await res.text();
+            let acc = '';
+            for (const line of text.split(/\r?\n/)) {
+                const t = line.trim();
+                if (!t.startsWith('data:')) continue;
+                const payload = t.slice(5).trim();
+                if (!payload || payload === '[DONE]') continue;
+                try {
+                    const j = JSON.parse(payload);
+                    acc += j?.choices?.[0]?.delta?.content || j?.choices?.[0]?.message?.content || '';
+                } catch (e) { /* 忽略残缺分片 */ }
+            }
+            if (!acc) {
+                log('warn', 'response', '流式响应没解析出内容，可尝试在设置里关掉流式', text.slice(0, 500));
+                throw new Error('流式响应解析为空，可在设置里改用非流式重试。');
+            }
+            log('debug', 'response', `独立 API 流式返回（${acc.length} 字）`, acc);
+            return acc;
         }
         const data = await res.json();
         log('debug', 'response', '独立 API 原始返回', data);
@@ -1874,9 +1960,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     // ------------------------------------------------------------------
     // 生成：组件
     // ------------------------------------------------------------------
-    async function generateWidget(widget, { floorOffset = 0 } = {}) {
+    async function generateWidget(widget, { floorOffset } = {}) {
+        const off0 = floorOffset ?? (Number(settings().floorBackoff) || 0);
         log('info', 'system', `开始生成组件「${widget.name}」`, { id: widget.id, prompt: widget.prompt });
-        const extras = await gatherExtras({ floorOffset });
+        const extras = await gatherExtras({ floorOffset: off0 });
         const userPrompt = buildWidgetUserPrompt(widget, extras);
         const raw = await callModel(settings().prompts.widgetSystemPrompt, userPrompt, `组件:${widget.name}`, 'widgets');
         const html = stripCodeFence(raw);
@@ -1913,8 +2000,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         log('info', 'system', '开始生成/更新「表格生成」内容');
         onProgress?.('offscreen', 'start');
         const sOff = settings().offscreen;
-        const depth = (sOff.triggerMode === 'auto' && sOff.autoMode === 'follow') ? settings().historyDepth : sOff.historyDepth;
-        const extras = await gatherExtras({ historyDepth: depth, floorOffset });
+        const follow = sOff.triggerMode === 'auto' && sOff.autoMode === 'follow';
+        const depth = follow ? settings().historyDepth : sOff.historyDepth;
+        const back = floorOffset ?? (follow ? (Number(settings().floorBackoff) || 0) : (Number(sOff.floorBackoff) || 0));
+        const extras = await gatherExtras({ historyDepth: depth, floorOffset: back });
         const userPrompt = buildOffscreenUserPrompt(extras);
         try {
             const raw = await callModel(buildOffscreenSystemPrompt(), userPrompt, '表格生成', 'tables');
@@ -2053,6 +2142,33 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (mes1 && !mes1.is_user && !mes1.is_system
                 && s.offscreen.enabled && s.offscreen.triggerMode === 'auto' && s.offscreen.autoMode === 'floor') {
                 const cdT = chatData();
+                if (!cdT.autoTriggerState.firstSeen) {
+                    const beh = s.offscreen.newChatBehavior || 'ask';
+                    if (beh === 'auto') {
+                        cdT.autoTriggerState.firstSeen = true;
+                        cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
+                        saveChatData();
+                    } else if (beh === 'manual') {
+                        cdT.autoTriggerState.firstSeen = true;
+                        cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
+                        saveChatData();
+                        log('info', 'trigger', '这个聊天首次接入本扩展，已按设置跳过首次自动生成（改为从现在开始计数）。');
+                        toast('本聊天首次接入，表格未自动生成。需要时可手动点生成。', 'info');
+                        return;
+                    } else {
+                        cdT.autoTriggerState.firstSeen = true;
+                        cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
+                        saveChatData();
+                        const yes = confirm('这个聊天是第一次使用本扩展的表格功能。\n\n现在要基于已有聊天记录生成一次表格吗？\n（点取消则跳过，之后按楼层间隔正常触发）');
+                        if (!yes) { log('info', 'trigger', '用户选择跳过首次表格生成'); return; }
+                        startBackgroundTask('表格生成', async () => {
+                            await generateOffscreen();
+                            cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
+                            saveChatData();
+                        });
+                        return;
+                    }
+                }
                 const floorNow = c1.chat.length;
                 const iv = Math.max(1, Number(s.offscreen.floorInterval) || 1);
                 const delta = floorNow - (cdT.autoTriggerState.lastOffscreenFloor || 0);
@@ -2068,6 +2184,17 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             }
         } catch (err) {
             log('error', 'trigger', `表格楼层触发出错：${err.message || err}`, err);
+        }
+
+        // 总结捕获：等待中的"发到聊天"请求，从回复里抓 <大总结> 块
+        try {
+            const cS = ctx();
+            const mS = cS.chat?.[messageId];
+            if (mS && !mS.is_user && !mS.is_system && chatData().summary.pending) {
+                if (capturePendingSummary(mS.mes) && $modal) renderSummaryPanel($modal.find('.ow-panel[data-panel="summary"]'));
+            }
+        } catch (err) {
+            log('error', 'trigger', `总结捕获出错：${err.message || err}`, err);
         }
 
         // 剧情推演标记扫描：与手动/自动模式无关，只要正文里出现标记就推进
@@ -2440,7 +2567,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if ($pv.is(':visible')) { $pv.hide().empty(); return; }
             const frameId = `fav_${it.id}`;
             $pv.html(`
-              <div class="ow-result-frame-wrap" style="margin:8px 0 4px;">
+              <div class="ow-result-frame-wrap" data-maxh="${escapeHtml(settings().previewMaxHeight || 'mid')}" style="margin:8px 0 4px;">
                 <div class="ow-result-head">
                   <span>${escapeHtml(it.widgetName)}</span>
                   <span><button class="ow-btn" data-action="fav-fullscreen"><i class="fa-solid fa-expand"></i></button></span>
@@ -2756,7 +2883,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     function buildPreviewSrcdoc(innerHtml, frameId) {
         return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
-  html,body{margin:0;padding:0;background:#fff;height:auto;}
+  html,body{margin:0;padding:0;background:#fff;height:100%;}
+  body{overflow-y:auto;overflow-x:hidden;}
   #__ow_root{padding:12px;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.6;}
   #__ow_root img,#__ow_root video,#__ow_root canvas,#__ow_root table{max-width:100%;}
 </style></head><body>
@@ -2798,7 +2926,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (!el) return;
             // 不再额外 +padding：srcdoc 里量的就是含内边距的内容高度。
             // 再加保护：与当前高度相差不足 4px 时忽略，避免亚像素抖动来回触发。
-            const h = Math.min(Math.max(d.height, 80), 20000);
+            // 取"内容实际高度"与"上限"中的较小者：内容短则贴合内容，
+            // 内容长则停在上限，超出部分由 iframe 内部滚动，外层不被撑长。
+            let h = Math.min(Math.max(d.height, 80), 20000);
+            const wrap = el.closest('.ow-result-frame-wrap');
+            const mode = wrap?.dataset?.maxh || 'mid';
+            if (mode !== 'full') {
+                const vh = window.innerHeight || 800;
+                const cap = mode === 'short' ? vh * 0.4 : mode === 'tall' ? vh * 0.85 : vh * 0.6;
+                h = Math.min(h, Math.round(cap));
+            }
             const cur = parseInt(el.style.height || '0', 10);
             if (Math.abs(cur - h) >= 4) el.style.height = h + 'px';
         });
@@ -2821,7 +2958,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         for (const w of withResults) {
             const result = cd.widgetResults[w.id];
             $results.append(`
-              <div class="ow-result-frame-wrap${folded.has(w.id) ? ' ow-preview-collapsed' : ''}" data-id="${w.id}">
+              <div class="ow-result-frame-wrap${folded.has(w.id) ? ' ow-preview-collapsed' : ''}" data-id="${w.id}" data-maxh="${escapeHtml(s.previewMaxHeight || 'mid')}">
                 <div class="ow-result-head">
                   <span class="ow-result-title">
                     <span class="ow-caret ow-result-caret" data-action="toggle-preview" title="收起/展开"><i class="fa-solid fa-chevron-${folded.has(w.id) ? 'right' : 'down'}"></i></span>
@@ -2927,11 +3064,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         };
         renderList();
 
-        $ov.find('#ow_add_widget').on('click', () => {
-            s.widgets.push({ id: uid(), name: '新组件', prompt: '', enabled: true, presetEntries: [] });
-            saveSettings();
-            renderList();
-        });
+        $ov.find('#ow_add_widget').on('click', () => openNewWidgetDialog(renderList));
 
         bindWidgetCardEvents($ov, renderList);
     }
@@ -3677,6 +3810,124 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
     }
 
+    // ---------------- 新建组件：自行输入 / 预设提取 ----------------
+    function openNewWidgetDialog(onDone) {
+        const s = settings();
+        const $ov = $(`
+        <div class="ow-sub-overlay">
+          <div class="ow-sub-modal" style="width:min(860px,95vw);">
+            <div class="ow-modal-header">
+              <div class="ow-modal-title">新建组件</div>
+              <div class="ow-close-btn ow-sub-close"><i class="fa-solid fa-xmark"></i></div>
+            </div>
+            <div class="ow-sub-body">
+              <div class="ow-row">
+                <label><input type="radio" name="ow_nw_mode" value="manual" checked> 自行输入</label>
+                <label><input type="radio" name="ow_nw_mode" value="preset"> 从预设提取</label>
+              </div>
+
+              <div id="ow_nw_manual">
+                <div class="ow-field-label">组件名称</div>
+                <input type="text" class="ow-input" id="ow_nw_name" value="新组件">
+                <div class="ow-field-label">提示词</div>
+                <textarea class="ow-textarea" id="ow_nw_prompt" style="min-height:160px;" placeholder="描述这个组件要生成什么…"></textarea>
+              </div>
+
+              <div id="ow_nw_preset" style="display:none;">
+                <div class="ow-transfer">
+                  <div class="ow-transfer-col">
+                    <select class="ow-select" id="ow_nw_preset_sel"><option value="">选择预设…</option></select>
+                    <div class="ow-transfer-list" id="ow_nw_src"><div class="ow-muted" style="padding:8px;">先选一个预设</div></div>
+                  </div>
+                  <div class="ow-transfer-mid">
+                    <button class="ow-btn" id="ow_nw_add" title="加入右侧"><i class="fa-solid fa-arrow-right"></i></button>
+                    <button class="ow-btn" id="ow_nw_del" title="移出"><i class="fa-solid fa-arrow-left"></i></button>
+                  </div>
+                  <div class="ow-transfer-col">
+                    <div class="ow-transfer-head">已选条目 <span class="ow-muted" id="ow_nw_count">0</span></div>
+                    <div class="ow-transfer-list" id="ow_nw_dst"><div class="ow-muted" style="padding:8px;">勾选左侧条目后点 →</div></div>
+                  </div>
+                </div>
+                <div class="ow-field-label">组件名称</div>
+                <input type="text" class="ow-input" id="ow_nw_name2" value="新组件">
+                <div class="ow-field-label">补充提示词（可选，会与所选条目一起发送）</div>
+                <textarea class="ow-textarea" id="ow_nw_prompt2" style="min-height:80px;"></textarea>
+              </div>
+
+              <div class="ow-row" style="margin-top:14px;justify-content:flex-end;">
+                <button class="ow-btn ow-sub-close">取消</button>
+                <button class="ow-btn ow-primary" id="ow_nw_ok">确认</button>
+              </div>
+            </div>
+          </div>
+        </div>`).appendTo(document.documentElement);
+
+        const close = () => $ov.remove();
+        $ov.on('click', (e) => { if ($(e.target).hasClass('ow-sub-overlay')) close(); });
+        $ov.find('.ow-sub-close').on('click', close);
+
+        $ov.find('[name="ow_nw_mode"]').on('change', function () {
+            const preset = $(this).val() === 'preset';
+            $ov.find('#ow_nw_manual').toggle(!preset);
+            $ov.find('#ow_nw_preset').toggle(preset);
+        });
+
+        const $sel = $ov.find('#ow_nw_preset_sel');
+        for (const n of getPresetNames()) $sel.append(`<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`);
+
+        let srcEntries = [];
+        const chosen = [];
+        const renderSrc = () => {
+            const $l = $ov.find('#ow_nw_src');
+            if (!srcEntries.length) { $l.html('<div class="ow-muted" style="padding:8px;">这个预设里没有可用条目</div>'); return; }
+            $l.html(srcEntries.map((e, i) => `
+              <label class="ow-transfer-item ${chosen.some((c) => c.identifier === e.identifier) ? 'ow-chosen' : ''}">
+                <input type="checkbox" data-idx="${i}"><span title="${escapeHtml(String(e.content).slice(0, 300))}">${escapeHtml(e.name)}</span>
+              </label>`).join(''));
+        };
+        const renderDst = () => {
+            const $l = $ov.find('#ow_nw_dst');
+            $ov.find('#ow_nw_count').text(chosen.length);
+            if (!chosen.length) { $l.html('<div class="ow-muted" style="padding:8px;">勾选左侧条目后点 →</div>'); return; }
+            $l.html(chosen.map((e, i) => `
+              <label class="ow-transfer-item">
+                <input type="checkbox" data-idx="${i}"><span>${escapeHtml(e.name)}</span>
+              </label>`).join(''));
+        };
+        $sel.on('change', function () {
+            const name = $(this).val();
+            srcEntries = name ? getPresetEntries(name) : [];
+            renderSrc();
+        });
+        $ov.find('#ow_nw_add').on('click', function () {
+            $ov.find('#ow_nw_src input:checked').each(function () {
+                const e = srcEntries[Number($(this).data('idx'))];
+                if (e && !chosen.some((c) => c.identifier === e.identifier)) chosen.push(e);
+            });
+            renderSrc(); renderDst();
+        });
+        $ov.find('#ow_nw_del').on('click', function () {
+            const idxs = $ov.find('#ow_nw_dst input:checked').map(function () { return Number($(this).data('idx')); }).get().sort((a, b) => b - a);
+            for (const i of idxs) chosen.splice(i, 1);
+            renderSrc(); renderDst();
+        });
+
+        $ov.find('#ow_nw_ok').on('click', function () {
+            const preset = $ov.find('[name="ow_nw_mode"]:checked').val() === 'preset';
+            const name = String((preset ? $ov.find('#ow_nw_name2') : $ov.find('#ow_nw_name')).val() || '').trim() || '新组件';
+            const prompt = String((preset ? $ov.find('#ow_nw_prompt2') : $ov.find('#ow_nw_prompt')).val() || '');
+            if (preset && !chosen.length && !prompt.trim()) { toast('请至少选一个条目，或填写补充提示词', 'warning'); return; }
+            settings().widgets.push({
+                id: uid(), name, prompt, enabled: true,
+                presetEntries: preset ? chosen.slice() : [],
+            });
+            saveSettings();
+            log('info', 'ui', `新建组件「${name}」${preset ? `（含 ${chosen.length} 条预设条目）` : ''}`);
+            close();
+            onDone?.();
+        });
+    }
+
     // ---------------- 生成推演确认框 ----------------
     function openPlotGenDialog($plotPanel) {
         const s = settings();
@@ -3981,7 +4232,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.html(`
         <div class="ow-panel-bar">
           <div class="ow-row" style="margin:0;">
-            <button class="ow-btn ow-primary ow-gen-btn" id="ow_sum_gen"><i class="fa-solid fa-layer-group"></i> 大总结</button>
+            <button class="ow-btn ow-primary ow-gen-btn" id="ow_sum_gen" title="用扩展的 API 直接生成，不经过酒馆预设"><i class="fa-solid fa-layer-group"></i> 大总结（扩展）</button>
+            <button class="ow-btn ow-gen-btn" id="ow_sum_gen_chat" title="把提示词发进聊天，用酒馆预设生成，再自动捕获"><i class="fa-solid fa-comments"></i> 大总结（发到聊天）</button>
             <span class="ow-muted">当前最大第 ${to0} ${u} · 已总结至第 ${done} ${u}${doneRaw === null || to0 > doneRaw ? ` · 待整理 ${to0 - (doneRaw === null ? nextSummaryStart() - 1 : doneRaw)} ${u}` : ''}</span>
           </div>
           <span>
@@ -3989,6 +4241,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <button class="ow-btn" id="ow_sum_hide_btn"><i class="fa-solid fa-eye-slash"></i> 隐藏楼层</button>
           </span>
         </div>
+        ${sm.pending ? `<div class="ow-hint">⏳ 正在等待聊天回复（第 ${sm.pending.from}–${sm.pending.to} ${u}）。回复里出现 &lt;大总结&gt; 标签时会自动存档。<button class="ow-btn ow-danger" id="ow_sum_cancel" style="margin-left:8px;">取消等待</button></div>` : ''}
         <div id="ow_sum_list"></div>`);
 
         const $list = $panel.find('#ow_sum_list');
@@ -4001,7 +4254,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 <div class="ow-widget-card-head">
                   <span class="ow-caret" data-action="sum-toggle"><i class="fa-solid fa-chevron-right"></i></span>
                   <span class="ow-widget-name" data-action="sum-toggle">第 ${b.fromCh}–${b.toCh} ${u}</span>
-                  <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : '模型生成'} · ${b.level >= 2 ? '已压缩' : '原始'} · ${(b.rawText || '').length} 字</span>
+                  <span class="ow-muted ow-widget-meta">${b.imported ? '粘贴导入' : (b.viaChat ? '聊天生成' : '扩展生成')} · ${b.level >= 2 ? '已压缩' : '原始'} · ${(b.rawText || '').length} 字</span>
                   <span class="ow-spacer"></span>
                   ${b.imported ? '' : `<button class="ow-btn ow-gen-btn" data-action="sum-regen" title="重新生成这一段（章号范围不变，覆盖原内容）"><i class="fa-solid fa-arrows-rotate"></i> 重新生成</button>`}
                   ${b.level < 2
@@ -4018,7 +4271,21 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         }
 
         $panel.find('#ow_sum_gen').on('click', () => startBackgroundTask('大总结', () => generateBigSummary()));
+        $panel.find('#ow_sum_gen_chat').on('click', async function () {
+            if (!confirm('把总结提示词发进当前聊天，用酒馆的预设生成？\n\n回复里出现 <大总结> 标签时会自动捕获并存档。')) return;
+            try {
+                const r = await requestSummaryViaChat();
+                toast(`已发送请求（第 ${r.from}–${r.to}），等待回复…`, 'info');
+            } catch (err) {
+                toast(`发送失败：${err.message || err}`, 'error');
+            }
+        });
         $panel.find('#ow_sum_hide_btn').on('click', () => openHideDialog($panel));
+        $panel.find('#ow_sum_cancel').on('click', function () {
+            delete chatData().summary.pending;
+            saveChatData();
+            renderSummaryPanel($panel);
+        });
         $panel.find('#ow_sum_impbig_btn').on('click', () => openImportBigDialog($panel));
 
         $list.on('click', '[data-action="sum-toggle"]', function () {
@@ -4479,7 +4746,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 s.moduleApi[mk].presetId = s.api.presets?.[0]?.id || '';
             }
             saveSettings();
-            renderSettingsPanel($panel);
+            const $row = $(this).closest('.ow-row');
+            $row.find('.ow-mapi-preset').prop('disabled', s.moduleApi[mk].mode !== 'preset');
         });
         $panel.off('change', '.ow-mapi-preset').on('change', '.ow-mapi-preset', function () {
             const mk = $(this).data('module');
@@ -4551,7 +4819,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             for (const k of Object.keys(s.moduleApi || {})) {
                 if (s.moduleApi[k].presetId === p.id) { s.moduleApi[k].mode = 'system'; s.moduleApi[k].presetId = ''; }
             }
-            saveSettings(); renderSettingsPanel($panel);
+            saveSettings(); renderApiPresets($panel);
         });
         $box.off('click', '[data-action="api-test"]').on('click', '[data-action="api-test"]', async function () {
             const p = find(this);
@@ -4585,7 +4853,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_api_add').off('click').on('click', function () {
             s.api.presets = s.api.presets || [];
             s.api.presets.push({ id: `api_${Date.now().toString(36)}`, name: `预设 ${s.api.presets.length + 1}`, url: '', key: '', model: '', modelList: [] });
-            saveSettings(); renderSettingsPanel($panel);
+            saveSettings(); renderApiPresets($panel);
         });
     }
 
@@ -4649,6 +4917,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const html = [
           group('api', 'fa-plug', 'API 预设',
             `<div class="ow-muted" style="margin-bottom:6px;">维护多套 API，各模块在自己的分组里选择。Key 明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+             <div class="ow-row"><label><input type="checkbox" id="ow_api_stream" ${s.api.stream ? 'checked' : ''}> 使用流式请求</label>
+               <span class="ow-muted">默认非流式；某些服务只支持流式时再开</span></div>
              <div id="ow_api_presets"></div>
              <div class="ow-row"><button class="ow-btn ow-primary" id="ow_api_add">+ 新建预设</button></div>`, true),
 
@@ -4665,6 +4935,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             </div>
             <div class="ow-field-label">上下文</div>
             <div class="ow-row"><label>获取最近 <input type="number" class="ow-input ow-num" id="ow_history_depth" min="0" value="${s.historyDepth}"> 楼聊天记录</label></div>
+            <div class="ow-row"><label>回避最新 <input type="number" class="ow-input ow-num" id="ow_backoff" min="0" value="${s.floorBackoff ?? 0}"> 层</label>
+              <span class="ow-muted">0＝读到最新一层；调大可给重 roll 留余地</span></div>
             ${moduleApiRow('widgets', '使用的 API')}
             <div class="ow-field-label">注入正文</div>
             <div class="ow-row">
@@ -4689,6 +4961,18 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <label>获取最近 <input type="number" class="ow-input ow-num" id="ow_off_history_depth" min="0" value="${so.historyDepth}" ${tblFollow ? 'disabled' : ''}> 楼聊天记录</label>
               ${tblFollow ? '<span class="ow-muted">已跟随组件设置</span>' : ''}
             </div>
+            <div class="ow-row ${tblFollow ? 'ow-disabled' : ''}">
+              <label>回避最新 <input type="number" class="ow-input ow-num" id="ow_off_backoff" min="0" value="${so.floorBackoff ?? 2}" ${tblFollow ? 'disabled' : ''}> 层</label>
+            </div>
+            <div class="ow-field-label">首次接入老聊天时</div>
+            <div class="ow-row">
+              <select class="ow-select" id="ow_off_newchat">
+                <option value="ask" ${(so.newChatBehavior || 'ask') === 'ask' ? 'selected' : ''}>弹窗询问</option>
+                <option value="manual" ${so.newChatBehavior === 'manual' ? 'selected' : ''}>跳过，改为手动</option>
+                <option value="auto" ${so.newChatBehavior === 'auto' ? 'selected' : ''}>直接自动生成</option>
+              </select>
+              <span class="ow-muted">避免打开老聊天就自动生成一堆表格</span>
+            </div>
             ${moduleApiRow('tables', '使用的 API', tblFollow, tblFollow ? '已跟随组件设置' : '')}
             <div class="ow-field-label">注入正文</div>
             <div class="ow-row">
@@ -4699,6 +4983,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
           group('plot', 'fa-code-branch', '剧情推演', `
             <div class="ow-field-label">上下文</div>
             <div class="ow-row"><label>获取最近 <input type="number" class="ow-input ow-num" id="ow_plot_history" min="0" value="${s.plot.historyDepth}"> 楼聊天记录</label></div>
+            <div class="ow-row"><label>回避最新 <input type="number" class="ow-input ow-num" id="ow_plot_backoff" min="0" value="${s.plot.floorBackoff ?? 0}"> 层</label></div>
             <div class="ow-row"><label>至少生成 <input type="number" class="ow-input ow-num" id="ow_plot_min" min="2" value="${s.plot.minEvents}"> 个事件节点</label></div>
             <div class="ow-field-label">生成</div>
             <div class="ow-row"><label><input type="checkbox" id="ow_plot_send_current" ${s.plot.sendCurrent ? 'checked' : ''}> 生成时发送当前推演</label></div>
@@ -4766,6 +5051,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             `<div id="ow_inject_overview"></div><div class="ow-row"><button class="ow-btn" id="ow_inject_refresh"><i class="fa-solid fa-rotate"></i> 刷新</button></div>`),
 
           group('theme', 'fa-palette', '主题', `
+            <div class="ow-field-label">组件预览高度上限</div>
+            <div class="ow-row">
+              <select class="ow-select" id="ow_preview_maxh">
+                <option value="short" ${s.previewMaxHeight === 'short' ? 'selected' : ''}>较矮（40% 屏高）</option>
+                <option value="mid" ${(s.previewMaxHeight || 'mid') === 'mid' ? 'selected' : ''}>适中（60% 屏高）</option>
+                <option value="tall" ${s.previewMaxHeight === 'tall' ? 'selected' : ''}>较高（85% 屏高）</option>
+                <option value="full" ${s.previewMaxHeight === 'full' ? 'selected' : ''}>不限（内容多高就多高）</option>
+              </select>
+              <span class="ow-muted">超出部分在预览框内滚动，功能栏保持可见</span>
+            </div>
             <div class="ow-row">
               <label><input type="radio" name="ow_theme_mode" value="system" ${s.theme.mode === 'system' ? 'checked' : ''}> 跟随酒馆</label>
               <label><input type="radio" name="ow_theme_mode" value="custom" ${s.theme.mode === 'custom' ? 'checked' : ''}> 自定义 CSS</label>
@@ -4815,7 +5110,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             saveSettings();
             if ($modal) renderSummaryPanel($modal.find('.ow-panel[data-panel="summary"]'));
         });
-        $panel.find('input[name="ow_sum_cmode"]').on('change', function () { s.summary.compressMode = $(this).val(); saveSettings(); renderSettingsPanel($panel); });
+        $panel.find('input[name="ow_sum_cmode"]').on('change', function () {
+            s.summary.compressMode = $(this).val();
+            saveSettings();
+            $panel.find('#ow_sum_lag').prop('disabled', s.summary.compressMode !== 'auto');
+        });
         $panel.find('#ow_sum_lag').on('change', function () { s.summary.compressLag = Math.max(1, Number($(this).val()) || 5); saveSettings(); });
         $panel.find('#ow_sum_inject').on('change', function () { s.summary.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); });
         $panel.find('#ow_sum_inject_depth').on('change', function () { s.summary.injectDepth = Number($(this).val()) || 0; saveSettings(); updateInjections(); });
@@ -4846,12 +5145,17 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('input[name="ow_off_trigger"]').on('change', function () {
             s.offscreen.triggerMode = $(this).val();
             saveSettings();
-            renderSettingsPanel($panel);
+            const on = s.offscreen.triggerMode === 'auto';
+            const $g = $panel.find('.ow-group[data-group="tables"]');
+            $g.find('.ow-sub-fields').toggleClass('ow-disabled', !on).find('input').prop('disabled', !on);
         });
         $panel.find('input[name="ow_off_automode"]').on('change', function () {
             s.offscreen.autoMode = $(this).val();
             saveSettings();
-            renderSettingsPanel($panel);
+            const follow = s.offscreen.autoMode === 'follow';
+            $panel.find('#ow_off_floor_n').prop('disabled', follow);
+            $panel.find('#ow_off_history_depth').prop('disabled', follow);
+            $panel.find('#ow_off_backoff').prop('disabled', follow);
         });
         $panel.find('#ow_off_floor_n').on('change', function () {
             s.offscreen.floorInterval = Math.max(1, Number($(this).val()) || 1);
@@ -4877,11 +5181,17 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             }
             toast('没找到扩展管理器入口，请手动打开酒馆左侧「扩展」面板 → Manage extensions', 'warning');
         });
+        $panel.find('#ow_backoff').on('change', function () { s.floorBackoff = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_off_backoff').on('change', function () { s.offscreen.floorBackoff = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_plot_backoff').on('change', function () { s.plot.floorBackoff = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
+        $panel.find('#ow_off_newchat').on('change', function () { s.offscreen.newChatBehavior = $(this).val(); saveSettings(); });
+        $panel.find('#ow_api_stream').on('change', function () { s.api.stream = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_wi_rc').on('change', function () {
             s.wiReverseControl.enabled = $(this).is(':checked');
             saveSettings();
-            renderSettingsPanel($panel);
+            const on = s.wiReverseControl.enabled;
+            $panel.find('#ow_wi_rc_auto, #ow_wi_rc_apply').prop('disabled', !on);
         });
         $panel.find('#ow_wi_rc_auto').on('change', function () { s.wiReverseControl.autoApply = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_wi_rc_apply').on('click', async function () {
@@ -4909,6 +5219,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             saveSettings();
             $panel.find('#ow_custom_theme_fields').toggle(s.theme.mode === 'custom');
             applyTheme();
+        });
+        $panel.find('#ow_preview_maxh').on('change', function () {
+            s.previewMaxHeight = $(this).val();
+            saveSettings();
+            if ($modal) renderWidgetsPanel($modal.find('.ow-panel[data-panel="widgets"]'));
         });
         $panel.find('#ow_theme_save').on('click', function () {
             s.theme.customCss = $panel.find('#ow_theme_css').val();

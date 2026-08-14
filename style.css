@@ -513,6 +513,8 @@
 
 /* ------------------------------------------------------------ 组件预览结果 */
 .ow-result-frame-wrap {
+    display: flex;
+    flex-direction: column;
     border: 1px solid var(--ow-border);
     border-radius: var(--ow-radius-sm);
     overflow: hidden;
@@ -543,7 +545,11 @@
 .ow-result-frame {
     display: block;
     width: 100%;
+    /* 上限由 --ow-frame-max 控制（脚本按内容高度与上限取小值设定 height），
+       内容超出时滚动条出现在 iframe 内部，外层面板不再被撑长，
+       这样功能栏就一直贴在这个框的顶部，不会被滚走。 */
     height: 420px;
+    max-height: var(--ow-frame-max, 60vh);
     border: none;
     background: #fff;
     transition: height 0.18s ease;
@@ -899,13 +905,13 @@
 .ow-dir-del:hover { opacity: 1; color: #e5787d; }
 
 /* ---- 组件预览：折叠 + 头部常驻 ---- */
+/* 功能栏固定在预览框自己的顶部：内容滚动发生在 iframe 内部，
+   所以这里不需要 sticky，普通流式布局就一直可见。 */
 .ow-result-head {
-    /* 滚动查看长预览时标题与按钮保持可见 */
-    position: sticky;
-    top: 42px;
-    z-index: 4;
-    background: var(--SmartThemeBlurTintColor, #1e1e1e);
-    backdrop-filter: blur(6px);
+    position: relative;
+    z-index: 2;
+    background: var(--ow-surface-2);
+    flex: 0 0 auto;
 }
 
 .ow-result-title {
@@ -925,7 +931,7 @@
 .ow-result-caret { font-size: 11px; }
 
 .ow-preview-collapsed .ow-result-frame { display: none; }
-.ow-preview-collapsed .ow-result-head { position: static; }
+
 
 /* ---- 设置分组折叠 ---- */
 .ow-group-title { cursor: pointer; user-select: none; }
@@ -934,3 +940,46 @@
 .ow-group-collapsed .ow-group-title { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
 .ow-group-collapsed .ow-group-body { display: none; }
 .ow-group-body { padding-top: 4px; }
+
+
+/* 全屏时铺满，不受高度上限约束 */
+.ow-result-frame:fullscreen,
+.ow-result-frame:-webkit-full-screen {
+    max-height: none !important;
+    height: 100vh !important;
+}
+
+/* 预览高度上限：可在设置里调 */
+.ow-result-frame-wrap[data-maxh="short"] .ow-result-frame { --ow-frame-max: 40vh; }
+.ow-result-frame-wrap[data-maxh="mid"] .ow-result-frame { --ow-frame-max: 60vh; }
+.ow-result-frame-wrap[data-maxh="tall"] .ow-result-frame { --ow-frame-max: 85vh; }
+.ow-result-frame-wrap[data-maxh="full"] .ow-result-frame { --ow-frame-max: none; }
+
+/* ---- 穿梭框（新建组件·预设提取）---- */
+.ow-transfer { display: flex; gap: 10px; align-items: stretch; margin-top: 6px; }
+.ow-transfer-col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.ow-transfer-mid { display: flex; flex-direction: column; justify-content: center; gap: 8px; flex: 0 0 auto; }
+.ow-transfer-head { font-size: 12px; color: var(--ow-text-dim); padding: 6px 2px; }
+.ow-transfer-list {
+    flex: 1 1 auto;
+    min-height: 220px;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--ow-border);
+    border-radius: var(--ow-radius-sm);
+    background: var(--ow-surface);
+    padding: 4px;
+}
+.ow-transfer-item {
+    display: flex; align-items: center; gap: 7px;
+    padding: 5px 7px; border-radius: 5px; cursor: pointer; font-size: 12.5px;
+}
+.ow-transfer-item:hover { background: var(--ow-surface-2); }
+.ow-transfer-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ow-transfer-item input { accent-color: var(--ow-accent); flex: 0 0 auto; }
+.ow-transfer-item.ow-chosen { opacity: 0.45; }
+@media (max-width: 620px) {
+    .ow-transfer { flex-direction: column; }
+    .ow-transfer-mid { flex-direction: row; justify-content: center; }
+    .ow-transfer-list { min-height: 140px; }
+}
