@@ -1,0 +1,13 @@
+{
+  "name": "ego-assistant",
+  "version": "3.1.0",
+  "private": true,
+  "description": "SillyTavern 扩展：组件生成 / 表格 / 剧情推演 / 总结 / 本聊天设定",
+  "scripts": {
+    "test": "node tests/run-all.cjs",
+    "test:install": "npm install --no-save jsdom jquery",
+    "version:sync": "node scripts/sync-version.mjs",
+    "check": "node scripts/sync-version.mjs && node tests/run-all.cjs"
+  },
+  "homepage": "https://github.com/houlidong0321-netizen/st-offscreen-widgets"
+}
