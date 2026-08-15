@@ -14,17 +14,36 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '3.2.0';
+    const EXT_VERSION = '3.2.2';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
+    /**
+     * 从自身脚本 URL 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
+     *
+     * 两种安装位置在磁盘上不同，但通过 HTTP 访问时共用同一个 URL 前缀
+     * （见酒馆 src/users.js 的 /scripts/extensions/third-party/* 路由）：
+     *   只装给自己 → data/<用户>/extensions/<名字>        接口参数 global:false
+     *   装给所有人 → public/scripts/extensions/third-party/<名字>  接口参数 global:true
+     * 所以只能靠"两种都试一遍"来判断，见 checkExtensionUpdate。
+     *
+     * 服务端会 sanitize(extensionName) 后与对应根目录 join，因此这里要给的是
+     * **纯文件夹名**：不能带 "third-party/" 前缀，sanitize 会把斜杠删掉拼成
+     * "third-partyXXX" 从而 404。
+     */
     function getExtensionIdParam() {
         try {
             const url = new URL(import.meta.url);
-            const match = url.pathname.match(/\/extensions\/(third-party\/[^/]+)\//);
-            if (match) return match[1].replace('third-party', '');
-        } catch (e) { /* 忽略，走回退值 */ }
-        return '/st-offscreen-widgets'; // 回退：按本仓库默认安装文件夹名推断
+            // 形如 /scripts/extensions/third-party/<folder>/index.js
+            // 早先的正则要求 <folder> 后面还有 "/"，脚本直接位于该目录下时匹配不到。
+            const m = url.pathname.match(/\/extensions\/third-party\/([^/]+)\//);
+            if (m) return m[1];
+            // 兜底：取路径里最后一个目录名
+            const parts = url.pathname.split('/').filter(Boolean);
+            if (parts.length >= 2) return parts[parts.length - 2];
+        } catch (e) { /* 落到下面的回退 */ }
+        return 'ego-assistant';
     }
+
     const EXTENSION_ID_PARAM = getExtensionIdParam();
 
     // 更新状态缓存，供菜单角标 / 弹窗内横幅 / 设置页状态区共用，避免重复请求
@@ -36,46 +55,52 @@
         currentBranchName: '',
         remoteUrl: '',
         global: false,
+        notFound: false,
     };
 
     async function checkExtensionUpdate({ quiet = false } = {}) {
         if (updateState.checking) return updateState;
         updateState.checking = true;
+        updateState.notFound = false;
         try {
             const c = ctx();
             const headers = c.getRequestHeaders ? c.getRequestHeaders() : { 'Content-Type': 'application/json' };
-            // 全局扩展与用户扩展在前端 URL 上是同一个 /scripts/extensions/third-party/ 路径，
-            // 无法从路径分辨，因此两种都试一遍：先当作用户扩展，再当作全局扩展。
+            let sawNotFound = false;
             let lastErr = '';
             for (const isGlobal of [false, true]) {
                 try {
                     const res = await fetch('/api/extensions/version', {
-                        method: 'POST',
-                        headers,
+                        method: 'POST', headers,
                         body: JSON.stringify({ extensionName: EXTENSION_ID_PARAM, global: isGlobal }),
                     });
-                    if (!res.ok) {
-                        lastErr = `HTTP ${res.status}`;
-                        log('debug', 'system', `更新检查（global=${isGlobal}）返回 ${res.status}，尝试下一种安装方式`);
+                    if (res.status === 404) {
+                        // 目录名对不上 —— 不是"不是 git 仓库"，别报错误的结论
+                        sawNotFound = true;
+                        lastErr = 'HTTP 404';
                         continue;
                     }
+                    if (!res.ok) { lastErr = `HTTP ${res.status}`; continue; }
                     const data = await res.json();
                     updateState.checked = true;
                     updateState.global = isGlobal;
+                    updateState.installKind = isGlobal ? '全局（所有用户）' : '当前用户';
                     updateState.isUpToDate = !!data.isUpToDate;
                     updateState.currentCommitHash = data.currentCommitHash || '';
                     updateState.currentBranchName = data.currentBranchName || '';
                     updateState.remoteUrl = data.remoteUrl || '';
                     if (!quiet) {
-                        log('info', 'system', `扩展更新检查完成（${isGlobal ? '全局' : '用户'}扩展）：${updateState.isUpToDate ? '已是最新版本' : '发现新版本'}（本地提交 ${updateState.currentCommitHash.slice(0, 7) || '未知'}）`, data);
+                        log('info', 'system', `扩展更新检查完成（${isGlobal ? '全局' : '用户'}扩展，目录名 ${EXTENSION_ID_PARAM}）：${updateState.isUpToDate ? '已是最新版本' : '发现新版本'}`, data);
                     }
                     return updateState;
                 } catch (err) {
                     lastErr = err.message || String(err);
-                    log('debug', 'system', `更新检查请求出错（global=${isGlobal}）：${lastErr}`);
                 }
             }
-            log('warn', 'system', `更新检查未成功（用户扩展与全局扩展两种方式都失败，最后错误：${lastErr}）。extensionName=${EXTENSION_ID_PARAM}。若安装目录名与仓库名不同，或不是用 Git 地址安装的，就会出现这种情况。`);
+            updateState.notFound = sawNotFound;
+            log('warn', 'system',
+                sawNotFound
+                    ? `更新检查失败：酒馆在扩展目录里找不到名为「${EXTENSION_ID_PARAM}」的文件夹（HTTP 404）。\n这通常说明推导出的目录名和实际安装目录不一致。请到「关于/更新」点「显示诊断」，日志里会打印实际路径。`
+                    : `更新检查未成功（用户扩展与全局扩展两种方式都失败，最后错误：${lastErr}）。extensionName=${EXTENSION_ID_PARAM}`);
         } finally {
             updateState.checking = false;
             updateMenuBadge();
@@ -2693,6 +2718,9 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 return { position: c.position, overflow: c.overflow, transform: c.transform, filter: c.filter, width: c.width, height: c.height };
             })(),
             挂载父节点: ov?.parentElement?.tagName || '未知',
+            本扩展加载路径: (() => { try { return new URL(import.meta.url).pathname; } catch (e) { return '未知'; } })(),
+            推导出的目录名: EXTENSION_ID_PARAM,
+            判定的安装位置: updateState.installKind || '（尚未检查更新）',
         };
         log('info', 'ui', '弹窗几何诊断（若界面显示不出来，请把这条日志发给开发者）', info);
         return info;
@@ -3449,6 +3477,14 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const $status = $panel.find('#ow_update_status');
         if (!$status.length) return;
 
+        if (updateState.notFound) {
+            $status.html(`酒馆找不到名为 <code>${escapeHtml(EXTENSION_ID_PARAM)}</code> 的扩展目录（HTTP 404）。<br>
+                <span class="ow-muted">推导出的目录名和实际安装目录对不上。两种安装位置分别是：<br>
+                · 只装给自己：<code>SillyTavern/data/&lt;用户&gt;/extensions/&lt;目录名&gt;</code><br>
+                · 装给所有人：<code>SillyTavern/public/scripts/extensions/third-party/&lt;目录名&gt;</code><br>
+                把该目录改名成上面显示的名字即可。点下方「显示诊断」可以看到实际加载路径。</span>`);
+            return;
+        }
         if (!updateState.checked) {
             $status.html(`未能获取版本信息。<br>
                 <span class="ow-muted">尝试的 extensionName：<code>${escapeHtml(EXTENSION_ID_PARAM)}</code>（用户扩展与全局扩展两种方式都试过了）。
@@ -3463,7 +3499,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 解决办法：卸载后用「Install extension」粘贴仓库地址重装，之后就能自动更新了。</span>`);
             return;
         }
-        const where = updateState.global ? '全局扩展' : '用户扩展';
+        const where = updateState.installKind || (updateState.global ? '全局（所有用户）' : '当前用户');
         if (updateState.isUpToDate) {
             $status.html(`✅ 已是最新版本 <span class="ow-muted">（${where} · ${escapeHtml(shortHash)}${updateState.currentBranchName ? ' · ' + escapeHtml(updateState.currentBranchName) : ''}）</span>`);
             updateMenuBadge();

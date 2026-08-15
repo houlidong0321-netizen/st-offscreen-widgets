@@ -36,6 +36,8 @@ function findModule(name) {
  * @param {string[]} opts.activeBooks  酒馆里"已激活"的世界书名（填进 #world_info）
  * @param {function} opts.fetch       自定义 fetch
  * @param {string}   opts.url         页面地址（测 https/CORS 判断时有用）
+ * @param {string}   opts.folder      模拟的扩展安装目录名
+ * @param {string}   opts.scriptUrl   直接指定 import.meta.url（优先于 folder）
  */
 function boot(opts = {}) {
     const { JSDOM } = require(findModule('jsdom'));
@@ -101,7 +103,8 @@ function boot(opts = {}) {
     const expose = opts.expose || [];
     const src = fs.readFileSync(INDEX, 'utf8')
         .replace(/import\.meta\.url/g,
-            JSON.stringify((opts.url || 'http://localhost/') + 'scripts/extensions/third-party/ego-assistant/index.js'))
+            JSON.stringify(opts.scriptUrl
+                || (opts.url || 'http://localhost/') + `scripts/extensions/third-party/${opts.folder || 'ego-assistant'}/index.js`))
         .replace(/\}\)\(\);\s*$/,
             `  window.__T={${expose.join(',')}};\n})();`);
 
