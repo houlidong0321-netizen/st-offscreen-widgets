@@ -19,9 +19,10 @@ for (const f of files) {
         process.stdout.write(out);
         const m = /(\d+) 通过, (\d+) 失败/.exec(out);
         if (m) { totalPass += +m[1]; totalFail += +m[2]; }
-        if (/[1-9]\d* 失败/.test(out)) failed++;
+        else { failed++; console.error(`!! ${f} 没有输出统计行，可能中途崩了`); }
+        if (m && +m[2] > 0) failed++;
     } catch (e) {
-        failed++;
+        failed++; totalFail++;
         process.stdout.write(String(e.stdout || ''));
         console.error(`\n!! ${f} 执行出错:\n${String(e.stderr || e.message).split('\n').slice(0, 6).join('\n')}`);
     }

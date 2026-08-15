@@ -40,6 +40,36 @@ const { boot, tick, check, summary } = require('./harness.cjs');
     await T.applyReverseWorldInfo();
     check('不碰未设定过的条目', BOOK.entries['0'].disable === true);
 
+    // 两套状态必须分离：勾选只改"扩展发送清单"，不动"写回酒馆的快照"
+    const app4 = boot({
+        activeBooks: ['书B'],
+        context: { loadWorldInfo: async () => ({ entries: {
+            '0': { uid: 0, comment: '甲', content: 'A', disable: false },
+            '1': { uid: 1, comment: '乙', content: 'B', disable: false },
+        } }) },
+        expose: ['settings','chatData','fetchWorldInfoEntriesForManagement','saveWiStateToChat','applyReverseWorldInfo','wiPendingDiff','isWorldInfoEntrySendEnabled'],
+    });
+    await tick();
+    const T4 = app4.T(); const s4 = T4.settings();
+    const ents = await T4.fetchWorldInfoEntriesForManagement();
+
+    // 应用一次：把当前勾选固化成快照
+    s4.worldInfoOverrides['书B::0'] = true;
+    s4.worldInfoOverrides['书B::1'] = false;
+    T4.saveWiStateToChat(ents);
+    const snapAfterApply = JSON.stringify(T4.chatData().wiState);
+    check('应用后快照已固化', T4.chatData().wiState['书B::1'] === false);
+
+    // 之后再改勾选 —— 快照不能跟着变
+    s4.worldInfoOverrides['书B::1'] = true;
+    check('后续勾选不污染快照', JSON.stringify(T4.chatData().wiState) === snapAfterApply);
+    check('但扩展发送清单已变', T4.isWorldInfoEntrySendEnabled(s4, '书B', '1', false) === true);
+    check('提示存在未应用的改动', T4.wiPendingDiff(ents).length === 1, T4.wiPendingDiff(ents).join(','));
+
+    // 再点一次应用，两者才重新一致
+    T4.saveWiStateToChat(ents);
+    check('再次应用后差异清零', T4.wiPendingDiff(ents).length === 0);
+
     // ---- API ----
     let sent = null;
     const app2 = boot({

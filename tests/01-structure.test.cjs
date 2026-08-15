@@ -31,7 +31,7 @@ const { boot, tick, check, summary, syntaxCheckSource, readSource } = require('.
     app.$(btn).trigger('click');
     await tick(300);
 
-    for (const p of ['widgets', 'offscreen', 'plot', 'summary', 'lore', 'favorites', 'settings']) {
+    for (const p of ['widgets', 'offscreen', 'plot', 'summary', 'favorites', 'settings']) {
         const el = app.window.document.querySelector(`.ow-panel[data-panel="${p}"]`);
         const len = el ? el.innerHTML.trim().length : -1;
         check(`面板渲染 ${p}`, len > 100, `${len} 字符`);
@@ -39,8 +39,8 @@ const { boot, tick, check, summary, syntaxCheckSource, readSource } = require('.
 
     // 设置分组顺序
     const groups = [...app.window.document.querySelectorAll('.ow-group')].map((g) => g.dataset.group);
-    const want = ['api', 'widgets', 'tables', 'plot', 'summary', 'lore', 'worldinfo', 'prompts', 'log'];
-    check('设置分组顺序正确', JSON.stringify(groups.slice(0, 9)) === JSON.stringify(want), groups.join(','));
+    const want = ['api', 'widgets', 'tables', 'plot', 'summary', 'worldinfo', 'prompts', 'log'];
+    check('设置分组顺序正确', JSON.stringify(groups.slice(0, 8)) === JSON.stringify(want), groups.join(','));
 
     summary('[01] 结构与完整性');
 })();

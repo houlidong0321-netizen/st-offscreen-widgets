@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '3.1.0';
+    const EXT_VERSION = '3.2.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     function getExtensionIdParam() {
@@ -181,7 +181,6 @@
     const INJECT_KEY_OFFSCREEN = `${MODULE_NAME}_offscreen`;
     const INJECT_KEY_PLOT = `${MODULE_NAME}_plot`;
     const INJECT_KEY_SUMMARY = `${MODULE_NAME}_summary`;
-    const INJECT_KEY_LORE = `${MODULE_NAME}_lore`;
 
     // 日志：只存内存（刷新即清空），出问题时可复制给开发者排查。
     const MAX_LOGS = 300;
@@ -269,11 +268,6 @@
         offscreenTables: defaultOffscreenTables(),
         // 收藏夹：跨聊天全局保存，folders 为文件夹，items 为收藏的组件快照
         favorites: { folders: [{ id: 'default', name: '默认收藏夹', createdAt: Date.now() }], items: [] },
-        // 本聊天专属设定（只在当前聊天生效，不会污染角色卡世界书）
-        lore: {
-            injectEnabled: true,
-            scanDepth: 10,   // 关键词触发时向前扫描多少层聊天
-        },
         // 总结
         summary: {
             enabled: false,
@@ -408,11 +402,6 @@
             }
         }
         if (!c.chatMetadata[MODULE_NAME].wiState) c.chatMetadata[MODULE_NAME].wiState = {};
-        // 本聊天专属设定
-        if (!c.chatMetadata[MODULE_NAME].lore) {
-            c.chatMetadata[MODULE_NAME].lore = { entries: [] };
-        }
-        if (!Array.isArray(c.chatMetadata[MODULE_NAME].lore.entries)) c.chatMetadata[MODULE_NAME].lore.entries = [];
         // 总结状态
         if (!c.chatMetadata[MODULE_NAME].summary) {
             c.chatMetadata[MODULE_NAME].summary = { index: [], bigSummaries: [], hidden: [], scannedAt: null };
@@ -667,72 +656,6 @@
             ? '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容，在已有表格基础上做增量更新，输出包含全部保留行的完整表格。'
             : '请结合当前故事所处的时间点（季节/月份/星期/节日，从聊天记录与世界书中推断）与最新正文内容生成以上表格。');
         return parts.join('\n\n');
-    }
-
-    // 本聊天专属设定：存在 chatMetadata，只对当前聊天生效，不影响角色卡世界书。
-    const LORE_TYPES = [
-        { id: 'setting', name: '世界设定' },
-        { id: 'npc', name: 'NPC' },
-        { id: 'persona', name: '用户人设' },
-        { id: 'other', name: '其他' },
-    ];
-
-    function loreTypeName(id) {
-        return LORE_TYPES.find((t) => t.id === id)?.name || '其他';
-    }
-
-    function loreEntries() {
-        return chatData().lore.entries;
-    }
-
-    /** 关键词触发：留空=常驻注入；填了=最近若干层聊天里出现才注入 */
-    function isLoreEntryActive(entry, recentText) {
-        if (entry.enabled === false) return false;
-        const kws = String(entry.keywords || '').split(/[,，;；\n]/).map((x) => x.trim()).filter(Boolean);
-        if (!kws.length) return true;
-        return kws.some((k) => recentText.includes(k));
-    }
-
-    /**
-     * 按注入位置把生效的设定条目分组。
-     * 每条可以单独指定位置/深度（像世界书那样），没指定的用模块默认值。
-     * 返回 [{position, depth, text}]
-     */
-    function buildLoreInjectionGroups() {
-        const s = settings();
-        const list = loreEntries();
-        if (!list.length) return [];
-        const chat = ctx().chat || [];
-        const depth = Math.max(1, Number(s.lore.scanDepth) || 10);
-        const recentText = chat.slice(-depth).map((m) => String(m.mes || '')).join('\n');
-
-        const active = list.filter((e) => isLoreEntryActive(e, recentText));
-        const skipped = list.length - active.length;
-        if (skipped > 0) log('debug', 'inject', `本聊天设定：生效 ${active.length} 条，${skipped} 条因未启用或关键词未命中而跳过`);
-        if (!active.length) return [];
-
-        const groups = new Map();
-        for (const e of active) {
-            const dep = Number(e.depth) || 0;
-            if (!groups.has(dep)) groups.set(dep, { depth: dep, items: [] });
-            groups.get(dep).items.push(e);
-        }
-        return [...groups.values()].map((g) => {
-            const byType = {};
-            for (const e of g.items) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
-            const parts = [];
-            for (const t of LORE_TYPES) {
-                const arr = byType[t.id];
-                if (!arr?.length) continue;
-                parts.push(`【${t.name}】\n` + arr.map((e) => `· ${e.name}：${e.content}`).join('\n'));
-            }
-            return { depth: g.depth, text: parts.join('\n\n') };
-        }).filter((g) => g.text).sort((a, b) => a.depth - b.depth);
-    }
-
-    /** 合并成一段纯文本（注入总览用） */
-    function buildLoreInjectionText() {
-        return buildLoreInjectionGroups().map((g) => g.text).join('\n\n');
     }
 
     // 总结模块：模型按模板直接产出完整档案文本，扩展原样保存，可重新生成 / 压缩 / 还原。
@@ -2298,13 +2221,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (text) setInjection('tables', `[表格参考信息，仅用于保持世界的连贯性，不要直接照搬描述：\n${text}]`, s.offscreen.injectDepth);
         }
 
-        // 本聊天设定：每条可有自己的位置/深度/顺序，按三者分组
-        if (s.lore.injectEnabled) {
-            buildLoreInjectionGroups().slice(0, 12).forEach((g, i) => {
-                setInjection(`lore${i}`, `[本场景专属设定（请严格遵守，但不要在正文中直接复述本段）：\n${g.text}]`, g.depth);
-            });
-        }
-
         // 历史总结
         if (s.summary.injectEnabled) {
             const txt = renderAllSummariesText();
@@ -2634,7 +2550,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <div class="ow-tab" data-tab="offscreen">表格生成</div>
               <div class="ow-tab" data-tab="plot">剧情推演</div>
               <div class="ow-tab" data-tab="summary">总结</div>
-              <div class="ow-tab" data-tab="lore">设定</div>
               <div class="ow-tab" data-tab="favorites">收藏夹</div>
               <div class="ow-tab" data-tab="settings">设置</div>
             </div>
@@ -2642,7 +2557,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <div class="ow-panel" data-panel="offscreen"></div>
             <div class="ow-panel" data-panel="plot"></div>
             <div class="ow-panel" data-panel="summary"></div>
-            <div class="ow-panel" data-panel="lore"></div>
             <div class="ow-panel" data-panel="favorites"></div>
             <div class="ow-panel" data-panel="settings"></div>
           </div>
@@ -2685,7 +2599,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             ['offscreen', renderOffscreenPanel],
             ['plot', renderPlotPanel],
             ['summary', renderSummaryPanel],
-            ['lore', renderLorePanel],
             ['favorites', renderFavoritesPanel],
             ['settings', renderSettingsPanel],
         ];
@@ -4119,106 +4032,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         });
     }
 
-    // ---------------- 本聊天设定面板 ----------------
-    function renderLorePanel($panel) {
-        const s = settings();
-        const list = loreEntries();
-        const chat = ctx().chat || [];
-        const recentText = chat.slice(-Math.max(1, Number(s.lore.scanDepth) || 10)).map((m) => String(m.mes || '')).join('\n');
-        const activeN = list.filter((e) => isLoreEntryActive(e, recentText)).length;
-
-        $panel.html(`
-        <div class="ow-panel-bar">
-          <div class="ow-row" style="margin:0;">
-            <button class="ow-btn ow-primary" id="ow_lore_add"><i class="fa-solid fa-plus"></i> 新建设定</button>
-            <span class="ow-muted">${list.length} 条 · 当前生效 ${activeN} 条${s.lore.injectEnabled ? '' : ' · <b>注入已关闭</b>'}</span>
-          </div>
-          <span class="ow-muted">只属于当前聊天</span>
-        </div>
-        <div class="ow-hint">这些设定只存在这个聊天里，换聊天/换角色都看不到，也不会写进角色卡世界书。<br>
-        关键词留空＝常驻注入；填了关键词＝最近若干层聊天里出现该词才注入（省 token）。</div>
-        <div id="ow_lore_list"></div>`);
-
-        const $list = $panel.find('#ow_lore_list');
-        if (!list.length) {
-            $list.html('<div class="ow-empty">还没有设定。点上方「新建设定」，可以写只属于这个聊天的世界设定、NPC 或用户人设。</div>');
-        } else {
-            const byType = {};
-            for (const e of list) (byType[e.type || 'other'] = byType[e.type || 'other'] || []).push(e);
-            let html = '';
-            for (const t of LORE_TYPES) {
-                const arr = byType[t.id];
-                if (!arr?.length) continue;
-                html += `<div class="ow-section-title">${t.name}（${arr.length}）</div>`;
-                html += arr.map((e) => {
-                    const active = isLoreEntryActive(e, recentText);
-                    return `
-                  <div class="ow-widget-card ow-collapsed" data-lid="${escapeHtml(e.id)}">
-                    <div class="ow-widget-card-head">
-                      <span class="ow-caret" data-action="lore-toggle"><i class="fa-solid fa-chevron-right"></i></span>
-                      <label class="ow-switch" title="启用/停用">
-                        <input type="checkbox" class="ow-lore-on" ${e.enabled !== false ? 'checked' : ''}><span class="ow-switch-track"></span>
-                      </label>
-                      <span class="ow-widget-name" data-action="lore-toggle">${escapeHtml(e.name || '未命名')}</span>
-                      <span class="ow-muted ow-widget-meta">${e.keywords ? `关键词：${escapeHtml(String(e.keywords).slice(0, 16))}` : '常驻'} · 深度${e.depth ?? 0}${e.enabled !== false ? (active ? '' : ' · 未命中') : ''}</span>
-                      <span class="ow-spacer"></span>
-                      <button class="ow-btn ow-danger" data-action="lore-del"><i class="fa-solid fa-trash"></i></button>
-                    </div>
-                    <div class="ow-widget-card-body">
-                      <div class="ow-field-label">名称</div>
-                      <input type="text" class="ow-input ow-lore-name" value="${escapeHtml(e.name || '')}">
-                      <div class="ow-field-label">分类</div>
-                      <select class="ow-select ow-lore-type">
-                        ${LORE_TYPES.map((t2) => `<option value="${t2.id}" ${((e.type || 'other') === t2.id) ? 'selected' : ''}>${t2.name}</option>`).join('')}
-                      </select>
-                      <div class="ow-field-label">内容</div>
-                      <textarea class="ow-textarea ow-lore-content" style="min-height:120px;">${escapeHtml(e.content || '')}</textarea>
-                      <div class="ow-field-label">关键词（可选，逗号分隔；留空＝常驻注入）</div>
-                      <input type="text" class="ow-input ow-lore-kw" value="${escapeHtml(e.keywords || '')}" placeholder="例：林医生, 医院, 白大褂">
-                      <div class="ow-field-label">注入深度</div>
-                      <div class="ow-row">
-                        <input type="number" class="ow-input ow-num ow-lore-edepth" min="0" value="${e.depth ?? 0}">
-                        <span class="ow-muted">数字越小越靠近最新消息</span>
-                      </div>
-                    </div>
-                  </div>`;
-                }).join('');
-            }
-            $list.html(html);
-        }
-
-        $panel.find('#ow_lore_add').on('click', function () {
-            loreEntries().push({ id: `lore_${Date.now().toString(36)}`, name: '新设定', type: 'setting', content: '', keywords: '', enabled: true, depth: 0 });
-            saveChatData(); updateInjections(); renderLorePanel($panel);
-        });
-
-        const find = (el) => loreEntries().find((x) => x.id === $(el).closest('.ow-widget-card').data('lid'));
-        $list.on('click', '[data-action="lore-toggle"]', function () {
-            const $c = $(this).closest('.ow-widget-card');
-            $c.toggleClass('ow-collapsed');
-            $c.find('.ow-caret i').attr('class', $c.hasClass('ow-collapsed') ? 'fa-solid fa-chevron-right' : 'fa-solid fa-chevron-down');
-        });
-        $list.on('change', '.ow-lore-on', function () { const e = find(this); if (e) { e.enabled = $(this).is(':checked'); saveChatData(); updateInjections(); } });
-        $list.on('input', '.ow-lore-name', function () {
-            const e = find(this); if (!e) return; e.name = $(this).val(); saveChatData();
-            $(this).closest('.ow-widget-card').find('.ow-widget-name').text(e.name || '未命名');
-        });
-        $list.on('input', '.ow-lore-content', function () { const e = find(this); if (e) { e.content = $(this).val(); saveChatData(); updateInjections(); } });
-        $list.on('input', '.ow-lore-kw', function () { const e = find(this); if (e) { e.keywords = $(this).val(); saveChatData(); updateInjections(); } });
-        $list.on('change', '.ow-lore-edepth', function () {
-            const e = find(this); if (!e) return;
-            e.depth = Math.max(0, Number($(this).val()) || 0);
-            saveChatData(); updateInjections();
-        });
-        $list.on('change', '.ow-lore-type', function () { const e = find(this); if (e) { e.type = $(this).val(); saveChatData(); renderLorePanel($panel); } });
-        $list.on('click', '[data-action="lore-del"]', function () {
-            const e = find(this);
-            if (!e || !confirm(`删除设定「${e.name}」？`)) return;
-            chatData().lore.entries = loreEntries().filter((x) => x.id !== e.id);
-            saveChatData(); updateInjections(); renderLorePanel($panel);
-        });
-    }
-
     // ---------------- 总结面板 ----------------
     function renderSummaryPanel($panel) {
         const s = settings();
@@ -4526,6 +4339,29 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         loadAndRenderWorldInfoEntries($panel);
     }
 
+    /** 当前勾选与"已写回酒馆的那份快照"是否有差异 */
+    function wiPendingDiff(entries) {
+        const s = settings();
+        const snap = chatData().wiState || {};
+        const diff = [];
+        for (const e of entries) {
+            const key = `${e.book}::${e.uid}`;
+            if (snap[key] === undefined) continue;   // 从没应用过的条目不算
+            const now = isWorldInfoEntrySendEnabled(s, e.book, e.uid, e.disabledInST);
+            if (now !== snap[key]) diff.push(e.label);
+        }
+        return diff;
+    }
+
+    function renderWiDirtyHint($panel) {
+        const $box = $panel.find('#ow_wi_dirty');
+        if (!$box.length) return;
+        const entries = $panel.data('wiEntries') || [];
+        const diff = wiPendingDiff(entries);
+        if (!settings().wiReverseControl?.enabled || !diff.length) { $box.hide().empty(); return; }
+        $box.show().html(`⚠️ 有 ${diff.length} 处勾选改动<b>尚未写回酒馆</b>（只影响扩展发送）。要同步到酒馆请点「立即应用到酒馆」。`);
+    }
+
     async function loadAndRenderWorldInfoEntries($panel) {
         const s = settings();
         const $list = $panel.find('#ow_wi_entry_list');
@@ -4585,20 +4421,21 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             </div>`;
         }
         $list.html(html);
+        $panel.data('wiEntries', entries);
+        renderWiDirtyHint($panel);
 
         $list.off('change', '.ow-wi-entry-toggle').on('change', '.ow-wi-entry-toggle', function () {
             const book = $(this).data('book');
             const uidStr = String($(this).data('uid'));
+            // 只改"扩展要发送哪些条目"。写回酒馆的那份快照(wiState)必须等你点
+            // 「立即应用到酒馆」才更新——两套是独立的。
             s.worldInfoOverrides[`${book}::${uidStr}`] = $(this).is(':checked');
             saveSettings();
-            const cdw = chatData();
-            cdw.wiState = cdw.wiState || {};
-            cdw.wiState[`${book}::${uidStr}`] = $(this).is(':checked');
-            saveChatData();
             const $card = $(this).closest('.ow-widget-card');
             const total = $card.find('.ow-wi-entry-toggle').length;
             const on = $card.find('.ow-wi-entry-toggle:checked').length;
             $card.find('.ow-widget-meta').text(`${on}/${total} 发送`);
+            renderWiDirtyHint($panel);
         });
         $list.off('click', '[data-action="wi-all"], [data-action="wi-none"]').on('click', '[data-action="wi-all"], [data-action="wi-none"]', function () {
             const want = $(this).data('action') === 'wi-all';
@@ -4607,15 +4444,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 const book = $(this).data('book');
                 const uidStr = String($(this).data('uid'));
                 s.worldInfoOverrides[`${book}::${uidStr}`] = want;
-                const cdw2 = chatData();
-                cdw2.wiState = cdw2.wiState || {};
-                cdw2.wiState[`${book}::${uidStr}`] = want;
                 $(this).prop('checked', want);
             });
             saveSettings();
             const total = $card.find('.ow-wi-entry-toggle').length;
             $card.find('.ow-widget-meta').text(`${want ? total : 0}/${total} 发送`);
-            saveChatData();
+            renderWiDirtyHint($panel);
         });
     }
 
@@ -4862,7 +4696,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const s = settings();
         const rows = [];
         const add = (name, on, text) => rows.push({ name, on, chars: on ? String(text || '').length : 0 });
-        try { add('本聊天设定', s.lore.injectEnabled, buildLoreInjectionText()); } catch (e) { /* ignore */ }
         try { add('组件结果', s.injectWidgets, s.widgets.filter((w) => w.enabled).map((w) => chatData().widgetResults[w.id]?.html).filter(Boolean).join('')); } catch (e) { /* ignore */ }
         try { add('表格', s.offscreen.enabled && s.offscreen.injectTables, renderOffscreenAsPlainText(chatData().offscreen)); } catch (e) { /* ignore */ }
         try { add('剧情推演', s.plot.injectEnabled, buildPlotInjectionText()); } catch (e) { /* ignore */ }
@@ -5017,11 +4850,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               ${depthRow('ow_sum_inject', s.summary.injectDepth)}
             </div>`),
 
-          group('lore', 'fa-scroll', '设定', `
-            <div class="ow-row"><label><input type="checkbox" id="ow_lore_inject" ${s.lore.injectEnabled ? 'checked' : ''}> 注入本聊天设定</label></div>
-            <div class="ow-row"><label>关键词触发时向前扫描 <input type="number" class="ow-input ow-num" id="ow_lore_scan" min="1" value="${s.lore.scanDepth}"> 层</label></div>
-            <div class="ow-muted" style="font-size:11.5px;">条目与各自的注入深度在「设定」标签页里管理。内容只存在当前聊天。</div>`),
-
           group('worldinfo', 'fa-book', '世界书', `
             <div class="ow-row">
               <label><input type="checkbox" id="ow_include_wi" ${s.includeWorldInfo ? 'checked' : ''}> 随行发送世界书 / 聊天书条目</label>
@@ -5032,15 +4860,20 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <label><input type="checkbox" id="ow_wi_rc_auto" ${s.wiReverseControl.autoApply ? 'checked' : ''} ${s.wiReverseControl.enabled ? '' : 'disabled'}> 切换聊天时自动应用</label>
               <button class="ow-btn ow-primary" id="ow_wi_rc_apply" ${s.wiReverseControl.enabled ? '' : 'disabled'}><i class="fa-solid fa-right-left"></i> 立即应用到酒馆</button>
             </div>
-            <div class="ow-muted" style="font-size:11.5px;">把下面的勾选状态<b>写回酒馆世界书本身</b>（改的是条目的启用/禁用）。<br>
-            适用于一张角色卡有多条平行线：聊天1走20岁线、聊天2走30岁线，各自勾好后切聊天就自动切换，不用再手动开关。<br>
-            状态按聊天分别保存；只影响你在本扩展里设定过的条目，没动过的不碰。</div>
+            <div class="ow-muted" style="font-size:11.5px;">
+            下面的勾选平时<b>只决定扩展要发送哪些条目</b>，不会动酒馆。<br>
+            点「立即应用到酒馆」时，才把<b>当时</b>的勾选固化成一份快照写回酒馆世界书（改条目的启用/禁用），
+            并记进本聊天；之后开启「切换聊天时自动应用」，进这个聊天就会自动还原成那份快照。<br>
+            应用之后你再改勾选，改的仍然只是扩展的发送清单 —— 想同步到酒馆，得再点一次应用。<br>
+            适用于一张角色卡有多条平行线：聊天1走20岁线、聊天2走30岁线，各自应用一次，之后切聊天自动切换。<br>
+            只影响你应用过的条目，没碰过的不管。</div>
             <div class="ow-row">
               <button class="ow-btn" id="ow_wi_refresh"><i class="fa-solid fa-rotate"></i> 刷新条目</button>
               <button class="ow-btn" id="ow_wi_reset">恢复默认</button>
               <span class="ow-muted">来源：<span id="ow_wi_book_names">—</span></span>
             </div>
             <div class="ow-muted" style="font-size:11.5px;">默认跟随条目在酒馆中的启用状态；此处改动只影响本扩展。</div>
+            <div id="ow_wi_dirty" class="ow-hint" style="display:none;"></div>
             <div id="ow_wi_entry_list"></div>`),
 
           group('prompts', 'fa-pen-nib', '提示词', `<div id="ow_prompts_section"></div>`),
@@ -5099,9 +4932,6 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             }
         });
         renderApiPresets($panel);
-
-        $panel.find('#ow_lore_inject').on('change', function () { s.lore.injectEnabled = $(this).is(':checked'); saveSettings(); updateInjections(); renderInjectionOverview($panel); });
-        $panel.find('#ow_lore_scan').on('change', function () { s.lore.scanDepth = Math.max(1, Number($(this).val()) || 10); saveSettings(); updateInjections(); });
         bindModuleApiRows($panel);
 
         $panel.find('#ow_sum_enabled').on('change', function () { s.summary.enabled = $(this).is(':checked'); saveSettings(); });
@@ -5198,9 +5028,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             const $b = $(this); $b.prop('disabled', true);
             try {
                 const entries = await fetchWorldInfoEntriesForManagement();
-                saveWiStateToChat(entries);
+                saveWiStateToChat(entries);           // 此刻才把当前勾选固化成"写回酒馆"的快照
                 const r = await applyReverseWorldInfo();
                 toast(r.ok ? (r.changed ? `已改动酒馆里的 ${r.changed} 个条目` : '酒馆状态已与本聊天设定一致') : '当前酒馆版本不支持，详见日志', r.ok ? 'success' : 'warning');
+                // 酒馆里的启用状态变了，重新拉一遍列表，让"（酒馆中已禁用）"标注同步
+                await loadAndRenderWorldInfoEntries($panel);
             } catch (err) {
                 toast(`应用失败：${err.message || err}`, 'error');
             } finally { $b.prop('disabled', false); }

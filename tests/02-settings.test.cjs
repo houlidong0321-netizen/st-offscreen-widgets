@@ -3,7 +3,7 @@ const { boot, tick, check, summary } = require('./harness.cjs');
 
 (async () => {
     console.log('\n[02] 设置与注入');
-    const app = boot({ expose: ['settings', 'chatData', 'loreEntries', 'updateInjections', 'buildLoreInjectionGroups'] });
+    const app = boot({ expose: ['settings', 'chatData', 'updateInjections'] });
     await tick();
     const T = app.T(); const s = T.settings();
 
@@ -19,34 +19,12 @@ const { boot, tick, check, summary } = require('./harness.cjs');
     check('总结默认按楼层计数', s.summary.countMode === 'floor');
 
     // 注入统一走 IN_CHAT(1) + 深度
-    T.loreEntries().push({ id: 'a', name: 'x', type: 'setting', content: 'AAA', enabled: true, depth: 5 });
+    const cd = T.chatData();
+    cd.summary.bigSummaries.push({ id: 'x', fromCh: 0, toCh: 1, imported: true, rawText: '档案', sections: [], level: 1 });
     T.updateInjections();
-    const k = Object.keys(app.rec.injected).find((x) => x.includes('lore'));
-    check('注入位置为聊天中(1)且深度生效', app.rec.injected[k].p === 1 && app.rec.injected[k].d === 5,
+    const k = Object.keys(app.rec.injected).find((x) => x.includes('summary'));
+    check('注入位置为聊天中(1)且深度生效', app.rec.injected[k].p === 1 && app.rec.injected[k].d === 999,
         `${app.rec.injected[k].p}/${app.rec.injected[k].d}`);
-
-    // 按深度分组合并
-    T.loreEntries().push({ id: 'b', name: 'y', type: 'npc', content: 'BBB', enabled: true, depth: 5 });
-    T.loreEntries().push({ id: 'c', name: 'z', type: 'npc', content: 'CCC', enabled: true, depth: 9 });
-    const g = T.buildLoreInjectionGroups();
-    check('相同深度合并为一组', g.length === 2, g.map((x) => '@' + x.depth).join(','));
-
-    // 关键词触发
-    const app2 = boot({
-        expose: ['settings', 'loreEntries', 'buildLoreInjectionGroups'],
-        chat: [{ name: 'C', mes: '两人走进医院大厅。', is_user: false }],
-    });
-    await tick();
-    const T2 = app2.T();
-    T2.loreEntries().push({ id: '1', name: '常驻', type: 'setting', content: 'ALWAYS', enabled: true, depth: 0 });
-    T2.loreEntries().push({ id: '2', name: '命中', type: 'npc', content: 'HIT', keywords: '医院', enabled: true, depth: 0 });
-    T2.loreEntries().push({ id: '3', name: '未命中', type: 'npc', content: 'MISS', keywords: '飞船', enabled: true, depth: 0 });
-    T2.loreEntries().push({ id: '4', name: '停用', type: 'npc', content: 'OFF', enabled: false, depth: 0 });
-    const txt = T2.buildLoreInjectionGroups().map((x) => x.text).join('');
-    check('常驻条目注入', txt.includes('ALWAYS'));
-    check('关键词命中注入', txt.includes('HIT'));
-    check('关键词未命中不注入', !txt.includes('MISS'));
-    check('停用条目不注入', !txt.includes('OFF'));
 
     // 迁移：旧版设置结构
     const old = { offscreen_widgets: { offscreen: { enabled: true, followWidgets: false }, autoTriggers: { offscreenByFloor: { enabled: true, interval: 8 } }, plot: { directions: [{ id: 'he', name: 'HE', enabled: true }] } } };
