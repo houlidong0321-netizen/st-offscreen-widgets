@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '3.2.2';
+    const EXT_VERSION = '3.3.0';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     /**
@@ -224,7 +224,7 @@
         if (logs.length > MAX_LOGS) logs.shift();
         const consoleFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
         consoleFn(`[Ego][${tag}] ${msg}`, data !== undefined ? data : '');
-        if ($logPanel) renderLogEntries($logPanel);
+        // 不在这里重绘：日志写得很频繁，实时重绘会拖慢生成过程
         return entry;
     }
 
@@ -273,6 +273,8 @@
             injectDepth: 3,
         },
         api: { mode: 'system', url: '', key: '', model: '', modelList: [], presets: [], activePresetId: '', stream: false },
+        // 跟随酒馆时的请求方式：raw=只发本扩展提示词；preset=走酒馆完整管线（含预设/角色卡/世界书）
+        requestMode: 'raw',
         // 各模块用哪套 API：'system'=跟随酒馆，'preset'=指定预设
         moduleApi: {
             widgets: { mode: 'system', presetId: '' },
@@ -1208,6 +1210,17 @@
   在结果尚未落定前，剧情锁死在当前事件内继续推进，不要提前跳转。
 - 每条分支都必须写明指向哪个事件编号（或 OPEN / END）。
 
+【蝴蝶效应：分支绝不能殊途同归】
+- **同一个事件的多条分支，禁止指向同一个后续事件**。若事件01的结果A与结果B都指向事件02，
+  那这个选择就毫无意义——无论用户怎么选故事都一样。这是严重错误。
+- 每一次分支都是一次分岔：不同结果把故事推向**不同的平行时空**，
+  此后的人物处境、关系状态、可选走向都应当明显不同，而不是绕一圈回到同一条线。
+- 因此：事件01 的结果A → 事件02，结果B → 事件03（各自独立的后续，内容互不相同）；
+  事件02 与 事件03 的后续继续各自分岔，形成真正的树状/网状结构。
+- 允许两个**不同事件**的分支指向同一个事件（剧情线可以在很后面重新汇合），
+  但**同一个事件内部的几条分支必须各去各的地方**。
+- 结局同理：不同路线应抵达**不同的**开放结局，不要所有线都收束到同一个 OPEN 描述。
+
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
 {"events":[{"id":"01","title":"事件代号","core":"戏剧核心：本事件旨在催生/改变的情感张力",
@@ -1314,7 +1327,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
      */
     function validateAndRepairPlot(events) {
         const ids = new Set(events.map((e) => e.id));
-        const issues = { dangling: [], deadloop: [] };
+        const issues = { dangling: [], deadloop: [], sameTarget: [] };
 
         for (const ev of events) {
             for (const b of ev.branches) {
@@ -1325,6 +1338,17 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                     issues.dangling.push(`事件${ev.id}/分支${b.key} → "${nx || '(空)'}"`);
                     b.next = 'OPEN'; // 悬空一律收束为阶段性开放结局，避免走进死路
                 }
+            }
+        }
+
+        // 同一事件的多条分支指向同一目标 —— 选择失去意义
+        for (const ev of events) {
+            const seen = new Map();
+            for (const b of ev.branches) {
+                const nx = String(b.next).toUpperCase();
+                if (nx === 'OPEN' || nx === 'END') continue;
+                if (seen.has(b.next)) issues.sameTarget.push(`事件${ev.id}：分支${seen.get(b.next)} 与 分支${b.key} 都指向 ${b.next}`);
+                else seen.set(b.next, b.key);
             }
         }
 
@@ -1366,6 +1390,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             log('warn', 'parse',
                 `模型生成了 ${issues.dangling.length} 条指向不存在事件的悬空分支，已自动改为"阶段性开放结局(OPEN)"，避免剧情走进死路。`,
                 issues.dangling);
+        }
+        if (issues.sameTarget.length) {
+            log('warn', 'parse', `有 ${issues.sameTarget.length} 处"同一事件的不同分支指向同一后续"，选择将失去意义，建议重新生成。`, issues.sameTarget);
+            toast(`推演里有 ${issues.sameTarget.length} 处分支殊途同归，详见日志`, 'warning');
         }
         if (issues.deadloop.length) {
             log('warn', 'parse',
@@ -1693,7 +1721,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
 
     async function callModel(systemPrompt, userPrompt, label = '', moduleKey = '') {
         const preset = resolveModuleApi(moduleKey);
-        log('info', 'request', `[${label}] 发起请求（${preset ? `独立API：${preset.name}` : '跟随酒馆'}）`, {
+        log('info', 'request', `[${label}] 发起请求（${preset ? `独立API：${preset.name}` : (settings().requestMode === 'preset' ? '跟随酒馆·含预设' : '跟随酒馆·仅提示词')}）`, {
             systemPrompt,
             userPrompt,
         });
@@ -1701,6 +1729,22 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         try {
             if (preset) {
                 raw = await callCustomApi(systemPrompt, userPrompt, preset);
+            } else if (settings().requestMode === 'preset') {
+                // 走酒馆完整管线：预设条目、角色卡、世界书、聊天记录都会带上，
+                // 我们的提示词作为最后一条系统指令追加在聊天记录之后，上下文更连贯。
+                const c = ctx();
+                if (typeof c.generateQuietPrompt !== 'function') {
+                    log('warn', 'request', '当前酒馆版本没有 generateQuietPrompt，已回退为仅发提示词');
+                    const r0 = await c.generateRaw({ prompt: userPrompt, systemPrompt });
+                    raw = typeof r0 === 'string' ? r0 : String(r0 ?? '');
+                } else {
+                    const r1 = await c.generateQuietPrompt({
+                        quietPrompt: `${systemPrompt}\n\n${userPrompt}`,
+                        quietToLoud: false,
+                        skipWIAN: false,
+                    });
+                    raw = typeof r1 === 'string' ? r1 : String(r1 ?? '');
+                }
             } else {
                 // 跟随酒馆当前正文所用的 API/连接配置，走原生 generateRaw（不经过 WI/AN 自动扫描，
                 // 上下文素材由本扩展自行拼接到 userPrompt 中）。
@@ -2091,15 +2135,28 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 && s.offscreen.enabled && s.offscreen.triggerMode === 'auto' && s.offscreen.autoMode === 'floor') {
                 const cdT = chatData();
                 if (!cdT.autoTriggerState.firstSeen) {
+                    // 只有"已有存量明显超过一个间隔"才算老聊天需要询问；
+                    // 新聊天从 0 慢慢聊上来的不该打扰（之前 8 楼退出再进也会弹）。
+                    const ivFirst = Math.max(1, Number(s.offscreen.floorInterval) || 1);
+                    if (c1.chat.length < ivFirst * 2) {
+                        cdT.autoTriggerState.firstSeen = true;
+                        cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
+                        saveChatData();
+                        await flushChatData();
+                        log('info', 'trigger', `本聊天首次接入，存量仅 ${c1.chat.length} 层（不足间隔 ${ivFirst} 的两倍），按新聊天处理，不弹窗。`);
+                        return;
+                    }
                     const beh = s.offscreen.newChatBehavior || 'ask';
                     if (beh === 'auto') {
                         cdT.autoTriggerState.firstSeen = true;
                         cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
                         saveChatData();
+                        await flushChatData();
                     } else if (beh === 'manual') {
                         cdT.autoTriggerState.firstSeen = true;
                         cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
                         saveChatData();
+                        await flushChatData();
                         log('info', 'trigger', '这个聊天首次接入本扩展，已按设置跳过首次自动生成（改为从现在开始计数）。');
                         toast('本聊天首次接入，表格未自动生成。需要时可手动点生成。', 'info');
                         return;
@@ -2107,6 +2164,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                         cdT.autoTriggerState.firstSeen = true;
                         cdT.autoTriggerState.lastOffscreenFloor = c1.chat.length;
                         saveChatData();
+                        await flushChatData();
                         const yes = confirm('这个聊天是第一次使用本扩展的表格功能。\n\n现在要基于已有聊天记录生成一次表格吗？\n（点取消则跳过，之后按楼层间隔正常触发）');
                         if (!yes) { log('info', 'trigger', '用户选择跳过首次表格生成'); return; }
                         startBackgroundTask('表格生成', async () => {
@@ -2743,46 +2801,43 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
     function renderLogPanelShell($panel) {
         $panel.html(`
         <div class="ow-row">
-          <button class="ow-btn" id="ow_log_copy"><i class="fa-regular fa-copy"></i> 复制全部日志</button>
-          <button class="ow-btn ow-danger" id="ow_log_clear"><i class="fa-solid fa-broom"></i> 清空日志</button>
-          <span class="ow-muted">仅存于本次会话内存，刷新即清空。</span>
+          <button class="ow-btn ow-primary" id="ow_log_download"><i class="fa-solid fa-download"></i> 下载日志</button>
+          <button class="ow-btn" id="ow_log_copy"><i class="fa-regular fa-copy"></i> 复制到剪贴板</button>
+          <button class="ow-btn ow-danger" id="ow_log_clear"><i class="fa-solid fa-broom"></i> 清空</button>
+          <span class="ow-muted" id="ow_log_count"></span>
         </div>
-        <div id="ow_log_entries"></div>`);
-        $panel.find('#ow_log_copy').on('click', async () => {
+        <div class="ow-muted" style="font-size:11.5px;line-height:1.6;">
+          日志只存在本次会话的内存里（最多 ${MAX_LOGS} 条），刷新页面即清空。<br>
+          这里不逐条渲染——条目含完整提示词与模型原文，渲染出来会明显拖慢界面。排查时下载或复制后查看即可。
+        </div>`);
+
+        $panel.find('#ow_log_download').on('click', () => {
             const text = exportLogsText() || '（暂无日志）';
             try {
-                await navigator.clipboard.writeText(text);
-                toast('日志已复制到剪贴板', 'success');
-            } catch (e) {
-                // 剪贴板 API 不可用时，退化为弹窗展示可手动复制
+                const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `ego-log-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.txt`;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                toast('日志已下载', 'success');
+            } catch (err) {
+                toast('下载失败，可改用复制按钮', 'error');
+            }
+        });
+        $panel.find('#ow_log_copy').on('click', async () => {
+            const text = exportLogsText() || '（暂无日志）';
+            try { await navigator.clipboard.writeText(text); toast('日志已复制', 'success'); }
+            catch (e) {
                 const w = window.open('', '_blank');
                 if (w) w.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(text)}</pre>`);
             }
         });
         $panel.find('#ow_log_clear').on('click', () => {
-            if (confirm('确定清空全部日志吗？')) clearLogs();
+            if (!confirm('确定清空全部日志吗？')) return;
+            clearLogs();
+            renderLogEntries($panel);
         });
-    }
-
-    function renderLogEntries($panel) {
-        if (!$panel || !$panel.length) return;
-        if (!$panel.find('#ow_log_entries').length) renderLogPanelShell($panel);
-        const $entries = $panel.find('#ow_log_entries');
-        const levelColor = { error: '#f66', warn: '#e6b800', info: 'inherit', debug: '#888' };
-        if (!logs.length) {
-            $entries.html('<div class="ow-empty">暂无日志，进行一次生成操作后这里会显示详细过程。</div>');
-            return;
-        }
-        const wasAtBottom = $entries.length && Math.abs($entries[0].scrollHeight - $entries.scrollTop() - $entries.outerHeight()) < 40;
-        $entries.html(logs.slice().reverse().map((e) => {
-            const t = new Date(e.time).toLocaleTimeString();
-            const color = levelColor[e.level] || 'inherit';
-            return `<div class="ow-log-entry" style="border-left:3px solid ${color};padding:4px 8px;margin-bottom:4px;font-size:0.82em;">
-                <div style="opacity:0.7;">${t} · <b style="color:${color};">${e.level.toUpperCase()}</b> · ${escapeHtml(e.tag)}</div>
-                <div>${escapeHtml(e.msg)}</div>
-                ${e.data ? `<pre style="white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto;background:rgba(255,255,255,0.04);padding:6px;border-radius:4px;margin-top:4px;">${escapeHtml(e.data)}</pre>` : ''}
-            </div>`;
-        }).join(''));
     }
 
     function applyTheme() {
@@ -2792,6 +2847,17 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         if (s.theme.mode === 'custom' && s.theme.customCss) {
             $modal.append(`<style id="ow_custom_theme_style">${s.theme.customCss}</style>`);
         }
+    }
+
+    /** 只刷新计数，不渲染条目 */
+    function renderLogEntries($panel) {
+        if (!$panel || !$panel.length) return;
+        if (!$panel.find('#ow_log_download').length) renderLogPanelShell($panel);
+        const errs = logs.filter((e) => e.level === 'error').length;
+        const warns = logs.filter((e) => e.level === 'warn').length;
+        $panel.find('#ow_log_count').html(`共 ${logs.length} 条`
+            + (errs ? ` · <span style="color:#e5787d;">${errs} 错误</span>` : '')
+            + (warns ? ` · <span style="color:#e0a458;">${warns} 警告</span>` : ''));
     }
 
     // ---------------- 组件生成面板：模块一「组件显示」+ 模块二「组件列表」 ----------------
@@ -4786,6 +4852,18 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         const html = [
           group('api', 'fa-plug', 'API 预设',
             `<div class="ow-muted" style="margin-bottom:6px;">维护多套 API，各模块在自己的分组里选择。Key 明文存于酒馆设置，勿在共享环境使用敏感 Key。</div>
+             <div class="ow-field-label">跟随酒馆时的请求方式</div>
+             <div class="ow-row">
+               <label><input type="radio" name="ow_reqmode" value="raw" ${s.requestMode !== 'preset' ? 'checked' : ''}> 仅发提示词</label>
+               <label><input type="radio" name="ow_reqmode" value="preset" ${s.requestMode === 'preset' ? 'checked' : ''}> 结合当前预设</label>
+             </div>
+             <div class="ow-muted" style="font-size:11.5px;line-height:1.6;margin-bottom:8px;">
+               <b>仅发提示词</b>：只发本扩展的提示词 + 设定的聊天记录。干净省 token，但读不到预设里的设定。<br>
+               <b>结合当前预设</b>：走酒馆完整管线（预设条目 / 角色卡 / 世界书 / 聊天记录都在），
+               本扩展的提示词作为<b>最后一条系统指令</b>追加在聊天记录之后，输出更贴合人设与文风。
+               代价是每次请求 token 明显增加，也可能被预设里的格式类指令干扰。<br>
+               只对「跟随酒馆」生效；选了独立 API 预设的模块不受影响。
+             </div>
              <div class="ow-row"><label><input type="checkbox" id="ow_api_stream" ${s.api.stream ? 'checked' : ''}> 使用流式请求</label>
                <span class="ow-muted">默认非流式；某些服务只支持流式时再开</span></div>
              <div id="ow_api_presets"></div>
@@ -5051,6 +5129,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         $panel.find('#ow_off_backoff').on('change', function () { s.offscreen.floorBackoff = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_plot_backoff').on('change', function () { s.plot.floorBackoff = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_off_newchat').on('change', function () { s.offscreen.newChatBehavior = $(this).val(); saveSettings(); });
+        $panel.find('input[name="ow_reqmode"]').on('change', function () { s.requestMode = $(this).val(); saveSettings(); });
         $panel.find('#ow_api_stream').on('change', function () { s.api.stream = $(this).is(':checked'); saveSettings(); });
         $panel.find('#ow_history_depth').on('change', function () { s.historyDepth = Math.max(0, Number($(this).val()) || 0); saveSettings(); });
         $panel.find('#ow_wi_rc').on('change', function () {
