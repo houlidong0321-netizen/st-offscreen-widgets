@@ -14,7 +14,7 @@
     // 更新检查：扩展以 ES module 加载，document.currentScript 恒为 null，
     // 因此用 import.meta.url 推导安装目录名，喂给酒馆的 /api/extensions/version|update。
     const EXT_NAME = 'Ego 小助手';
-    const EXT_VERSION = '3.3.0';
+    const EXT_VERSION = '3.3.2';
     const REPO_URL = 'https://github.com/houlidong0321-netizen/st-offscreen-widgets.git';
 
     /**
@@ -1210,6 +1210,20 @@
   在结果尚未落定前，剧情锁死在当前事件内继续推进，不要提前跳转。
 - 每条分支都必须写明指向哪个事件编号（或 OPEN / END）。
 
+【导火索排期：给每个事件定一个具体日期】
+- 目的：让剧情有明确的切入点，不至于"想推进却找不到由头"，也不至于拖很久都不发生。
+- 下方会给出【当前故事日期】。以它为基准，为每个事件的导火索排一个 **triggerDate**（YYYY-MM-DD）。
+- 排期原则：
+  · **当前正在进行的那个事件**：导火索通常已经发生或就在眼前，排在当前日期或往后 0-2 天内。
+  · 后续事件：按剧情节奏依次往后排。相邻事件之间通常间隔 **1-7 天**，
+    需要酝酿的重大冲突可以拉到 1-3 周，但**不要动辄排到几个月后**——那等于不会发生。
+  · 分岔出去的不同事件（如结果A去事件02、结果B去事件03）**可以排在相近日期**，
+    因为它们属于不同的平行时空，不会同时发生。
+- 必须结合下方【角色日程】：不要把导火索排在角色明显不可能在场的日子
+  （例如对方那天出差、值夜班、有既定行程），除非这个"不在场"本身就是导火索。
+- 如果导火索依赖某个特定条件（周末、节日、发薪日、对方生日），就排到最近满足条件的那一天。
+- triggerWindow 填当天的时段（上午/下午/晚上，或具体时刻），说不准就留空。
+
 【蝴蝶效应：分支绝不能殊途同归】
 - **同一个事件的多条分支，禁止指向同一个后续事件**。若事件01的结果A与结果B都指向事件02，
   那这个选择就毫无意义——无论用户怎么选故事都一样。这是严重错误。
@@ -1224,30 +1238,43 @@
 【输出格式】
 只输出一个 JSON 对象，不要输出任何 Markdown 代码块围栏或解释文字，结构必须是：
 {"events":[{"id":"01","title":"事件代号","core":"戏剧核心：本事件旨在催生/改变的情感张力",
-"trigger":"导火索(起)：如何在正文中自然触发","branches":[
+"trigger":"导火索(起)：如何在正文中自然触发",
+"triggerDate":"YYYY-MM-DD 导火索预计发生的具体日期（见下方【导火索排期】）",
+"triggerWindow":"当天的时段，如 上午/下午/晚上/19:30，说不准就留空",
+"branches":[
 {"key":"A","condition":"该事件的一种结局走向（只写故事结果，不写描述）","next":"02"},
 {"key":"B","condition":"另一种结局走向","next":"03"}]}]}
 每个事件的 branches 可以有 2-4 条，覆盖所有合理走向。
+triggerDate 必须是 YYYY-MM-DD 格式的确切日期；实在无法判断时才留空字符串。
 id 使用两位数字字符串（"01"、"02"…）。每个事件至少 2 条分支。
 next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开放结局）、或 "END"（仅在指定 HE/BE 时可用）。`;
 
-    const DEFAULT_PLOT_INJECT_TEMPLATE = `[剧情推演·当前事件（隐藏指令，绝不可在正文中直接复述或提及本段存在）]
+    const DEFAULT_PLOT_INJECT_TEMPLATE = `[剧情推演·运行法则（隐藏指令，绝不可在正文中直接复述或提及本段存在）]
+- 本事件是一个宏观篇章，需要经历多轮互动才能收束。在用户的行为真正满足下面某条终局分支条件之前，
+  请持续在本事件内部深化细节、对话与拉扯，不要急于推进，按当前对话的自然速率行进，并禁止生成标记。
+- 分支判定看的是**这个事件最终走向了哪个结果**，而不是情绪、态度或倾向。
+  角色心里怎么想、气氛偏向哪边，都**不构成**分支成立；只有分支描述的那件事在正文里**确实发生并落定**才算。
+
+【触发标记的硬性门槛，全部满足才允许输出】
+1. 导火索已经在正文中实际发生过，而不只是被提起、被预告、被安排。
+2. 该事件已经经历了足够的互动展开，不是刚开场就收尾。
+3. 某一条终局分支所描述的**结果已经在正文中明确写出并成为既定事实**。
+4. 你能在本次或此前的正文里指出具体是哪几句写明了这个结果。
+
+- 满足以上全部条件时，才在本次正文的末尾追加一行隐藏标记：
+  {{marker_example}}
+  其中最后一个字母替换为实际触发的分支字母。该标记是 HTML 注释，不会显示给用户，请务必原样输出。
+- 只要有任何一条不满足，就**不要输出该标记**，继续在当前事件中推进。
+- **绝对禁止**：只发生了导火索就填写标记；把角色的情绪倾向当成分支达成；
+  在没有正文支撑的情况下想象、脑补或提前认定某个分支已经发生。
+- 宁可晚一轮推进，也不要错误推进。错误推进会让后续所有剧情走上错误的平行时空。
+
 当前所处事件：{{event_title}}
 戏剧核心：{{event_core}}
 导火索：{{event_trigger}}
 终局分支：
-{{branches}}
+{{branches}}`;
 
-运行法则：
-- 本事件是一个宏观篇章，需要经历多轮互动才能收束。在用户的行为真正满足下面某条终局分支条件之前，
-  请持续在本事件内部深化细节、对话与拉扯，不要急于推进，按当前对话的自然速率行进。
-- 分支判定看的是**这个事件最终走向了哪个结果**。结果尚未落定前，继续在当前事件内推进，不要提前跳转；
-  一旦某条分支描述的结果在正文中确实达成，即判定该分支成立。
-- 每次回复前在后台比对用户输入：若判定其情感倾向真正满足了某条终局分支条件，则在本次正文的末尾
-  以自然叙事手法无痕引入下一事件的导火索，并在正文最末尾追加一行隐藏标记：
-  {{marker_example}}
-  其中最后一个字母替换为实际触发的分支字母。该标记是 HTML 注释，不会显示给用户，请务必原样输出。
-- 若未满足任何分支条件，则不要输出该标记，继续在当前事件中推进。`;
 
     function plotDirections() {
         const s = settings();
@@ -1273,6 +1300,16 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             parts.push('【结局许可】未指定 HE 或 BE，禁止使用 "END"。所有线路最终都收束到阶段性开放结局（next="OPEN"）。');
         }
         parts.push('【通用约束】所有事件必须基于正文与世界书中已经确立的人物、场所、关系推导，禁止凭空引入未出现过的重要角色或设定，禁止改变世界规则。');
+
+        // 排期需要的两样：当前日期 + 角色既定日程
+        const today = detectStoryDate();
+        parts.push(`【当前故事日期】${today || '（未能从正文中识别，请从聊天记录里自行判断，并以此为基准排期）'}`);
+        const sched = (chatData().offscreen.tables?.scheduleTable || [])
+            .map((r) => {
+                const bits = [r.routine, r.seasonal].filter((x) => x && x !== '—').join('；');
+                return bits ? `- ${r.role}：${bits}` : null;
+            }).filter(Boolean);
+        if (sched.length) parts.push(`【角色日程（排期时避开冲突）】\n${sched.join('\n')}`);
         const custom = String(s.plot.customEvents || '').trim();
         if (custom) {
             parts.push(`【用户指定的必含内容（最高优先级）】\n${custom}\n\n处理要求：以上每一条都**必须**在本次矩阵中得到体现，不得省略、不得改写其核心诉求。\n这些条目的形式不限——可能是完整事件、某个分支走向、一句想看到的台词、一个画面、一个想要的结果，或只是一个零碎念头。请你自行判断各条最合适的落点：\n· 能独立成篇的 → 做成一个事件节点；\n· 属于某个事件的结局走向 → 安排成该事件的一条分支；\n· 太零碎的（一句台词/一个画面/一种氛围）→ 补全成完整情节，安置进合适事件的戏剧核心或导火索里；\n· 指定了某个结果 → 让某条分支线最终导向它。\n并把它们合理串进整条故事线，与其余自动生成的事件自然衔接。若数量不足节点总数，由你补全其余事件。`);
@@ -1297,6 +1334,24 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return parts.join('\n\n');
     }
 
+    /**
+     * 从最近的聊天记录里找当前故事日期。
+     * 优先认天气 HUD 那种 [日期: 2026-08-13] 格式，其次认正文里出现的年月日。
+     */
+    function detectStoryDate() {
+        const chat = ctx().chat || [];
+        for (let i = chat.length - 1; i >= 0 && i >= chat.length - 30; i--) {
+            const t = String(chat[i]?.mes || '');
+            let m = t.match(/\[\s*日期\s*[:：]\s*(\d{4})\s*[-./年]\s*(\d{1,2})\s*[-./月]\s*(\d{1,2})/);
+            if (!m) m = t.match(/(\d{4})\s*[-./年]\s*(\d{1,2})\s*[-./月]\s*(\d{1,2})\s*[日号]?/);
+            if (m) {
+                const d = `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+                if (!isNaN(new Date(d + 'T00:00:00').getTime())) return d;
+            }
+        }
+        return '';
+    }
+
     function normalizePlotEvents(rows) {
         const out = [];
         rows.forEach((r, i) => {
@@ -1308,8 +1363,12 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
                 condition: String(b?.condition ?? b?.条件 ?? b?.触发条件 ?? '').trim(),
                 next: String(b?.next ?? b?.指向 ?? b?.下一事件 ?? '').trim(),
             })).filter((b) => b.key);
+            const rawDate = String(r.triggerDate ?? r.trigger_date ?? r.日期 ?? '').trim();
+            const okDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) && !isNaN(new Date(rawDate + 'T00:00:00').getTime());
             out.push({
                 id,
+                triggerDate: okDate ? rawDate : '',
+                triggerWindow: String(r.triggerWindow ?? r.trigger_window ?? r.时段 ?? '').trim(),
                 title: String(r.title ?? r.标题 ?? r.事件代号 ?? r.代号 ?? `事件${id}`).trim(),
                 core: String(r.core ?? r.戏剧核心 ?? r.核心 ?? '').trim(),
                 trigger: String(r.trigger ?? r.导火索 ?? r.起 ?? '').trim(),
@@ -1425,6 +1484,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         cd.plot.matrixId = `m${Date.now().toString(36)}`;
         cd.plot.startMsgId = (ctx().chat || []).length;
         cd.plot.updatedAt = Date.now();
+        syncTriggersToTimeline();
         saveChatData();
         log('info', 'system', `剧情推演生成完成：${events.length} 个事件节点，当前节点 ${cd.plot.currentId}`);
         updateInjections();
@@ -1456,6 +1516,41 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         updateInjections();
         log('info', 'system', `已恢复上一版剧情矩阵（${prev.events?.length || 0} 个事件）`);
         return true;
+    }
+
+    /**
+     * 把带日期的导火索同步进核心待办事项表 —— 天气 HUD 读这张表，
+     * 于是导火索就落到月历的具体日子上，剧情有了明确切入点。
+     * 只同步"尚未经历过"的事件；已走过的不再占月历。
+     */
+    function syncTriggersToTimeline() {
+        const cd = chatData();
+        const pl = cd.plot;
+        if (!pl.events?.length) return 0;
+        cd.offscreen.tables = cd.offscreen.tables || {};
+        const rows = cd.offscreen.tables.timelineTable || [];
+        // 先清掉上一轮由推演写进去的行（标记过来源），保留用户/模型自己写的
+        const kept = rows.filter((r) => !String(r.chapter || '').includes('[Plot_'));
+        const walked = new Set(pl.path.map((p) => p.eventId));
+
+        let added = 0;
+        for (const ev of pl.events) {
+            if (!ev.triggerDate) continue;
+            if (walked.has(ev.id)) continue;          // 已经历的事件不再排进月历
+            const time = ev.triggerWindow ? `${ev.triggerDate} ${ev.triggerWindow}` : ev.triggerDate;
+            kept.push({
+                time,
+                task: `[事件${ev.id}] ${ev.title}｜导火索：${ev.trigger || '—'}`,
+                chapter: `\`[Plot_${ev.id}]\``,
+            });
+            added++;
+        }
+        kept.sort((a, b) => String(a.time).localeCompare(String(b.time)));
+        cd.offscreen.tables.timelineTable = kept;
+        saveChatData();
+        updateInjections();
+        if (added) log('info', 'system', `已把 ${added} 个事件的导火索按日期写进核心待办事项表（天气 HUD 的月历会显示）`);
+        return added;
     }
 
     function getPlotEvent(id) {
@@ -1509,6 +1604,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             pl.currentId = '';
             log('warn', 'trigger', `事件 ${eventId} 的分支 ${branchKey} 指向了不存在的 "${next}"，已按开放结局处理。`);
         }
+        syncTriggersToTimeline();
         saveChatData();
         updateInjections();
         return true;
@@ -1528,7 +1624,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             .replace(/\{\{event_id\}\}/g, ev.id)
             .replace(/\{\{event_title\}\}/g, `[事件${ev.id}] ${ev.title}`)
             .replace(/\{\{event_core\}\}/g, ev.core || '—')
-            .replace(/\{\{event_trigger\}\}/g, ev.trigger || '—')
+            .replace(/\{\{event_trigger\}\}/g, (ev.trigger || '—') + (ev.triggerDate ? `（预计发生于 ${ev.triggerDate}${ev.triggerWindow ? ' ' + ev.triggerWindow : ''}，剧情走到那天前后就可以自然引出）` : ''))
             .replace(/\{\{branches\}\}/g, branches)
             .replace(/\{\{marker_example\}\}/g, markerExample);
     }
@@ -1719,31 +1815,82 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
         return preset;
     }
 
+    /**
+     * 临时监听 GENERATE_AFTER_COMBINE_PROMPTS / CHAT_COMPLETION_PROMPT_READY，
+     * 把酒馆最终拼好的提示词记进日志（只在"结合预设"模式下用，用完立刻解绑）。
+     */
+    async function withFinalPromptCapture(label, fn) {
+        const c = ctx();
+        const ev = c.eventSource;
+        const types = c.eventTypes || {};
+        let done = false;
+        const onText = (data) => {
+            if (done) return; done = true;
+            const p = String(data?.prompt || '');
+            log('info', 'request', `[${label}] 酒馆最终发出的提示词（文本补全，共 ${p.length} 字）`, p);
+        };
+        const onChat = (data) => {
+            if (done) return; done = true;
+            const arr = Array.isArray(data?.chat) ? data.chat : [];
+            const total = arr.reduce((n, m) => n + String(m?.content || '').length, 0);
+            log('info', 'request',
+                `[${label}] 酒馆最终发出的消息数组（对话补全，共 ${arr.length} 条 / ${total} 字）`,
+                arr.map((m, i) => `#${i} [${m?.role || '?'}] ${String(m?.content || '').slice(0, 400)}`).join('\n'));
+        };
+        try {
+            if (types.GENERATE_AFTER_COMBINE_PROMPTS) ev?.on?.(types.GENERATE_AFTER_COMBINE_PROMPTS, onText);
+            if (types.CHAT_COMPLETION_PROMPT_READY) ev?.on?.(types.CHAT_COMPLETION_PROMPT_READY, onChat);
+        } catch (e) {
+            log('debug', 'request', `挂载提示词抓取失败（不影响生成）：${e.message || e}`);
+        }
+        try {
+            return await fn();
+        } finally {
+            try {
+                if (types.GENERATE_AFTER_COMBINE_PROMPTS) ev?.removeListener?.(types.GENERATE_AFTER_COMBINE_PROMPTS, onText);
+                if (types.CHAT_COMPLETION_PROMPT_READY) ev?.removeListener?.(types.CHAT_COMPLETION_PROMPT_READY, onChat);
+            } catch (e) { /* 忽略 */ }
+            if (!done) {
+                log('warn', 'request',
+                    `[${label}] 没能抓到酒馆最终提示词。可能是该版本没有派发这两个事件，` +
+                    `也可能"结合预设"实际没生效。此时请对比一下两种模式的回复差异。`);
+            }
+        }
+    }
+
     async function callModel(systemPrompt, userPrompt, label = '', moduleKey = '') {
         const preset = resolveModuleApi(moduleKey);
-        log('info', 'request', `[${label}] 发起请求（${preset ? `独立API：${preset.name}` : (settings().requestMode === 'preset' ? '跟随酒馆·含预设' : '跟随酒馆·仅提示词')}）`, {
-            systemPrompt,
-            userPrompt,
-        });
+        const mode = preset ? `独立API：${preset.name}`
+            : (settings().requestMode === 'preset' ? '跟随酒馆·含预设' : '跟随酒馆·仅提示词');
+        log('info', 'request',
+            `[${label}] 发起请求（${mode}）` +
+            (mode.endsWith('含预设') ? ' —— 下面记的是本扩展传入的部分；预设/角色卡/世界书由酒馆拼接，见随后那条「酒馆最终发出的…」' : ''),
+            { systemPrompt, userPrompt });
         let raw;
         try {
             if (preset) {
                 raw = await callCustomApi(systemPrompt, userPrompt, preset);
             } else if (settings().requestMode === 'preset') {
                 // 走酒馆完整管线：预设条目、角色卡、世界书、聊天记录都会带上，
-                // 我们的提示词作为最后一条系统指令追加在聊天记录之后，上下文更连贯。
+                // 我们的提示词作为最后一条系统指令追加在聊天记录之后。
                 const c = ctx();
                 if (typeof c.generateQuietPrompt !== 'function') {
                     log('warn', 'request', '当前酒馆版本没有 generateQuietPrompt，已回退为仅发提示词');
                     const r0 = await c.generateRaw({ prompt: userPrompt, systemPrompt });
                     raw = typeof r0 === 'string' ? r0 : String(r0 ?? '');
                 } else {
-                    const r1 = await c.generateQuietPrompt({
-                        quietPrompt: `${systemPrompt}\n\n${userPrompt}`,
-                        quietToLoud: false,
-                        skipWIAN: false,
+                    // 上面那条日志记的是"我们传进去的参数"，看不到酒馆内部拼好的预设。
+                    // 这里临时挂一次监听，把真正发出去的完整提示词抓下来记进日志，
+                    // 方便确认预设/角色卡/世界书到底有没有带上。
+                    const captured = await withFinalPromptCapture(label, async () => {
+                        const r1 = await c.generateQuietPrompt({
+                            quietPrompt: `${systemPrompt}\n\n${userPrompt}`,
+                            quietToLoud: false,
+                            skipWIAN: false,
+                        });
+                        return typeof r1 === 'string' ? r1 : String(r1 ?? '');
                     });
-                    raw = typeof r1 === 'string' ? r1 : String(r1 ?? '');
+                    raw = captured;
                 }
             } else {
                 // 跟随酒馆当前正文所用的 API/连接配置，走原生 generateRaw（不经过 WI/AN 自动扫描，
@@ -3655,6 +3802,10 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (!confirm('恢复上一版矩阵？当前这版会被存起来，可以再点一次换回来。')) return;
             if (restorePlotHistory()) { toast('已恢复上一版矩阵', 'success'); renderPlotPanel($panel); }
         });
+        $tree.on('click', '[data-action="plot-sync"]', function () {
+            const n = syncTriggersToTimeline();
+            toast(n ? `已把 ${n} 个导火索同步到月历` : '没有带日期的待发生事件可同步', n ? 'success' : 'info');
+        });
         $tree.on('click', '[data-action="plot-reset"]', function () {
             if (!confirm('清空推演进度（置灰状态与已走路径），事件矩阵保留？')) return;
             pl.deadBranches = {};
@@ -3674,6 +3825,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             <span class="ow-muted">当前事件：${pl.currentId ? `<b>[事件${escapeHtml(pl.currentId)}]</b>` : '（已抵达结局或未设定）'}</span>
             <span class="ow-spacer"></span>
             ${pl.history?.length ? '<button class="ow-btn" data-action="plot-restore" title="回到上一版矩阵"><i class="fa-solid fa-clock-rotate-left"></i> 恢复上一版</button>' : ''}
+            <button class="ow-btn" data-action="plot-sync" title="把带日期的导火索同步到月历（天气 HUD 可见）"><i class="fa-solid fa-calendar-plus"></i> 同步到月历</button>
             <button class="ow-btn" data-action="plot-reset">重置进度</button>
         </div><div class="ow-tree">`;
 
@@ -3697,6 +3849,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               </div>
               ${ev.core ? `<div class="ow-node-line"><span class="ow-node-label">核心</span>${escapeHtml(ev.core)}</div>` : ''}
               ${ev.trigger ? `<div class="ow-node-line"><span class="ow-node-label">导火索</span>${escapeHtml(ev.trigger)}</div>` : ''}
+              ${ev.triggerDate ? `<div class="ow-node-line"><span class="ow-node-label">预计</span><span class="ow-node-date">${escapeHtml(ev.triggerDate)}${ev.triggerWindow ? ' ' + escapeHtml(ev.triggerWindow) : ''}</span></div>` : ''}
               <div class="ow-branches">
                 ${ev.branches.map((b) => {
                     const isDead = dead.includes(b.key);
@@ -3752,6 +3905,11 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
               <textarea class="ow-textarea" id="ow_pe_core" style="min-height:60px;">${escapeHtml(ev.core)}</textarea>
               <div class="ow-field-label">导火索</div>
               <textarea class="ow-textarea" id="ow_pe_trigger" style="min-height:60px;">${escapeHtml(ev.trigger)}</textarea>
+              <div class="ow-field-label">预计发生日期（会同步到月历，留空则不排期）</div>
+              <div class="ow-row">
+                <input type="date" class="ow-input" id="ow_pe_date" value="${escapeHtml(ev.triggerDate || '')}" style="width:170px;">
+                <input type="text" class="ow-input" id="ow_pe_window" value="${escapeHtml(ev.triggerWindow || '')}" placeholder="时段，如 下午 / 19:30" style="width:150px;">
+              </div>
               <div class="ow-field-label">终局分支（条件写情感倾向，不要写具体动作）</div>
               <div id="ow_pe_branches">
                 ${ev.branches.map((b, i) => `
@@ -3804,6 +3962,8 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             ev.title = String($ov.find('#ow_pe_title').val() || '').trim() || ev.title;
             ev.core = String($ov.find('#ow_pe_core').val() || '').trim();
             ev.trigger = String($ov.find('#ow_pe_trigger').val() || '').trim();
+            ev.triggerDate = String($ov.find('#ow_pe_date').val() || '').trim();
+            ev.triggerWindow = String($ov.find('#ow_pe_window').val() || '').trim();
             const branches = [];
             $ov.find('#ow_pe_branches .ow-widget-card').each(function () {
                 branches.push({
@@ -3817,6 +3977,7 @@ next 只能填：本次矩阵中确实存在的事件 id、"OPEN"（阶段性开
             if (issues.deadloop.length) {
                 toast(`注意：事件 ${issues.deadloop.join('、')} 现在走不到结局了`, 'warning');
             }
+            syncTriggersToTimeline();
             saveChatData();
             updateInjections();
             log('info', 'ui', `手动编辑了事件 ${ev.id}`);

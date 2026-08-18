@@ -36,6 +36,37 @@ const { boot, tick, check, summary } = require('./harness.cjs');
     const out2 = await app2.T().callModel('S', 'U', 'x', 'widgets');
     check('无 generateQuietPrompt 时回退', typeof out2 === 'string');
 
+    // preset 模式要抓取酒馆最终提示词
+    const listeners = {};
+    let emitted = null;
+    const appCap = boot({
+        expose: ['settings', 'callModel'],
+        context: {
+            eventTypes: { CHARACTER_MESSAGE_RENDERED: 'a', CHAT_CHANGED: 'b',
+                GENERATE_AFTER_COMBINE_PROMPTS: 'gacp', CHAT_COMPLETION_PROMPT_READY: 'ccpr' },
+            eventSource: {
+                on(k, f) { (listeners[k] = listeners[k] || []).push(f); },
+                removeListener(k, f) { listeners[k] = (listeners[k] || []).filter(x => x !== f); },
+            },
+            generateQuietPrompt: async () => {
+                // 模拟酒馆在生成过程中派发最终提示词
+                for (const f of (listeners['ccpr'] || [])) f({ chat: [
+                    { role: 'system', content: '预设里的越狱条目' },
+                    { role: 'system', content: '角色卡描述' },
+                    { role: 'user', content: '我们的指令' }] });
+                emitted = true;
+                return 'ok';
+            },
+        },
+    });
+    await tick();
+    appCap.T().settings().requestMode = 'preset';
+    await appCap.T().callModel('SYS', 'USER', '组件', 'widgets');
+    const capLog = appCap.rec.logs.join('\n');
+    check('记录了酒馆最终提示词', capLog.includes('酒馆最终发出的消息数组'), '');
+    check('最终提示词含预设内容', capLog.includes('预设里的越狱条目'));
+    check('用完解绑监听', (listeners['ccpr'] || []).length === 0, String((listeners['ccpr'] || []).length));
+
     // ---- 3) 蝴蝶效应校验 ----
     const app3 = boot({ expose: ['validateAndRepairPlot'] });
     await tick();
